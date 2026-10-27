@@ -1,0 +1,25 @@
+name: order-type-check
+
+on:
+  push:
+    paths:
+      - .github/workflows/order-type-check.yml
+      - order_type_check.py
+
+permissions:
+  contents: read
+
+jobs:
+  order-type-check:
+    name: order-type-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Read open order types
+        env:
+          NHPLUG_APP_KEY: ${{ secrets.NHPLUG_APP_KEY }}
+          NHPLUG_APP_SECRET: ${{ secrets.NHPLUG_APP_SECRET }}
+        run: python3 order_type_check.py
