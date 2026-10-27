@@ -1,0 +1,156 @@
+name: connectivity
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  dns:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Resolve api.nhplug.com
+        run: |
+          set +e
+          resolved=$(getent hosts api.nhplug.com)
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ] || [ -z "$resolved" ]; then
+            echo "dns: getent hosts api.nhplug.com failed (exit ${status})"
+            exit 1
+          fi
+          echo "$resolved"
+          echo "Resolved IP:"
+          echo "$resolved" | awk '{print $1}'
+
+  tcp-443:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: TCP connect to api.nhplug.com:443
+        run: |
+          set +e
+          timeout 10 bash -c 'echo > /dev/tcp/api.nhplug.com/443'
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "tcp-443: failed (exit ${status})"
+            exit "$status"
+          fi
+          echo "tcp-443: connected to api.nhplug.com:443"
+
+  tcp-8443:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: TCP connect to api.nhplug.com:8443
+        run: |
+          set +e
+          timeout 10 bash -c 'echo > /dev/tcp/api.nhplug.com/8443'
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "tcp-8443: failed (exit ${status})"
+            exit "$status"
+          fi
+          echo "tcp-8443: connected to api.nhplug.com:8443"
+
+  tcp-7070:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: TCP connect to api.nhplug.com:7070
+        run: |
+          set +e
+          timeout 10 bash -c 'echo > /dev/tcp/api.nhplug.com/7070'
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "tcp-7070: failed (exit ${status})"
+            exit "$status"
+          fi
+          echo "tcp-7070: connected to api.nhplug.com:7070"
+
+  tls-8443:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: TLS handshake and HTTP status on api.nhplug.com:8443
+        run: |
+          set +e
+          logfile=$(mktemp)
+          http_code=$(curl -sS -m 15 -o /dev/null -w '%{http_code}' -v https://api.nhplug.com:8443/ 2>"$logfile")
+          status=$?
+          set -e
+          echo "HTTP status: ${http_code}"
+          echo "curl -v output tail:"
+          tail -n 80 "$logfile"
+          rm -f "$logfile"
+          if [ "$status" -ne 0 ]; then
+            echo "tls-8443: connection or TLS error (curl exit ${status})"
+            exit "$status"
+          fi
+          case "$http_code" in
+            ''|000)
+              echo "tls-8443: no HTTP status received"
+              exit 1
+              ;;
+          esac
+          echo "tls-8443: HTTP ${http_code}"
+
+  tls-7070:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: TLS handshake and HTTP status on api.nhplug.com:7070
+        run: |
+          set +e
+          logfile=$(mktemp)
+          http_code=$(curl -sS -m 15 -o /dev/null -w '%{http_code}' -v https://api.nhplug.com:7070/ 2>"$logfile")
+          status=$?
+          set -e
+          echo "HTTP status: ${http_code}"
+          echo "curl -v output tail:"
+          tail -n 80 "$logfile"
+          rm -f "$logfile"
+          if [ "$status" -ne 0 ]; then
+            echo "tls-7070: connection or TLS error (curl exit ${status})"
+            exit "$status"
+          fi
+          case "$http_code" in
+            ''|000)
+              echo "tls-7070: no HTTP status received"
+              exit 1
+              ;;
+          esac
+          echo "tls-7070: HTTP ${http_code}"
+
+  summary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    needs:
+      - dns
+      - tcp-443
+      - tcp-8443
+      - tcp-7070
+      - tls-8443
+      - tls-7070
+    if: always()
+    steps:
+      - name: Write job results to the step summary
+        run: |
+          {
+            echo "## Connectivity to api.nhplug.com"
+            echo ""
+            echo "| Job | Conclusion |"
+            echo "| --- | --- |"
+            echo "| dns | ${{ needs.dns.result }} |"
+            echo "| tcp-443 | ${{ needs['tcp-443'].result }} |"
+            echo "| tcp-8443 | ${{ needs['tcp-8443'].result }} |"
+            echo "| tcp-7070 | ${{ needs['tcp-7070'].result }} |"
+            echo "| tls-8443 | ${{ needs['tls-8443'].result }} |"
+            echo "| tls-7070 | ${{ needs['tls-7070'].result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
