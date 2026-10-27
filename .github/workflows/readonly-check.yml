@@ -1,0 +1,22 @@
+name: readonly-check
+
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  readonly-check:
+    name: readonly-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run readonly check
+        env:
+          NHPLUG_APP_KEY: ${{ secrets.NHPLUG_APP_KEY }}
+          NHPLUG_APP_SECRET: ${{ secrets.NHPLUG_APP_SECRET }}
+        run: python3 readonly_check.py
