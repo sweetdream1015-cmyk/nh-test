@@ -1,0 +1,24 @@
+name: gb-readonly-check
+
+on:
+  push:
+    paths:
+      - .github/workflows/gb-readonly-check.yml
+      - gb_readonly_check.py
+
+permissions:
+  contents: read
+
+jobs:
+  gb-readonly-check:
+    name: gb-readonly-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run overseas readonly check
+        env:
+          NHPLUG_APP_KEY: ${{ secrets.NHPLUG_APP_KEY }}
+          NHPLUG_APP_SECRET: ${{ secrets.NHPLUG_APP_SECRET }}
+        run: python3 gb_readonly_check.py

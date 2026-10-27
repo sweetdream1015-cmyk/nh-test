@@ -3,6 +3,8 @@ name: readonly-check
 on:
   workflow_dispatch:
   push:
+    paths:
+      - readonly_check.py
 
 permissions:
   contents: read
