@@ -1,5 +1,7 @@
 """Order-capable ladder bot. Live trading is off unless LIVE_TRADING is exactly on.
 
+No new order is sent on weekends or in the KST pre-reset windows
+08:00-09:10 and 16:00-17:10. Those runs log "skip: time guard" and exit.
 Inquiry plus, when live and allowed, limit buy, limit sell, and full cancel.
 The modify endpoint is never called. Prints counts and OK/ERROR codes only.
 
@@ -72,16 +74,39 @@ def _live_flag():
     return os.environ.get("LIVE_TRADING") == "on"
 
 
+def _now_kst():
+    return datetime.now(KST)
+
+
+def _orders_blocked(now):
+    """True when a new order must not be sent.
+
+    Weekends, and weekday 08:00 inclusive to 09:10 exclusive plus 16:00
+    inclusive to 17:10 exclusive. The broker wipes resting orders at
+    09:00 and 17:00, so those spans are too late to place and too early
+    for the 09:10 and 17:10 resets. 09:10 and 17:10 themselves are allowed.
+    """
+    if now.weekday() >= 5:
+        return True
+    minutes = now.hour * 60 + now.minute
+    if 8 * 60 <= minutes < 9 * 60 + 10:
+        return True
+    if 16 * 60 <= minutes < 17 * 60 + 10:
+        return True
+    return False
+
+
 def _reset_slot(now):
     """KST reset slot after the broker wipe. None means outside the window.
 
-    09:10 inclusive through 17:00 exclusive, then 17:10 through midnight.
-    A delayed job still belongs to the slot it wakes up in.
+    09:10 inclusive through 16:00 exclusive, then 17:10 through midnight.
+    16:00-17:10 is not a slot: orders placed then would be wiped at 17:00
+    or would land before the 17:10 reset.
     """
     if now.weekday() >= 5:
         return None
     minutes = now.hour * 60 + now.minute
-    if 9 * 60 + 10 <= minutes < 17 * 60:
+    if 9 * 60 + 10 <= minutes < 16 * 60:
         return "09"
     if minutes >= 17 * 60 + 10:
         return "17"
@@ -478,7 +503,7 @@ def _order_ok(status, payload):
 
 
 def _post_order(url, body):
-    if url not in _ORDER_URLS:
+    if url not in _ORDER_URLS or _orders_blocked(_now_kst()):
         return None
     status, _headers, payload = gb._post_bearer(url, gb._json_body(body), {})
     if status == 401:
@@ -819,12 +844,14 @@ def _remember(state, keys):
 
 
 def _may_trade(event, mode, now_kst, now_et, report_only):
-    """Live orders are schedule-only and only inside that mode's window."""
+    """Live orders are schedule-only, inside the mode window, and past the KST guard."""
     return (
         _live_flag()
         and event == "schedule"
         and _window_open(mode, now_kst, now_et)
         and not report_only
+        and not _orders_blocked(now_kst)
+        and not _orders_blocked(_now_kst())
     )
 
 
@@ -834,6 +861,15 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
     if mult is None or mode not in ("reset", "intraday"):
         print("ERROR config")
         return 1
+
+    def _stop_for_guard():
+        if _orders_blocked(now_kst) or _orders_blocked(_now_kst()):
+            print("skip: time guard")
+            return True
+        return False
+
+    if _stop_for_guard():
+        return 0
     if event == "schedule" and not _window_open(mode, now_kst, now_et):
         print("OK skip")
         return 0
@@ -962,6 +998,8 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
         print("ERROR max_orders")
         return 1
 
+    if live and _stop_for_guard():
+        return 0
     if live and mode == "reset":
         actions["save_state"](_clean_state(working))
 
@@ -971,8 +1009,12 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
         placed = 0
         cancelled = 0
         touch = live and plan["ticker"] in allow and not plan["review"]
+        if touch and _stop_for_guard():
+            return 0
         if touch and mode == "reset":
             for order in plan["cancel"]:
+                if _stop_for_guard():
+                    return 0
                 result = actions["cancel"](plan["ticker"], order)
                 if result is None:
                     print("ERROR unexpected")
@@ -985,6 +1027,8 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
                 return 1
         if touch:
             for item in plan["place"]:
+                if _stop_for_guard():
+                    return 0
                 exists = actions["exists"](plan["ticker"], item["side"], item["idx"])
                 if exists is None:
                     print("ERROR unexpected")
@@ -1025,6 +1069,8 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
         )
 
     if want_exception:
+        if _stop_for_guard():
+            return 0
         current = actions["exception_open"]()
         if current is None:
             print("ERROR unexpected")
@@ -1069,11 +1115,14 @@ def _die_http():
 def main():
     mode = os.environ.get("LADDER_MODE", "")
     event = os.environ.get("GITHUB_EVENT_NAME", "push")
-    now_kst = datetime.now(KST)
+    now_kst = _now_kst()
     now_et = datetime.now(ET)
     if mode not in ("reset", "intraday"):
         print("ERROR config")
         return 1
+    if _orders_blocked(now_kst):
+        print("skip: time guard")
+        return 0
     if event == "schedule" and mode == "reset":
         slot = _reset_slot(now_kst)
         if slot is None:
