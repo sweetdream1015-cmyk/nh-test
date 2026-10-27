@@ -1,0 +1,55 @@
+name: ladder-intraday
+
+on:
+  schedule:
+    # Weekday US premarket through after-hours. The script skips outside that session.
+    - cron: "*/5 * * * 1-5"
+  push:
+    paths:
+      - .github/workflows/ladder-intraday.yml
+      - ladder_bot.py
+
+concurrency:
+  group: ladder-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  ladder-intraday:
+    name: ladder-intraday
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Restore access token
+        uses: actions/cache@v4
+        with:
+          path: .nhplug-token
+          key: nhplug-token-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            nhplug-token-
+
+      - name: Restore ladder state
+        uses: actions/cache@v4
+        with:
+          path: .ladder-state
+          key: ladder-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ladder-state-
+
+      - name: Run ladder intraday
+        env:
+          LADDER_MODE: intraday
+          LIVE_TRADING: ${{ vars.LIVE_TRADING }}
+          LIVE_TICKERS: ${{ vars.LIVE_TICKERS }}
+          MAX_QTY_MULT: ${{ vars.MAX_QTY_MULT }}
+          NHPLUG_APP_KEY: ${{ secrets.NHPLUG_APP_KEY }}
+          NHPLUG_APP_SECRET: ${{ secrets.NHPLUG_APP_SECRET }}
+          NHPLUG_TOKEN_PATH: .nhplug-token/token.json
+          LADDER_STATE_PATH: .ladder-state/state.json
+        run: python3 ladder_bot.py
