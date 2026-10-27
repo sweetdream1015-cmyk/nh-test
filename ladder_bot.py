@@ -14,7 +14,10 @@ Spec fields used:
   cns_qty, orr_no, orr_dt, fc_sec_trd_nat_cd
 - POST /gbstock/order/v1/buy and /sell
   fc_sec_trd_nat_cd 200, iem_cd ticker, orr_qty, fc_orr_uit_pr,
-  ahi_nmn_pr_tp_cd 00 (limit). Buy also sends wtm_cur_knd_cd 1.
+  ahi_nmn_pr_tp_cd 63 from 09:10-16:59 KST, 61 from 17:10 until the
+  next 09:10, or ORDER_TYPE when that variable is 00, 61, 62, or 63.
+  Spec requires fc_orr_uit_pr for 00, 61, 62, and 63. Buy also sends
+  wtm_cur_knd_cd 1.
 - POST /gbstock/order/v1/cancel
   org_orr_no, all_pat_dit_cd 1 (full cancel)
 """
@@ -76,6 +79,39 @@ def _live_flag():
 
 def _now_kst():
     return datetime.now(KST)
+
+
+_ORDER_TYPES = {"00", "61", "62", "63"}
+
+
+def _order_type_override():
+    """Return the ORDER_TYPE variable, '' when unset, or None when invalid."""
+    raw = os.environ.get("ORDER_TYPE", "").strip()
+    if not raw:
+        return ""
+    if raw in _ORDER_TYPES:
+        return raw
+    return None
+
+
+def _order_type(now):
+    """Session limit code. Never falls back to 00 unless ORDER_TYPE is 00.
+
+    09:10 through 16:59 KST is 63 (day-session limit). 17:10 through the
+    next 09:10, including 00:00-07:59, is 61 (premarket limit). The
+    17:00-17:09 gap has no session code.
+    """
+    override = _order_type_override()
+    if override is None:
+        return None
+    if override:
+        return override
+    minutes = now.hour * 60 + now.minute
+    if 9 * 60 + 10 <= minutes <= 16 * 60 + 59:
+        return "63"
+    if minutes >= 17 * 60 + 10 or minutes < 9 * 60 + 10:
+        return "61"
+    return None
 
 
 def _orders_blocked(now):
@@ -519,6 +555,9 @@ def _place(account, ticker, side, price, qty, live, counter):
     index = _level_of(ticker, price)
     if index is None or qty < 1 or qty > _HARD_MAX[ticker]:
         return None
+    kind = _order_type(_now_kst())
+    if kind is None:
+        return None
     if counter[0] >= _MAX_NEW:
         return None
     counter[0] += 1
@@ -528,7 +567,7 @@ def _place(account, ticker, side, price, qty, live, counter):
         "iem_cd": ticker,
         "orr_qty": int(qty),
         "fc_orr_uit_pr": round(float(price), 2),
-        "ahi_nmn_pr_tp_cd": "00",
+        "ahi_nmn_pr_tp_cd": kind,
     }
     if side == "buy":
         body["wtm_cur_knd_cd"] = "1"
@@ -564,6 +603,9 @@ def _cancel(account, ticker, order, live):
 def _place_exception(account, live, counter):
     if not live:
         return False
+    kind = _order_type(_now_kst())
+    if kind is None:
+        return None
     if counter[0] >= _MAX_NEW:
         return None
     counter[0] += 1
@@ -573,7 +615,7 @@ def _place_exception(account, live, counter):
         "iem_cd": "SOXL",
         "orr_qty": 100,
         "fc_orr_uit_pr": 75,
-        "ahi_nmn_pr_tp_cd": "00",
+        "ahi_nmn_pr_tp_cd": kind,
         "wtm_cur_knd_cd": "1",
     }
     return _post_order(BUY_URL, body)
@@ -858,7 +900,7 @@ def _may_trade(event, mode, now_kst, now_et, report_only):
 def run(mode, event, now_kst, now_et, opens, fills, state, actions):
     """Pure orchestration. `actions` performs live calls or records dry intent."""
     mult = _mult()
-    if mult is None or mode not in ("reset", "intraday"):
+    if mult is None or mode not in ("reset", "intraday") or _order_type_override() is None:
         print("ERROR config")
         return 1
 
@@ -888,6 +930,11 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
     ):
         print("OK skip")
         return 0
+    kind = _order_type(_now_kst())
+    if kind is None:
+        print("ERROR config")
+        return 1
+    print(f"order type {kind}")
     if _exception_filled(fills, set(working["handled"])):
         working["exception_filled"] = True
 
@@ -1117,7 +1164,7 @@ def main():
     event = os.environ.get("GITHUB_EVENT_NAME", "push")
     now_kst = _now_kst()
     now_et = datetime.now(ET)
-    if mode not in ("reset", "intraday"):
+    if mode not in ("reset", "intraday") or _order_type_override() is None:
         print("ERROR config")
         return 1
     if _orders_blocked(now_kst):

@@ -2,7 +2,7 @@ name: ladder-intraday
 
 on:
   schedule:
-    # Weekday US premarket through after-hours. The script skips outside that session.
+    # Weekday poll, every 5 minutes UTC. The script skips outside the US session.
     - cron: "*/5 * * * 1-5"
   push:
     paths:
@@ -55,6 +55,7 @@ jobs:
           LIVE_TRADING: ${{ vars.LIVE_TRADING }}
           LIVE_TICKERS: ${{ vars.LIVE_TICKERS }}
           MAX_QTY_MULT: ${{ vars.MAX_QTY_MULT }}
+          ORDER_TYPE: ${{ vars.ORDER_TYPE }}
           NHPLUG_APP_KEY: ${{ secrets.NHPLUG_APP_KEY }}
           NHPLUG_APP_SECRET: ${{ secrets.NHPLUG_APP_SECRET }}
           NHPLUG_TOKEN_PATH: .nhplug-token/token.json
