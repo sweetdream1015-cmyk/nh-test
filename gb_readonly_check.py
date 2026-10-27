@@ -290,12 +290,80 @@ def _country(row):
 
 
 def _ticker(row):
+    """iem_cd is the ticker (spec example AAPL, length 12). Drop padding."""
     if not isinstance(row, dict):
         return ""
     code = row.get("iem_cd")
-    if isinstance(code, str):
-        return code.strip()
+    if isinstance(code, int) and not isinstance(code, bool):
+        code = str(code)
+    if not isinstance(code, str):
+        return ""
+    cleaned = "".join(ch for ch in code if ord(ch) >= 32)
+    return cleaned.strip()
+
+
+def _code(value):
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
     return ""
+
+
+def _num(value):
+    if isinstance(value, bool) or value is None:
+        return ""
+    if isinstance(value, int):
+        text = str(value)
+    elif isinstance(value, float):
+        text = str(int(value)) if value.is_integer() else format(value, "f").rstrip("0").rstrip(".")
+    elif isinstance(value, str):
+        text = value.strip()
+    else:
+        return ""
+    return _redact(text)
+
+
+# oss_sby_dit_cd on the unexecuted request and Output_0: 1.매도 2.매수
+_SIDE = {"1": "sell", "2": "buy"}
+
+
+def _print_unexecuted(rows):
+    # Keys only. Values of the first row are not printed here.
+    if rows and isinstance(rows[0], dict):
+        keys = [key for key in rows[0].keys() if isinstance(key, str)]
+        print("unexecuted fields " + " ".join(keys))
+    else:
+        print("unexecuted fields")
+    counts = {}
+    order = []
+    for row in rows:
+        symbol = _redact(_ticker(row) or "(blank)")
+        if symbol not in counts:
+            order.append(symbol)
+            counts[symbol] = 0
+        counts[symbol] += 1
+    for symbol in order:
+        print(f"unexecuted symbol {symbol} {counts[symbol]}")
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        symbol = _redact(_ticker(row) or "(blank)")
+        side = _code(row.get("oss_sby_dit_cd"))
+        side_name = _SIDE.get(side, "")
+        status = _code(row.get("oss_ato_orr_sts_cd"))
+        qty = _num(row.get("orr_qty"))
+        rem = _num(row.get("ny_cns_orr_qty"))
+        price = _num(row.get("fc_orr_uit_pr"))
+        parts = [symbol, f"side {side}"]
+        if side_name:
+            parts.append(side_name)
+        if status:
+            parts.append(f"status {status}")
+        parts.append(f"qty {qty}")
+        parts.append(f"rem {rem}")
+        parts.append(f"px {price}")
+        print(" ".join(parts))
 
 
 def _balance_rows(rows):
@@ -378,7 +446,7 @@ def main():
             held[ticker] += 1
     open_counts = {ticker: 0 for ticker in TICKERS}
     for row in open_orders:
-        ticker = _ticker(row)
+        ticker = _ticker(row).upper()
         if ticker in open_counts:
             open_counts[ticker] += 1
 
@@ -388,6 +456,7 @@ def main():
         present = "yes" if held[ticker] else "no"
         print(f"{ticker} holding {present}")
         print(f"{ticker} unexecuted {open_counts[ticker]}")
+    _print_unexecuted(open_orders)
     return 0
 
 
