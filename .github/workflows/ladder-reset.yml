@@ -2,13 +2,14 @@ name: ladder-reset
 
 on:
   schedule:
-    # 09:00 and 17:00 KST. The script only trades inside a short window after these.
-    - cron: "0 0 * * 1-5"
-    - cron: "0 8 * * 1-5"
+    # 09:10 and 17:10 KST, after the broker wipes resting orders.
+    - cron: "10 0 * * 1-5"
+    - cron: "10 8 * * 1-5"
   push:
     paths:
       - .github/workflows/ladder-reset.yml
       - ladder_bot.py
+      - restore_ladder_state.py
 
 concurrency:
   group: ladder-bot
@@ -43,6 +44,12 @@ jobs:
           restore-keys: |
             ladder-state-
 
+      - name: Restore ladder state artifact
+        if: hashFiles('.ladder-state/state.json') == ''
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 restore_ladder_state.py
+
       - name: Run ladder reset
         env:
           LADDER_MODE: reset
@@ -54,3 +61,13 @@ jobs:
           NHPLUG_TOKEN_PATH: .nhplug-token/token.json
           LADDER_STATE_PATH: .ladder-state/state.json
         run: python3 ladder_bot.py
+
+      - name: Upload ladder state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ladder-state
+          path: .ladder-state/state.json
+          retention-days: 30
+          include-hidden-files: true
+          if-no-files-found: ignore

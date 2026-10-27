@@ -8,6 +8,7 @@ on:
     paths:
       - .github/workflows/ladder-intraday.yml
       - ladder_bot.py
+      - restore_ladder_state.py
 
 concurrency:
   group: ladder-bot
@@ -42,6 +43,12 @@ jobs:
           restore-keys: |
             ladder-state-
 
+      - name: Restore ladder state artifact
+        if: hashFiles('.ladder-state/state.json') == ''
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 restore_ladder_state.py
+
       - name: Run ladder intraday
         env:
           LADDER_MODE: intraday
@@ -53,3 +60,13 @@ jobs:
           NHPLUG_TOKEN_PATH: .nhplug-token/token.json
           LADDER_STATE_PATH: .ladder-state/state.json
         run: python3 ladder_bot.py
+
+      - name: Upload ladder state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ladder-state
+          path: .ladder-state/state.json
+          retention-days: 30
+          include-hidden-files: true
+          if-no-files-found: ignore

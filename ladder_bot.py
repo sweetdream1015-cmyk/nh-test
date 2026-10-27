@@ -37,7 +37,6 @@ CANCEL_URL = gb.LIVE + "/gbstock/order/v1/cancel"
 _ORDER_URLS = {BUY_URL, SELL_URL, CANCEL_URL}
 _HARD_MAX = {"NAIL": 20, "KORU": 4, "SOXL": 4}
 _MAX_NEW = 6
-_RESET_WINDOW_MIN = 45
 _TOKEN_PATH = os.environ.get("NHPLUG_TOKEN_PATH", ".nhplug-token/token.json")
 _STATE_PATH = os.environ.get("LADDER_STATE_PATH", ".ladder-state/state.json")
 
@@ -73,13 +72,24 @@ def _live_flag():
     return os.environ.get("LIVE_TRADING") == "on"
 
 
-def _in_reset_window(now):
+def _reset_slot(now):
+    """KST reset slot after the broker wipe. None means outside the window.
+
+    09:10 inclusive through 17:00 exclusive, then 17:10 through midnight.
+    A delayed job still belongs to the slot it wakes up in.
+    """
     if now.weekday() >= 5:
-        return False
+        return None
     minutes = now.hour * 60 + now.minute
-    return (9 * 60 <= minutes < 9 * 60 + _RESET_WINDOW_MIN) or (
-        17 * 60 <= minutes < 17 * 60 + _RESET_WINDOW_MIN
-    )
+    if 9 * 60 + 10 <= minutes < 17 * 60:
+        return "09"
+    if minutes >= 17 * 60 + 10:
+        return "17"
+    return None
+
+
+def _in_reset_window(now):
+    return _reset_slot(now) is not None
 
 
 def _in_us_session(now):
@@ -151,15 +161,35 @@ def _anchors(ticker, orders):
     }
 
 
-def _desired(ticker, sell_idx, buy_idx, mult):
+def _in_double_zone(ticker, price):
+    if ticker == "NAIL":
+        return price <= 22
+    if ticker == "KORU":
+        return price <= 9.4
+    if ticker == "SOXL":
+        return price <= 72
+    return False
+
+
+def _buy_computed(ticker, index, double_used):
     ladder = _cfg(ticker)["ladder"]
-    buy_qty = _cfg(ticker)["buy_qty"]
+    price = ladder[index]
+    qty = _cfg(ticker)["buy_qty"](price)
+    if index in set(double_used) and _in_double_zone(ticker, price):
+        return _cfg(ticker)["base"]
+    return qty
+
+
+def _desired(ticker, sell_idx, buy_idx, mult, double_used=()):
+    if not _valid_pair(ticker, sell_idx, buy_idx):
+        return None
+    ladder = _cfg(ticker)["ladder"]
     base = _cfg(ticker)["base"]
     specs = [
         ("sell", sell_idx, base),
         ("sell", sell_idx + 1, base),
-        ("buy", buy_idx, buy_qty(ladder[buy_idx])),
-        ("buy", buy_idx - 1, buy_qty(ladder[buy_idx - 1])),
+        ("buy", buy_idx, _buy_computed(ticker, buy_idx, double_used)),
+        ("buy", buy_idx - 1, _buy_computed(ticker, buy_idx - 1, double_used)),
     ]
     out = []
     for side, index, computed in specs:
@@ -290,7 +320,7 @@ def _save_json(path, data):
 
 def _load_state():
     data = _load_json(_STATE_PATH)
-    if not data or data.get("version") != 1:
+    if not data or data.get("version") not in (1, 2):
         return None
     if not isinstance(data.get("handled"), list):
         return None
@@ -298,7 +328,13 @@ def _load_state():
 
 
 def _fresh_state():
-    return {"version": 1, "tickers": {}, "handled": [], "exception_filled": False}
+    return {
+        "version": 2,
+        "tickers": {},
+        "handled": [],
+        "exception_filled": False,
+        "reset_done": {"09": "", "17": ""},
+    }
 
 
 def _load_token():
@@ -569,6 +605,26 @@ def _valid_pair(ticker, sell_idx, buy_idx):
     return 0 <= buy_idx < sell_idx < len(ladder) - 1 and buy_idx >= 1
 
 
+def _used_indexes(ticker, raw):
+    ladder = _cfg(ticker)["ladder"]
+    found = []
+    if not isinstance(raw, list):
+        return found
+    for item in raw:
+        index = None
+        if isinstance(item, bool):
+            continue
+        if isinstance(item, int) and 0 <= item < len(ladder):
+            index = item
+        else:
+            price = ladders._float(item)
+            if price is not None:
+                index = ladders._level(ladder, price)
+        if index is not None and index not in found:
+            found.append(index)
+    return found
+
+
 def _stored_pair(state, ticker):
     raw = state.get("tickers", {})
     if not isinstance(raw, dict):
@@ -580,7 +636,11 @@ def _stored_pair(state, ticker):
     buy_idx = pair.get("buy")
     if not _valid_pair(ticker, sell_idx, buy_idx):
         return None
-    return {"sell": sell_idx, "buy": buy_idx}
+    return {
+        "sell": sell_idx,
+        "buy": buy_idx,
+        "double_used": _used_indexes(ticker, pair.get("double_used")),
+    }
 
 
 def _baseline_ok(ticker, buys, sells, anchor):
@@ -624,10 +684,9 @@ def _clean_state(state):
     raw = state.get("tickers", {})
     if isinstance(raw, dict):
         for name, pair in raw.items():
-            if name not in ladders._CFG or not isinstance(pair, dict):
-                continue
-            if _valid_pair(name, pair.get("sell"), pair.get("buy")):
-                tickers[name] = {"sell": pair["sell"], "buy": pair["buy"]}
+            stored = _stored_pair({"tickers": {name: pair}}, name)
+            if stored is not None:
+                tickers[name] = stored
     handled = []
     for key in state.get("handled", []):
         if (
@@ -637,12 +696,85 @@ def _clean_state(state):
         ):
             if key not in handled:
                 handled.append(key)
+    done = {"09": "", "17": ""}
+    raw_done = state.get("reset_done")
+    if isinstance(raw_done, dict):
+        for slot in ("09", "17"):
+            value = raw_done.get(slot, "")
+            if isinstance(value, str) and len(value) == 8 and value.isdigit():
+                done[slot] = value
     return {
-        "version": 1,
+        "version": 2,
         "tickers": tickers,
         "handled": handled[-200:],
         "exception_filled": bool(state.get("exception_filled")),
+        "reset_done": done,
     }
+
+
+def _step_sell(ticker, pair):
+    sell_idx = pair["sell"] + 1
+    buy_idx = pair["buy"] + 1
+    if not _valid_pair(ticker, sell_idx, buy_idx):
+        return None
+    return {
+        "sell": sell_idx,
+        "buy": buy_idx,
+        "double_used": list(pair.get("double_used") or []),
+    }
+
+
+def _step_buy(ticker, pair):
+    used = list(pair.get("double_used") or [])
+    price = _cfg(ticker)["ladder"][pair["buy"]]
+    if _in_double_zone(ticker, price) and pair["buy"] not in used:
+        used.append(pair["buy"])
+    sell_idx = pair["sell"] - 1
+    buy_idx = pair["buy"] - 1
+    if not _valid_pair(ticker, sell_idx, buy_idx):
+        return None
+    return {"sell": sell_idx, "buy": buy_idx, "double_used": used}
+
+
+def _step_plan(ticker, pair, sell_missing, buy_missing, mult):
+    """Move S and B by one per confirmed core fill. None means review."""
+    if sell_missing and buy_missing:
+        return None
+    current = {
+        "sell": pair["sell"],
+        "buy": pair["buy"],
+        "double_used": list(pair.get("double_used") or []),
+    }
+    if sell_missing:
+        missing = set(sell_missing)
+        if missing == {current["sell"]}:
+            steps = 1
+        elif missing == {current["sell"], current["sell"] + 1}:
+            steps = 2
+        else:
+            return None
+        for _ in range(steps):
+            current = _step_sell(ticker, current)
+            if current is None:
+                return None
+    else:
+        missing = set(buy_missing)
+        if missing == {current["buy"]}:
+            steps = 1
+        elif missing == {current["buy"], current["buy"] - 1}:
+            steps = 2
+        else:
+            return None
+        for _ in range(steps):
+            current = _step_buy(ticker, current)
+            if current is None:
+                return None
+    desired = _desired(
+        ticker, current["sell"], current["buy"], mult, current["double_used"]
+    )
+    if not desired:
+        return None
+    return current, desired
 
 
 def _core_missing(anchors, orders):
@@ -709,6 +841,17 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
     working = _fresh_state() if state is None else _clean_state(state)
     allow = _allow_set()
     live = _may_trade(event, mode, now_kst, now_et, report_only)
+    slot = _reset_slot(now_kst) if mode == "reset" else None
+    today = now_kst.strftime("%Y%m%d")
+    if (
+        event == "schedule"
+        and _live_flag()
+        and slot
+        and not report_only
+        and working.get("reset_done", {}).get(slot) == today
+    ):
+        print("OK skip")
+        return 0
     if _exception_filled(fills, set(working["handled"])):
         working["exception_filled"] = True
 
@@ -721,59 +864,50 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
         cancel = []
         remember = []
         indexes = None
-        anchor = _anchors(ticker, mine)
-        if mode == "reset":
-            if anchor is None and not buys and not sells:
-                stored = _stored_pair(working, ticker)
-                if stored is not None:
-                    anchor = {
-                        "buys": buys,
-                        "sells": sells,
-                        "ignored": ignored,
-                        "buy": stored["buy"],
-                        "sell": stored["sell"],
-                    }
-            if report_only and not _baseline_ok(ticker, buys, sells, anchor):
+        stored = None if report_only else _stored_pair(working, ticker)
+        if stored is None:
+            review = True
+        elif mode == "reset":
+            place = _desired(
+                ticker, stored["sell"], stored["buy"], mult, stored["double_used"]
+            ) or []
+            if not place:
                 review = True
-            elif anchor is None:
-                review = True
+                place = []
             else:
-                place = _desired(ticker, anchor["sell"], anchor["buy"], mult) or []
-                if not place:
-                    review = True
-                    place = []
-                else:
-                    cancel = list(buys + sells)
-                    indexes = {"sell": anchor["sell"], "buy": anchor["buy"]}
-        elif report_only:
-            if _baseline_ok(ticker, buys, sells, anchor):
-                indexes = {"sell": anchor["sell"], "buy": anchor["buy"]}
-            else:
-                review = True
+                cancel = list(buys + sells)
+                indexes = stored
         else:
-            stored = _stored_pair(working, ticker)
-            if stored is None or anchor is None:
-                review = True
-            else:
-                missing = _core_missing(stored, buys + sells)
+            missing = _core_missing(stored, buys + sells)
+            if missing:
                 found = _confirmed_fills(
                     ticker, missing, fills, set(working["handled"])
                 )
                 if found is None:
                     review = True
                 else:
-                    place = intraday_adds(ticker, buys + sells, found, mult)
-                    if place is None:
+                    sell_missing = [
+                        item["idx"] for item in missing if item["side"] == "sell"
+                    ]
+                    buy_missing = [
+                        item["idx"] for item in missing if item["side"] == "buy"
+                    ]
+                    stepped = _step_plan(
+                        ticker, stored, sell_missing, buy_missing, mult
+                    )
+                    if stepped is None:
                         review = True
-                        place = []
-                    elif place:
-                        indexes = _next_pair(ticker, buys, sells, place)
-                        if indexes is None:
-                            review = True
-                            place = []
-                        else:
-                            remember = [item["key"] for item in found]
-        if not review and indexes is not None and (mode == "reset" or report_only):
+                    else:
+                        new_pair, desired = stepped
+                        open_levels = {(order["side"], order["idx"]) for order in buys + sells}
+                        place = [
+                            item
+                            for item in desired
+                            if (item["side"], item["idx"]) not in open_levels
+                        ]
+                        indexes = new_pair
+                        remember = [item["key"] for item in found]
+        if not review and mode == "reset" and indexes is not None:
             working["tickers"][ticker] = indexes
         plans.append(
             {
@@ -906,9 +1040,16 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
             if result:
                 sent_any = True
 
+    allowed = [plan for plan in plans if plan["ticker"] in allow]
+    if (
+        live
+        and mode == "reset"
+        and slot
+        and allowed
+        and all(not plan["review"] for plan in allowed)
+    ):
+        working["reset_done"][slot] = today
     if report_only:
-        if working["tickers"] or working["exception_filled"]:
-            actions["save_state"](_clean_state(working))
         print("OK report_only")
     else:
         if live:
@@ -933,7 +1074,17 @@ def main():
     if mode not in ("reset", "intraday"):
         print("ERROR config")
         return 1
-    if event == "schedule" and not _window_open(mode, now_kst, now_et):
+    if event == "schedule" and mode == "reset":
+        slot = _reset_slot(now_kst)
+        if slot is None:
+            print("OK skip")
+            return 0
+        loaded = _load_state()
+        done = (loaded or {}).get("reset_done") or {}
+        if _live_flag() and done.get(slot) == now_kst.strftime("%Y%m%d"):
+            print("OK skip")
+            return 0
+    elif event == "schedule" and not _window_open(mode, now_kst, now_et):
         print("OK skip")
         return 0
     key = os.environ.get("NHPLUG_APP_KEY", "")
