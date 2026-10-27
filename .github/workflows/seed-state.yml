@@ -1,0 +1,55 @@
+name: seed-state
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/seed-state.yml
+      - seed_state.py
+      - restore_ladder_state.py
+
+concurrency:
+  group: ladder-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  seed-state:
+    name: seed-state
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Restore ladder state
+        uses: actions/cache@v4
+        with:
+          path: .ladder-state
+          key: ladder-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ladder-state-
+
+      - name: Restore ladder state artifact
+        if: hashFiles('.ladder-state/state.json') == ''
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 restore_ladder_state.py
+
+      - name: Seed ladder state
+        env:
+          LADDER_STATE_PATH: .ladder-state/state.json
+        run: python3 seed_state.py
+
+      - name: Upload ladder state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ladder-state
+          path: .ladder-state/state.json
+          retention-days: 30
+          include-hidden-files: true
+          if-no-files-found: ignore

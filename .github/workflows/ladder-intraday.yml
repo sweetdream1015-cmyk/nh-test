@@ -1,0 +1,73 @@
+name: ladder-intraday
+
+on:
+  schedule:
+    # Weekday poll, every 5 minutes UTC. The script skips outside the US session.
+    - cron: "*/5 * * * 1-5"
+  push:
+    paths:
+      - .github/workflows/ladder-intraday.yml
+      - ladder_bot.py
+      - restore_ladder_state.py
+
+concurrency:
+  group: ladder-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  ladder-intraday:
+    name: ladder-intraday
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Restore access token
+        uses: actions/cache@v4
+        with:
+          path: .nhplug-token
+          key: nhplug-token-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            nhplug-token-
+
+      - name: Restore ladder state
+        uses: actions/cache@v4
+        with:
+          path: .ladder-state
+          key: ladder-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ladder-state-
+
+      - name: Restore ladder state artifact
+        if: hashFiles('.ladder-state/state.json') == ''
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 restore_ladder_state.py
+
+      - name: Run ladder intraday
+        env:
+          LADDER_MODE: intraday
+          LIVE_TRADING: ${{ vars.LIVE_TRADING }}
+          LIVE_TICKERS: ${{ vars.LIVE_TICKERS }}
+          MAX_QTY_MULT: ${{ vars.MAX_QTY_MULT }}
+          ORDER_TYPE: ${{ vars.ORDER_TYPE }}
+          NHPLUG_APP_KEY: ${{ secrets.NHPLUG_APP_KEY }}
+          NHPLUG_APP_SECRET: ${{ secrets.NHPLUG_APP_SECRET }}
+          NHPLUG_TOKEN_PATH: .nhplug-token/token.json
+          LADDER_STATE_PATH: .ladder-state/state.json
+        run: python3 ladder_bot.py
+
+      - name: Upload ladder state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ladder-state
+          path: .ladder-state/state.json
+          retention-days: 30
+          include-hidden-files: true
+          if-no-files-found: ignore

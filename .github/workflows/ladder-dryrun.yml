@@ -1,0 +1,24 @@
+name: ladder-dryrun
+
+on:
+  push:
+    paths:
+      - .github/workflows/ladder-dryrun.yml
+      - ladder_dryrun.py
+
+permissions:
+  contents: read
+
+jobs:
+  ladder-dryrun:
+    name: ladder-dryrun
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run ladder dry run
+        env:
+          NHPLUG_APP_KEY: ${{ secrets.NHPLUG_APP_KEY }}
+          NHPLUG_APP_SECRET: ${{ secrets.NHPLUG_APP_SECRET }}
+        run: python3 ladder_dryrun.py
