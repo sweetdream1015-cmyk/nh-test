@@ -1,6 +1,7 @@
 name: ladder-intraday
 
 on:
+  workflow_dispatch:
   schedule:
     # Weekday poll, every 5 minutes UTC. The script skips outside the US session.
     - cron: "*/5 * * * 1-5"

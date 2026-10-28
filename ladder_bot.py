@@ -885,11 +885,16 @@ def _remember(state, keys):
     state["handled"] = handled[-200:]
 
 
+def _clocked(event):
+    """Cron and manual dispatch share the trading gates. Push never trades."""
+    return event in ("schedule", "workflow_dispatch")
+
+
 def _may_trade(event, mode, now_kst, now_et, report_only):
-    """Live orders are schedule-only, inside the mode window, and past the KST guard."""
+    """Live orders are clocked runs only, inside the mode window, and past the KST guard."""
     return (
         _live_flag()
-        and event == "schedule"
+        and _clocked(event)
         and _window_open(mode, now_kst, now_et)
         and not report_only
         and not _orders_blocked(now_kst)
@@ -912,7 +917,7 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
 
     if _stop_for_guard():
         return 0
-    if event == "schedule" and not _window_open(mode, now_kst, now_et):
+    if _clocked(event) and not _window_open(mode, now_kst, now_et):
         print("OK skip")
         return 0
     report_only = state is None
@@ -922,7 +927,7 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
     slot = _reset_slot(now_kst) if mode == "reset" else None
     today = now_kst.strftime("%Y%m%d")
     if (
-        event == "schedule"
+        _clocked(event)
         and _live_flag()
         and slot
         and not report_only
@@ -1170,7 +1175,7 @@ def main():
     if _orders_blocked(now_kst):
         print("skip: time guard")
         return 0
-    if event == "schedule" and mode == "reset":
+    if _clocked(event) and mode == "reset":
         slot = _reset_slot(now_kst)
         if slot is None:
             print("OK skip")
@@ -1180,7 +1185,7 @@ def main():
         if _live_flag() and done.get(slot) == now_kst.strftime("%Y%m%d"):
             print("OK skip")
             return 0
-    elif event == "schedule" and not _window_open(mode, now_kst, now_et):
+    elif _clocked(event) and not _window_open(mode, now_kst, now_et):
         print("OK skip")
         return 0
     key = os.environ.get("NHPLUG_APP_KEY", "")
