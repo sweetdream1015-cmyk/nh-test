@@ -1,6 +1,7 @@
 name: ladder-reset
 
 on:
+  workflow_dispatch:
   schedule:
     # 09:10 KST = 00:10 UTC, and 17:10 KST = 08:10 UTC, weekdays Mon-Fri.
     - cron: "10 0 * * 1-5"
