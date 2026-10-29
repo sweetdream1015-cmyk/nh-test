@@ -2,6 +2,8 @@
 
 No new order is sent on weekends or in the KST pre-reset windows
 08:00-09:10 and 16:00-17:10. Those runs log "skip: time guard" and exit.
+A live reset places whole tickers only, at most 6 new orders. A ticker
+that does not fit is left uncancelled and logged DEFERRED for a later run.
 Inquiry plus, when live and allowed, limit buy, limit sell, and full cancel.
 The modify endpoint is never called. Prints counts and OK/ERROR codes only.
 
@@ -388,6 +390,123 @@ def _load_state():
     return data
 
 
+def _done_marker(slot, ticker, today):
+    """Id kept in handled so an older run that drops reset_tickers still skips the ticker."""
+    raw = "reset-done|%s|%s|%s" % (slot, ticker, today)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _clean_reset_tickers(raw):
+    cleaned = {"09": {}, "17": {}}
+    if not isinstance(raw, dict):
+        return cleaned
+    for slot in ("09", "17"):
+        slot_raw = raw.get(slot)
+        if not isinstance(slot_raw, dict):
+            continue
+        for name in ("NAIL", "KORU", "SOXL"):
+            value = slot_raw.get(name)
+            if isinstance(value, str) and len(value) == 8 and value.isdigit():
+                cleaned[slot][name] = value
+    return cleaned
+
+
+def _pin_done_markers(handled, reset_tickers):
+    wanted = []
+    for slot in ("09", "17"):
+        for ticker, day in (reset_tickers.get(slot) or {}).items():
+            wanted.append(_done_marker(slot, ticker, day))
+    rest = [key for key in handled if key not in wanted]
+    rest.extend(wanted)
+    return rest[-200:]
+
+
+def _slot_done(state, slot, ticker, today):
+    if slot not in ("09", "17") or not today:
+        return False
+    handled = state.get("handled") or []
+    if _done_marker(slot, ticker, today) in handled:
+        return True
+    raw = state.get("reset_tickers")
+    if not isinstance(raw, dict):
+        return False
+    slot_raw = raw.get(slot)
+    if not isinstance(slot_raw, dict):
+        return False
+    return slot_raw.get(ticker) == today
+
+
+def _mark_slot_done(state, slot, ticker, today):
+    if slot not in ("09", "17") or ticker not in ("NAIL", "KORU", "SOXL"):
+        return
+    slot_map = state.setdefault("reset_tickers", {}).setdefault(slot, {})
+    slot_map[ticker] = today
+    marker = _done_marker(slot, ticker, today)
+    handled = [key for key in state.get("handled", []) if isinstance(key, str)]
+    if marker not in handled:
+        handled.append(marker)
+    state["handled"] = handled[-200:]
+
+
+def _all_reset_done(state, plans, allow, slot, today):
+    found = False
+    for plan in plans:
+        if plan["ticker"] not in allow or plan["review"]:
+            continue
+        found = True
+        if not _slot_done(state, slot, plan["ticker"], today):
+            return False
+    return found
+
+
+def _exception_this_run(plans, allow, state, slot, today, selected):
+    for plan in plans:
+        if plan["ticker"] != "SOXL":
+            continue
+        if plan["review"] or "SOXL" not in allow:
+            return True
+        return "SOXL" in selected or _slot_done(state, slot, "SOXL", today)
+    return False
+
+
+def _reset_batch(plans, allow, state, slot, today, want_exception):
+    """Whole tickers only. A ticker that does not fit waits for a later run."""
+    remaining = _MAX_NEW
+    selected = []
+    deferred = []
+    for plan in plans:
+        ticker = plan["ticker"]
+        if ticker not in allow or plan["review"]:
+            continue
+        if _slot_done(state, slot, ticker, today):
+            continue
+        cost = len(plan["place"])
+        if cost > _MAX_NEW:
+            return {
+                "selected": set(),
+                "deferred": set(),
+                "exception": False,
+                "blocked": True,
+            }
+        if cost > remaining:
+            deferred.append(ticker)
+            continue
+        selected.append(ticker)
+        remaining -= cost
+    take_exception = False
+    if want_exception and "SOXL" not in deferred and remaining >= 1:
+        chosen = set(selected)
+        take_exception = _exception_this_run(
+            plans, allow, state, slot, today, chosen
+        )
+    return {
+        "selected": set(selected),
+        "deferred": set(deferred),
+        "exception": take_exception,
+        "blocked": False,
+    }
+
+
 def _fresh_state():
     return {
         "version": 2,
@@ -395,6 +514,7 @@ def _fresh_state():
         "handled": [],
         "exception_filled": False,
         "reset_done": {"09": "", "17": ""},
+        "reset_tickers": {"09": {}, "17": {}},
     }
 
 
@@ -770,12 +890,14 @@ def _clean_state(state):
             value = raw_done.get(slot, "")
             if isinstance(value, str) and len(value) == 8 and value.isdigit():
                 done[slot] = value
+    reset_tickers = _clean_reset_tickers(state.get("reset_tickers"))
     return {
         "version": 2,
         "tickers": tickers,
-        "handled": handled[-200:],
+        "handled": _pin_done_markers(handled, reset_tickers),
         "exception_filled": bool(state.get("exception_filled")),
         "reset_done": done,
+        "reset_tickers": reset_tickers,
     }
 
 
@@ -1011,6 +1133,11 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
             }
         )
 
+    if live and mode == "reset" and slot:
+        for name in ("NAIL", "KORU", "SOXL"):
+            if _slot_done(working, slot, name, today):
+                _mark_slot_done(working, slot, name, today)
+
     planned = 0
     for plan in plans:
         if plan["ticker"] not in allow or plan["review"]:
@@ -1034,7 +1161,14 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
     )
     if want_exception:
         planned += 1
-    if live and planned > _MAX_NEW:
+    batch = None
+    over = False
+    if live and mode == "reset":
+        batch = _reset_batch(plans, allow, working, slot, today, want_exception)
+        over = batch["blocked"]
+    elif live and planned > _MAX_NEW:
+        over = True
+    if over:
         for plan in plans:
             _report(
                 plan["ticker"],
@@ -1060,7 +1194,21 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
     for plan in plans:
         placed = 0
         cancelled = 0
-        touch = live and plan["ticker"] in allow and not plan["review"]
+        deferred = batch is not None and plan["ticker"] in batch["deferred"]
+        already = (
+            batch is not None
+            and plan["ticker"] in allow
+            and not plan["review"]
+            and plan["ticker"] not in batch["selected"]
+            and not deferred
+        )
+        touch = (
+            live
+            and plan["ticker"] in allow
+            and not plan["review"]
+            and not deferred
+            and not already
+        )
         if touch and _stop_for_guard():
             return 0
         if touch and mode == "reset":
@@ -1108,26 +1256,40 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
                         and isinstance(row.get("key"), str)
                     ],
                 )
+                if slot:
+                    _mark_slot_done(working, slot, plan["ticker"], today)
+        place_n = 0 if already else len(plan["place"])
+        cancel_n = 0 if already or mode != "reset" else len(plan["cancel"])
         _report(
             plan["ticker"],
             plan["buys"],
             plan["sells"],
             plan["ignored"],
-            len(plan["place"]),
-            len(plan["cancel"]) if mode == "reset" else 0,
+            place_n,
+            cancel_n,
             plan["review"],
             placed,
             cancelled,
         )
+        if deferred:
+            print("DEFERRED " + plan["ticker"])
+        elif already:
+            print(plan["ticker"] + " skip done")
 
-    if want_exception:
+    settled_exception = not want_exception
+    hold_exception = want_exception and batch is not None and not batch["exception"]
+    if hold_exception:
+        print("DEFERRED exception")
+    elif want_exception:
         if _stop_for_guard():
             return 0
         current = actions["exception_open"]()
         if current is None:
             print("ERROR unexpected")
             return 1
-        if not current:
+        if current:
+            settled_exception = True
+        else:
             if counter[0] >= _MAX_NEW:
                 print("ERROR max_orders")
                 return 1
@@ -1137,14 +1299,17 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
                 return 1
             if result:
                 sent_any = True
+                print("exception placed 1")
+                settled_exception = True
+            else:
+                settled_exception = False
 
-    allowed = [plan for plan in plans if plan["ticker"] in allow]
     if (
         live
         and mode == "reset"
         and slot
-        and allowed
-        and all(not plan["review"] for plan in allowed)
+        and settled_exception
+        and _all_reset_done(working, plans, allow, slot, today)
     ):
         working["reset_done"][slot] = today
     if report_only:
