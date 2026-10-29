@@ -6,6 +6,16 @@ on:
     # 09:10 KST = 00:10 UTC, and 17:10 KST = 08:10 UTC, weekdays Mon-Fri.
     - cron: "10 0 * * 1-5"
     - cron: "10 8 * * 1-5"
+    # Later whole-ticker batches, 2 minutes apart:
+    # 09:12, 09:14, 09:16 KST and 17:12, 17:14, 17:16 KST.
+    # The 09:10 and 17:10 crons above are unchanged.
+    # Scheduled workflows run from the default branch.
+    - cron: "12 0 * * 1-5"
+    - cron: "14 0 * * 1-5"
+    - cron: "16 0 * * 1-5"
+    - cron: "12 8 * * 1-5"
+    - cron: "14 8 * * 1-5"
+    - cron: "16 8 * * 1-5"
   push:
     paths:
       - .github/workflows/ladder-reset.yml

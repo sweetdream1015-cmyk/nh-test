@@ -2,6 +2,12 @@ name: seed-state
 
 on:
   workflow_dispatch:
+    inputs:
+      seed_force:
+        description: "지정 티커만 교정. 매도하한:매수상한. 예: KORU:13.5:11.3,SOXL:113:94. 비우면 기존 시드."
+        required: false
+        default: ""
+        type: string
   push:
     paths:
       - .github/workflows/seed-state.yml
@@ -42,6 +48,7 @@ jobs:
       - name: Seed ladder state
         env:
           LADDER_STATE_PATH: .ladder-state/state.json
+          SEED_FORCE: ${{ github.event.inputs.seed_force }}
         run: python3 seed_state.py
 
       - name: Upload ladder state
