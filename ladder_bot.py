@@ -5,7 +5,8 @@ No new order is sent on weekends or in the KST pre-reset windows
 A live reset places whole tickers only, at most 6 new orders. A ticker
 that does not fit is left uncancelled and logged DEFERRED for a later run.
 Inquiry plus, when live and allowed, limit buy, limit sell, and full cancel.
-The modify endpoint is never called. Prints counts and OK/ERROR codes only.
+The modify endpoint is never called. Prints counts, OK/ERROR codes, and
+on a broker reject the ticker, side, price, and redacted rsp_cd/rsp_msg.
 
 Spec fields used:
 - POST /oauth2/token
@@ -16,8 +17,9 @@ Spec fields used:
   cns_qty, orr_no, orr_dt, fc_sec_trd_nat_cd
 - POST /gbstock/order/v1/buy and /sell
   fc_sec_trd_nat_cd 200, iem_cd ticker, orr_qty, fc_orr_uit_pr,
-  ahi_nmn_pr_tp_cd 63 from 09:10-16:59 KST, 61 from 17:10 until the
-  next 09:10, or ORDER_TYPE when that variable is 00, 61, 62, or 63.
+  ahi_nmn_pr_tp_cd from the US Eastern clock for premarket (61) and
+  after-hours (62), and from the KST clock for the day session (63).
+  ORDER_TYPE overrides that when it is 00, 61, 62, or 63.
   Spec requires fc_orr_uit_pr for 00, 61, 62, and 63. Buy also sends
   wtm_cur_knd_cd 1.
 - POST /gbstock/order/v1/cancel
@@ -96,24 +98,95 @@ def _order_type_override():
     return None
 
 
-def _order_type(now):
-    """Session limit code. Never falls back to 00 unless ORDER_TYPE is 00.
+def _as_kst(now):
+    if now.tzinfo is None:
+        return now.replace(tzinfo=KST)
+    return now.astimezone(KST)
 
-    09:10 through 16:59 KST is 63 (day-session limit). 17:10 through the
-    next 09:10, including 00:00-07:59, is 61 (premarket limit). The
-    17:00-17:09 gap has no session code.
+
+def _as_et(now):
+    if now.tzinfo is None:
+        return now.replace(tzinfo=ET)
+    return now.astimezone(ET)
+
+
+def _minutes(now):
+    return now.hour * 60 + now.minute
+
+
+def _us_bucket(now_et):
+    """US session from America/New_York. None outside extended hours.
+
+    Premarket is 04:00 inclusive to 09:30 exclusive. After-hours is
+    16:00 inclusive to 20:00 exclusive, matching the intraday window
+    end. 09:30 and 16:00 are the regular cash open and close; the repo
+    notes do not name those two boundaries, only 04:00-20:00 ET.
+    """
+    if now_et.weekday() >= 5:
+        return None
+    minutes = _minutes(now_et)
+    if 4 * 60 <= minutes < 9 * 60 + 30:
+        return "pre"
+    if 9 * 60 + 30 <= minutes < 16 * 60:
+        return "regular"
+    if 16 * 60 <= minutes < 20 * 60:
+        return "post"
+    return None
+
+
+def _kst_day(now_kst):
+    """Korean daytime session, 09:10 inclusive through 16:59 inclusive."""
+    if now_kst.weekday() >= 5:
+        return False
+    minutes = _minutes(now_kst)
+    return 9 * 60 + 10 <= minutes <= 16 * 60 + 59
+
+
+def _session(now_kst, now_et=None, mode=None):
+    """Return (order type or None, skip line or "").
+
+    Codes from order_type_check: 61 premarket, 62 after-hours, 63 day
+    session. 00 is used only when ORDER_TYPE is 00.
+
+    US regular hours (09:30-16:00 ET) have no code in the repo. They
+    stay on 61, which is what the old KST clock sent in that region.
     """
     override = _order_type_override()
     if override is None:
-        return None
+        return None, "ERROR config"
     if override:
-        return override
-    minutes = now.hour * 60 + now.minute
-    if 9 * 60 + 10 <= minutes <= 16 * 60 + 59:
-        return "63"
-    if minutes >= 17 * 60 + 10 or minutes < 9 * 60 + 10:
-        return "61"
-    return None
+        return override, ""
+    now_kst = _as_kst(now_kst)
+    now_et = _as_et(now_et) if now_et is not None else now_kst.astimezone(ET)
+    bucket = _us_bucket(now_et)
+    day = _kst_day(now_kst)
+    # The 09:10 reset wants day-session orders (63). While US after-hours
+    # is still open those would be the wrong book, so the reset waits.
+    if mode == "reset" and day and bucket == "post":
+        return None, "skip: day session not open"
+    if bucket == "post":
+        return "62", ""
+    if bucket == "pre":
+        return "61", ""
+    if bucket == "regular":
+        return "61", ""
+    if day:
+        return "63", ""
+    if mode == "reset" and _reset_slot(now_kst) == "17":
+        return None, "skip: premarket not open"
+    return None, "skip: session closed"
+
+
+def _order_type(now, now_et=None, mode=None):
+    """Session limit code. Never falls back to 00 unless ORDER_TYPE is 00."""
+    return _session(now, now_et, mode)[0]
+
+
+def _session_skip(now_kst, now_et, mode):
+    code, reason = _session(now_kst, now_et, mode)
+    if code:
+        return ""
+    return reason or "skip: session closed"
 
 
 def _orders_blocked(now):
@@ -658,24 +731,74 @@ def _order_ok(status, payload):
     return isinstance(number, str) and number.strip().isdigit()
 
 
+_last_reject = None
+
+
+def _capture_reject(url, body, status, payload):
+    """Remember a broker rejection. The log line never includes secrets."""
+    global _last_reject
+    rsp_cd, rsp_msg = gb._rsp(payload if isinstance(payload, dict) else {})
+    act = ""
+    ticker = ""
+    price = ""
+    if isinstance(body, dict):
+        raw_act = body.get("act_no")
+        if isinstance(raw_act, str):
+            act = raw_act.strip()
+        raw_ticker = body.get("iem_cd")
+        if isinstance(raw_ticker, str):
+            ticker = raw_ticker.strip()
+        raw_price = body.get("fc_orr_uit_pr")
+        if isinstance(raw_price, (int, float)) and not isinstance(raw_price, bool):
+            price = raw_price
+    if len(act) >= 4:
+        rsp_cd = " ".join(rsp_cd.replace(act, "").split())
+        rsp_msg = " ".join(rsp_msg.replace(act, "").split())
+    side = {BUY_URL: "buy", SELL_URL: "sell", CANCEL_URL: "cancel"}.get(url, "")
+    http = "" if status is None else status
+    _last_reject = {
+        "ticker": ticker,
+        "side": side,
+        "price": price,
+        "http": http,
+        "rsp_cd": rsp_cd,
+        "rsp_msg": rsp_msg,
+    }
+
+
+def _log_reject():
+    info = _last_reject
+    if not info:
+        return False
+    print(
+        "REJECT {ticker} {side} {price} http {http} rsp_cd {rsp_cd} rsp_msg {rsp_msg}".format(
+            **info
+        )
+    )
+    return True
+
+
 def _post_order(url, body):
+    global _last_reject
+    _last_reject = None
     if url not in _ORDER_URLS or _orders_blocked(_now_kst()):
         return None
     status, _headers, payload = gb._post_bearer(url, gb._json_body(body), {})
-    if status == 401:
-        return None
-    if not _order_ok(status, payload):
+    if status == 401 or not _order_ok(status, payload):
+        _capture_reject(url, body, status, payload)
         return None
     return True
 
 
 def _place(account, ticker, side, price, qty, live, counter):
+    global _last_reject
+    _last_reject = None
     if not live:
         return False
     index = _level_of(ticker, price)
     if index is None or qty < 1 or qty > _HARD_MAX[ticker]:
         return None
-    kind = _order_type(_now_kst())
+    kind = _order_type(_now_kst(), mode=os.environ.get("LADDER_MODE"))
     if kind is None:
         return None
     if counter[0] >= _MAX_NEW:
@@ -698,6 +821,8 @@ def _place(account, ticker, side, price, qty, live, counter):
 
 
 def _cancel(account, ticker, order, live):
+    global _last_reject
+    _last_reject = None
     if not live:
         return False
     if order.get("idx") is None:
@@ -721,9 +846,11 @@ def _cancel(account, ticker, order, live):
 
 
 def _place_exception(account, live, counter):
+    global _last_reject
+    _last_reject = None
     if not live:
         return False
-    kind = _order_type(_now_kst())
+    kind = _order_type(_now_kst(), mode=os.environ.get("LADDER_MODE"))
     if kind is None:
         return None
     if counter[0] >= _MAX_NEW:
@@ -1057,10 +1184,15 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
     ):
         print("OK skip")
         return 0
-    kind = _order_type(_now_kst())
-    if kind is None:
+    kind, _reason = _session(now_kst, now_et, mode)
+    wall_kst = _now_kst()
+    wall_kind, wall_reason = _session(wall_kst, wall_kst.astimezone(ET), mode)
+    if _reason == "ERROR config" or wall_reason == "ERROR config":
         print("ERROR config")
         return 1
+    if not kind or kind != wall_kind:
+        print(_reason or wall_reason or "skip: session closed")
+        return 0
     print(f"order type {kind}")
     if _exception_filled(fills, set(working["handled"])):
         working["exception_filled"] = True
@@ -1191,6 +1323,15 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
 
     counter = [0]
     sent_any = False
+
+    def _rejected():
+        if not _log_reject():
+            return False
+        if live:
+            actions["save_state"](_clean_state(working))
+        print("ERROR reject")
+        return True
+
     for plan in plans:
         placed = 0
         cancelled = 0
@@ -1217,6 +1358,8 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
                     return 0
                 result = actions["cancel"](plan["ticker"], order)
                 if result is None:
+                    if _rejected():
+                        return 1
                     print("ERROR unexpected")
                     return 1
                 if result:
@@ -1237,6 +1380,8 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
                     continue
                 result = actions["place"](plan["ticker"], item, counter)
                 if result is None:
+                    if _rejected():
+                        return 1
                     print("ERROR unexpected")
                     return 1
                 if result:
@@ -1295,6 +1440,8 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
                 return 1
             result = actions["place_exception"](counter)
             if result is None:
+                if _rejected():
+                    return 1
                 print("ERROR unexpected")
                 return 1
             if result:
@@ -1376,6 +1523,8 @@ def main():
     if not account:
         print("ERROR unexpected")
         return 1
+    if account not in gb._secrets:
+        gb._secrets.append(account)
 
     opens = _inquiry(account, now_kst, "open")
     fills = _inquiry(account, now_kst, "fill")

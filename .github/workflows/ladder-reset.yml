@@ -16,6 +16,18 @@ on:
     - cron: "12 8 * * 1-5"
     - cron: "14 8 * * 1-5"
     - cron: "16 8 * * 1-5"
+    # US standard time: 17:10 KST is 03:10 ET, before premarket at 04:00 ET
+    # (18:00 KST). These runs place that reset once premarket is open.
+    # 18:00, 18:02, 18:04 KST = 09:00, 09:02, 09:04 UTC.
+    # During daylight time the 17:10 reset already finished, so these skip.
+    - cron: "0 9 * * 1-5"
+    - cron: "2 9 * * 1-5"
+    - cron: "4 9 * * 1-5"
+    # US standard time: 09:10-09:59 KST is still US after-hours. The day-session
+    # reset waits and places 63 from 10:00 KST (01:00 UTC), three batches.
+    - cron: "0 1 * * 1-5"
+    - cron: "2 1 * * 1-5"
+    - cron: "4 1 * * 1-5"
   push:
     paths:
       - .github/workflows/ladder-reset.yml
