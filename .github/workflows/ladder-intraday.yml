@@ -12,7 +12,14 @@ on:
     - cron: "*/5 0-6 * * 1-5"
     # US session 17:10-07:59 KST = 08:10-22:59 UTC. 08:00-09:10 KST
     # (23:00-00:10 UTC) is the morning wipe guard and is not polled.
+    # Friday 15:00-22:59 UTC is Saturday 00:00-07:59 KST, still Friday
+    # in New York, so this range covers that morning too.
     - cron: "*/5 8-22 * * 1-5"
+    # Standard time: Friday after-hours runs until 10:00 KST Saturday
+    # (20:00 EST). 09:10-09:55 KST is 00:10-00:55 UTC Saturday. 09:00-09:10
+    # is the wipe guard. Daylight time has already ended at 09:00 KST,
+    # so those runs hit the time guard and exit.
+    - cron: "*/5 0 * * 6"
   push:
     paths:
       - .github/workflows/ladder-intraday.yml

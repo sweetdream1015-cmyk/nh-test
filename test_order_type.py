@@ -841,18 +841,22 @@ def test_day_session_crons():
     crons = _workflow_crons("ladder-intraday.yml")
     assert "*/5 0-6 * * 1-5" in crons
     assert "*/5 8-22 * * 1-5" in crons
+    assert "*/5 0 * * 6" in crons
     assert "*/5 * * * 1-5" not in crons
-    # Monday/Wednesday/Friday in daylight time and in standard time.
+    # Monday/Wednesday/Friday in daylight time and in standard time,
+    # plus Saturday (Friday's US session) and Sunday.
     days = (
         datetime(2026, 10, 26, tzinfo=timezone.utc),
         datetime(2026, 10, 28, tzinfo=timezone.utc),
         datetime(2026, 10, 30, tzinfo=timezone.utc),
+        datetime(2026, 10, 31, tzinfo=timezone.utc),
+        datetime(2026, 11, 1, tzinfo=timezone.utc),
         datetime(2026, 11, 2, tzinfo=timezone.utc),
         datetime(2026, 11, 4, tzinfo=timezone.utc),
         datetime(2026, 11, 6, tzinfo=timezone.utc),
+        datetime(2026, 11, 7, tzinfo=timezone.utc),
     )
     for day in days:
-        assert day.isoweekday() <= 5, day.isoformat()
         for hour in range(24):
             for minute in range(0, 60, 5):
                 moment = day.replace(hour=hour, minute=minute)
@@ -863,7 +867,117 @@ def test_day_session_crons():
                     "intraday", kst, moment.astimezone(bot.ET)
                 ) and not bot._orders_blocked(kst)
                 if tradable:
-                    assert hits == 1, moment.isoformat()
+                    assert hits == 1, (moment.isoformat(), kst.isoformat())
+
+
+def test_weekend_guard_follows_us_session():
+    _restore_guards()
+    # Saturday 31 Oct 2026 is still daylight time. Friday's session ends 09:00 KST.
+    sat = _kst(2026, 10, 31, 0, 0)
+    sun = _kst(2026, 11, 1, 0, 0)
+    mon = _kst(2026, 10, 26, 0, 0)
+    for hour, minute in ((0, 30), (3, 0), (7, 30)):
+        moment = sat.replace(hour=hour, minute=minute)
+        assert not bot._orders_blocked(moment), moment.isoformat()
+    assert bot._order_type(sat.replace(hour=0, minute=30), _et_of(sat.replace(hour=0, minute=30)), "intraday") == "61"
+    assert bot._order_type(sat.replace(hour=3, minute=0), _et_of(sat.replace(hour=3, minute=0)), "intraday") == "61"
+    assert bot._order_type(sat.replace(hour=7, minute=30), _et_of(sat.replace(hour=7, minute=30)), "intraday") == "62"
+    for hour, minute in ((9, 0), (9, 15), (12, 0), (17, 15), (23, 0)):
+        moment = sat.replace(hour=hour, minute=minute)
+        assert bot._orders_blocked(moment), moment.isoformat()
+    for hour, minute in ((0, 30), (3, 0), (9, 0), (12, 0), (18, 0), (23, 30)):
+        moment = sun.replace(hour=hour, minute=minute)
+        assert bot._orders_blocked(moment), moment.isoformat()
+    # Monday before the day session is closed. 09:10 and the US evening are not.
+    for hour, minute in ((0, 30), (3, 0), (7, 30), (9, 0)):
+        moment = mon.replace(hour=hour, minute=minute)
+        assert bot._orders_blocked(moment), moment.isoformat()
+    assert not bot._orders_blocked(mon.replace(hour=9, minute=10))
+    assert not bot._orders_blocked(mon.replace(hour=12, minute=0))
+    assert not bot._orders_blocked(mon.replace(hour=17, minute=15))
+    # Standard time: Friday after-hours lasts until 10:00 KST Saturday.
+    est_sat = _kst(2026, 11, 7, 0, 0)
+    assert est_sat.weekday() == 5
+    for hour, minute in ((0, 30), (3, 0), (7, 30), (9, 30)):
+        moment = est_sat.replace(hour=hour, minute=minute)
+        assert not bot._orders_blocked(moment), moment.isoformat()
+    assert bot._order_type(est_sat.replace(hour=7, minute=30), _et_of(est_sat.replace(hour=7, minute=30)), "intraday") == "62"
+    assert bot._order_type(est_sat.replace(hour=9, minute=30), _et_of(est_sat.replace(hour=9, minute=30)), "intraday") == "62"
+    for hour, minute in ((8, 30), (9, 0), (10, 0), (12, 0)):
+        moment = est_sat.replace(hour=hour, minute=minute)
+        assert bot._orders_blocked(moment), moment.isoformat()
+    assert bot._orders_blocked(_kst(2026, 11, 2, 7, 30))
+    assert not bot._orders_blocked(_kst(2026, 11, 2, 18, 0))
+
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "NAIL"
+    state = bot._fresh_state()
+    state["exception_filled"] = True
+    state["tickers"]["NAIL"] = {
+        "sell": _idx("NAIL", 33),
+        "buy": _idx("NAIL", 28),
+        "double_used": [],
+    }
+    state = bot._clean_state(state)
+    code, out, world = _run_tracking(sat.replace(hour=7, minute=30), state, [], [])
+    assert code == 0, out
+    assert "skip: time guard" not in out
+    assert "order type 62" in out
+    assert world["placed"] == []
+    assert world["cancelled"] == []
+    code, out, world = _run_tracking(sun.replace(hour=3, minute=0), state, [], [])
+    assert code == 0, out
+    assert "skip: time guard" in out
+    assert world["placed"] == []
+    assert world["saved"] is None
+    code, out, world = _run_tracking(sat.replace(hour=9, minute=15), state, [], [])
+    assert code == 0, out
+    assert "skip: time guard" in out
+    assert world["placed"] == []
+
+
+def test_dates_cover_previous_trading_day():
+    _restore_guards()
+    monday = _kst(2026, 10, 26, 12, 0)
+    assert bot._dates(monday) == ["20261026", "20261025", "20261023"]
+    assert bot._dates(_kst(2026, 11, 2, 10, 0)) == ["20261102", "20261101", "20261030"]
+    assert bot._dates(_kst(2026, 10, 27, 12, 0)) == ["20261027", "20261026"]
+    assert bot._dates(_kst(2026, 10, 31, 3, 0)) == ["20261031", "20261030"]
+    assert bot._dates(_kst(2026, 11, 1, 12, 0)) == ["20261101", "20261031", "20261030"]
+    assert len(bot._dates(monday)) == len(set(bot._dates(monday)))
+
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "NAIL"
+    nail_key = "f6" * 32
+    state = bot._fresh_state()
+    state["exception_filled"] = True
+    state["tickers"]["NAIL"] = {
+        "sell": _idx("NAIL", 33),
+        "buy": _idx("NAIL", 28),
+        "double_used": [],
+    }
+    opens = [
+        {"ticker": "NAIL", "side": "sell", "price": 36, "qty": 10},
+        {"ticker": "NAIL", "side": "buy", "price": 28, "qty": 10},
+        {"ticker": "NAIL", "side": "buy", "price": 26, "qty": 10},
+    ]
+    fills = [_fill("NAIL", "sell", 33, nail_key, 10)]
+    fresh = bot._clean_state(state)
+    code, out, world = _run_tracking(monday, fresh, opens, fills)
+    assert code == 0, out
+    assert world["placed"] == [("NAIL", "sell", 39, 10), ("NAIL", "buy", 30, 10)]
+    assert nail_key in world["saved"]["handled"]
+    assert world["cancelled"] == []
+
+    handled = bot._clean_state(state)
+    handled["handled"] = [nail_key]
+    code, out, again = _run_tracking(monday, handled, opens, fills)
+    assert code == 0, out
+    assert again["placed"] == []
+    assert again["cancelled"] == []
+    assert again["saved"]["tickers"]["NAIL"]["sell"] == _idx("NAIL", 33)
+    assert again["saved"]["tickers"]["NAIL"]["buy"] == _idx("NAIL", 28)
+    assert again["saved"]["handled"] == [nail_key]
 
 
 def main():
@@ -879,6 +993,8 @@ def main():
         test_day_session_quantities()
         test_day_session_partial_does_not_advance()
         test_day_session_crons()
+        test_weekend_guard_follows_us_session()
+        test_dates_cover_previous_trading_day()
     finally:
         bot._now_kst = _ORIG_NOW
         bot._orders_blocked = _ORIG_BLOCKED
