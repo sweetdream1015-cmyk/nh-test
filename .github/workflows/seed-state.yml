@@ -4,7 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       seed_force:
-        description: "지정 티커만 교정. 매도하한:매수상한. 예: KORU:13.5:11.3,SOXL:113:94. 비우면 기존 시드."
+        description: "지정 티커만 교정. 매도하한:매수상한. 예: KORU:13.5:11.3,SOXL:113:94. 비우면 기존 시드. 주문은 내지 않음."
+        required: false
+        default: ""
+        type: string
+      seed_flags:
+        description: "주문 없이 표시만 저장. exception_filled=true 또는 false. 더블 매수 가격은 티커.double_used=가격,가격 이며 그 티커 목록을 바꿈. 빈 값이면 그 티커의 double_used를 지움. 세미콜론으로 구분. 예: exception_filled=true;SOXL.double_used=72. 비우면 표시는 그대로."
         required: false
         default: ""
         type: string
@@ -49,6 +54,7 @@ jobs:
         env:
           LADDER_STATE_PATH: .ladder-state/state.json
           SEED_FORCE: ${{ github.event.inputs.seed_force }}
+          SEED_FLAGS: ${{ github.event.inputs.seed_flags }}
         run: python3 seed_state.py
 
       - name: Upload ladder state
