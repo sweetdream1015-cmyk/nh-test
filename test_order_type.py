@@ -747,7 +747,7 @@ def test_day_session_quantities():
         79,
         1,
     )
-    assert soxl_below["placed"] == [("SOXL", "sell", 79, 1), ("SOXL", "buy", 66, 2)]
+    assert soxl_below["placed"] == [("SOXL", "sell", 79, 1), ("SOXL", "buy", 66, 4)]
 
 
 def test_day_session_partial_does_not_advance():

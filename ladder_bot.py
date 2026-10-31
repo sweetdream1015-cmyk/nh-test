@@ -333,16 +333,27 @@ def _anchors(ticker, orders):
 
 
 def _in_double_zone(ticker, price):
+    """True where the first buy is above base, so double_used can revert it.
+
+    NAIL is at or below 22. KORU is at or below 9.4. SOXL is exactly 72
+    or at or below 66.
+    """
     if ticker == "NAIL":
         return price <= 22
     if ticker == "KORU":
         return price <= 9.4
     if ticker == "SOXL":
-        return price <= 72
+        return price <= 66 or abs(price - 72) < 0.051
     return False
 
 
 def _buy_computed(ticker, index, double_used):
+    """First-buy size, or base once that level is already in double_used.
+
+    SOXL is 4 on the first buy at 72 and at 66 or below, otherwise 1.
+    A used SOXL level is 1. KORU at or below 9.4 is 2, then 1. NAIL at
+    or below 22 is 20, then 10.
+    """
     ladder = _cfg(ticker)["ladder"]
     price = ladder[index]
     qty = _cfg(ticker)["buy_qty"](price)

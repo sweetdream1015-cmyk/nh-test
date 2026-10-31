@@ -621,6 +621,84 @@ def test_seed_flags():
         assert created["tickers"]["SOXL"]["double_used"] == []
 
 
+def test_reset_low_rung_sizes():
+    koru = ladders._CFG["KORU"]["ladder"]
+    assert koru[2] == 8.6
+    assert 8.5 not in koru
+    assert bot._buy_computed("SOXL", _level("SOXL", 72), []) == 4
+    assert bot._buy_computed("SOXL", _level("SOXL", 66), []) == 4
+    assert bot._buy_computed("SOXL", _level("SOXL", 60), []) == 4
+    assert bot._buy_computed("SOXL", _level("SOXL", 79), []) == 1
+    assert bot._buy_computed("SOXL", _level("SOXL", 66), [_level("SOXL", 66)]) == 1
+    assert bot._buy_computed("SOXL", _level("SOXL", 72), [_level("SOXL", 72)]) == 1
+    assert bot._buy_computed("KORU", _level("KORU", 8.6), []) == 2
+    assert bot._buy_computed("KORU", _level("KORU", 9.4), []) == 2
+    assert bot._buy_computed("NAIL", _level("NAIL", 30), []) == 10
+
+    cases = [
+        (
+            "SOXL",
+            79,
+            66,
+            [_level("SOXL", 72)],
+            [
+                ("sell", 79, 1),
+                ("sell", 86, 1),
+                ("buy", 66, 4),
+                ("buy", 60, 4),
+            ],
+        ),
+        (
+            "KORU",
+            11.3,
+            9.4,
+            [],
+            [
+                ("sell", 11.3, 1),
+                ("sell", 12.5, 1),
+                ("buy", 9.4, 2),
+                ("buy", 8.6, 2),
+            ],
+        ),
+        (
+            "NAIL",
+            36,
+            30,
+            [],
+            [
+                ("sell", 36, 10),
+                ("sell", 39, 10),
+                ("buy", 30, 10),
+                ("buy", 28, 10),
+            ],
+        ),
+    ]
+    os.environ["LIVE_TRADING"] = "on"
+    for ticker, sell_px, buy_px, used, expected in cases:
+        got = bot._desired(
+            ticker, _level(ticker, sell_px), _level(ticker, buy_px), 1.0, used
+        )
+        assert [(item["side"], item["price"], item["qty"]) for item in got] == expected
+        os.environ["LIVE_TICKERS"] = ticker
+        state = bot._clean_state(
+            {
+                "version": 2,
+                "tickers": {ticker: _pair(ticker, sell_px, buy_px, used)},
+                "handled": [],
+                "exception_filled": True,
+                "reset_done": {"09": "", "17": ""},
+            }
+        )
+        code, out, world = _run(state, [], {})
+        assert code == 0, out
+        assert world["placed"] == [
+            (ticker, side, price, qty) for side, price, qty in expected
+        ], (ticker, world["placed"], out)
+        assert world["cancelled"] == []
+        assert world["exceptions"] == []
+        assert "exception placed" not in out
+
+
 def test_workflows():
     root = os.path.dirname(os.path.abspath(__file__))
     reset = open(
@@ -661,6 +739,7 @@ def main():
         test_push_and_time_guard_place_nothing()
         test_seed_force()
         test_seed_flags()
+        test_reset_low_rung_sizes()
         test_workflows()
     finally:
         bot._now_kst = _ORIG_NOW
