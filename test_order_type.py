@@ -4,7 +4,7 @@ import io
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 import gb_readonly_check as gb
 import ladder_bot as bot
@@ -54,6 +54,11 @@ def test_session_table():
         (_kst(2026, 10, 30, 4, 59), "intraday", "61"),
         # 09:10 KST daylight time is 20:10 ET, after-hours already over.
         (_kst(2026, 10, 29, 9, 10), "reset", "63"),
+        (_kst(2026, 10, 29, 9, 10), "intraday", "63"),
+        (_kst(2026, 10, 29, 12, 0), "intraday", "63"),
+        (_kst(2026, 10, 29, 15, 59), "intraday", "63"),
+        (_kst(2026, 10, 29, 16, 59), "intraday", "63"),
+        (_kst(2026, 10, 29, 9, 5), "intraday", None),
         (_kst(2026, 10, 29, 16, 59), "reset", "63"),
         # Standard time starts Sun Nov 1. Monday 17:10 KST is 03:10 EST.
         (_kst(2026, 11, 2, 17, 10), "reset", None),
@@ -72,6 +77,9 @@ def test_session_table():
         (_kst(2026, 11, 3, 9, 59), "intraday", "62"),
         (_kst(2026, 11, 3, 10, 0), "reset", "63"),
         (_kst(2026, 11, 3, 10, 0), "intraday", "63"),
+        (_kst(2026, 11, 3, 9, 30), "intraday", "62"),
+        (_kst(2026, 11, 3, 15, 0), "intraday", "63"),
+        (_kst(2026, 11, 2, 17, 30), "intraday", None),
     ]
     for moment, mode, expected in cases:
         got = bot._order_type(moment, _et_of(moment), mode)
@@ -82,6 +90,10 @@ def test_session_table():
     assert bot._session_skip(_kst(2026, 11, 3, 9, 10), _et_of(_kst(2026, 11, 3, 9, 10)), "reset") == (
         "skip: day session not open"
     )
+    early = _kst(2026, 10, 29, 9, 5)
+    assert bot._session_skip(early, _et_of(early), "intraday") == "skip: session closed"
+    between = _kst(2026, 11, 2, 17, 30)
+    assert bot._session_skip(between, _et_of(between), "intraday") == "skip: session closed"
 
 
 def test_order_type_override():
@@ -381,6 +393,479 @@ def test_crons_kept():
     assert '- cron: "0 1 * * 1-5"' in text
 
 
+def _restore_guards():
+    bot._orders_blocked = _ORIG_BLOCKED
+    bot._now_kst = _ORIG_NOW
+    gb._post_bearer = _ORIG_POST
+    os.environ.pop("ORDER_TYPE", None)
+
+
+def _run_tracking(moment, state, opens, fills, place_fn=None):
+    world = {"saved": None, "placed": [], "cancelled": [], "exceptions": []}
+
+    def save_state(data):
+        world["saved"] = json.loads(json.dumps(data))
+
+    def cancel(ticker, order):
+        world["cancelled"].append((ticker, order.get("side"), order.get("price")))
+        return True
+
+    def exists(_ticker, _side, _index):
+        return False
+
+    def confirm_clear(_ticker):
+        return True
+
+    def exception_open():
+        return False
+
+    def place_exception(_counter):
+        world["exceptions"].append((100, 75))
+        return True
+
+    def place(ticker, item, counter):
+        if place_fn is None:
+            result = True
+        else:
+            result = place_fn(ticker, item, counter)
+        if result:
+            world["placed"].append((ticker, item["side"], item["price"], item["qty"]))
+        return result
+
+    actions = {
+        "place": place,
+        "cancel": cancel,
+        "exists": exists,
+        "confirm_clear": confirm_clear,
+        "exception_open": exception_open,
+        "place_exception": place_exception,
+        "save_state": save_state,
+    }
+    _arm(moment)
+    code, out = _capture(
+        lambda: bot.run(
+            "intraday",
+            "workflow_dispatch",
+            moment,
+            _et_of(moment),
+            opens,
+            fills,
+            state,
+            actions,
+        )
+    )
+    return code, out, world
+
+
+def _fill(ticker, side, price, key, qty):
+    return {
+        "ticker": ticker,
+        "side": side,
+        "idx": _idx(ticker, price),
+        "key": key,
+        "filled_qty": qty,
+        "cancelled_qty": 0,
+    }
+
+
+def test_day_session_window():
+    _restore_guards()
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "NAIL"
+    noon = _kst(2026, 10, 29, 12, 0)
+    last = _kst(2026, 10, 29, 15, 59)
+    late = _kst(2026, 10, 29, 16, 30)
+    morning_guard = _kst(2026, 10, 29, 8, 30)
+    wipe = _kst(2026, 10, 29, 9, 5)
+    weekend = _kst(2026, 10, 31, 12, 0)
+    est_overlap = _kst(2026, 11, 3, 9, 30)
+    est_day = _kst(2026, 11, 3, 10, 0)
+    est_gap = _kst(2026, 11, 2, 17, 30)
+    est_us = _kst(2026, 11, 2, 18, 0)
+    cases = [
+        (noon, True, False),
+        (last, True, False),
+        (late, True, True),
+        (morning_guard, True, True),
+        (wipe, False, True),
+        (weekend, False, True),
+        (est_overlap, True, False),
+        (est_day, True, False),
+        (est_gap, False, False),
+        (est_us, True, False),
+    ]
+    for moment, open_, blocked in cases:
+        got_open = bot._window_open("intraday", moment, _et_of(moment))
+        got_blocked = bot._orders_blocked(moment)
+        assert got_open is open_, (moment.isoformat(), got_open, open_)
+        assert got_blocked is blocked, (moment.isoformat(), got_blocked, blocked)
+    assert bot._window_open("reset", noon, _et_of(noon))
+    assert bot._window_open("reset", est_gap, _et_of(est_gap))
+    assert not bot._window_open("intraday", est_gap, _et_of(est_gap))
+    assert bot._kst_day(late)
+    assert bot._order_type(late, _et_of(late), "intraday") == "63"
+
+    state = bot._fresh_state()
+    state["exception_filled"] = True
+    state["tickers"]["NAIL"] = {
+        "sell": _idx("NAIL", 33),
+        "buy": _idx("NAIL", 28),
+        "double_used": [],
+    }
+    state = bot._clean_state(state)
+    for moment, text in (
+        (morning_guard, "skip: time guard"),
+        (wipe, "skip: time guard"),
+        (late, "skip: time guard"),
+        (weekend, "skip: time guard"),
+    ):
+        code, out, world = _run_tracking(moment, state, [], [], None)
+        assert code == 0, out
+        assert text in out
+        assert world["placed"] == []
+        assert world["cancelled"] == []
+        assert world["saved"] is None
+    code, out, world = _run_tracking(est_gap, state, [], [], None)
+    assert code == 0, out
+    assert "OK skip" in out
+    assert "order type" not in out
+    assert world["placed"] == []
+    assert world["saved"] is None
+
+
+def _day_book():
+    nail_key = "a1" * 32
+    koru_key = "b2" * 32
+    soxl_key = "c3" * 32
+    state = bot._fresh_state()
+    state["exception_filled"] = False
+    state["tickers"]["NAIL"] = {
+        "sell": _idx("NAIL", 33),
+        "buy": _idx("NAIL", 28),
+        "double_used": [],
+    }
+    state["tickers"]["KORU"] = {
+        "sell": _idx("KORU", 12.5),
+        "buy": _idx("KORU", 11.3),
+        "double_used": [],
+    }
+    state["tickers"]["SOXL"] = {
+        "sell": _idx("SOXL", 94),
+        "buy": _idx("SOXL", 86),
+        "double_used": [],
+    }
+    opens = [
+        {"ticker": "NAIL", "side": "sell", "price": 36, "qty": 10},
+        {"ticker": "NAIL", "side": "buy", "price": 28, "qty": 10},
+        {"ticker": "NAIL", "side": "buy", "price": 26, "qty": 10},
+        {"ticker": "KORU", "side": "sell", "price": 12.5, "qty": 1},
+        {"ticker": "KORU", "side": "sell", "price": 13.5, "qty": 1},
+        {"ticker": "KORU", "side": "buy", "price": 10.3, "qty": 1},
+        {"ticker": "SOXL", "side": "sell", "price": 94, "qty": 1},
+        {"ticker": "SOXL", "side": "sell", "price": 103, "qty": 1},
+        {"ticker": "SOXL", "side": "buy", "price": 79, "qty": 1},
+        {"ticker": "SOXL", "side": "buy", "price": 75, "qty": 100},
+    ]
+    fills = [
+        _fill("NAIL", "sell", 33, nail_key, 10),
+        _fill("KORU", "buy", 11.3, koru_key, 1),
+        _fill("SOXL", "buy", 86, soxl_key, 1),
+    ]
+    return bot._clean_state(state), opens, fills, (nail_key, koru_key, soxl_key)
+
+
+def test_day_session_fill_followup():
+    """Sell steps up, buy steps down, nothing is cancelled, cap stays 6."""
+    _restore_guards()
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "NAIL,KORU,SOXL"
+    expected = [
+        ("NAIL", "sell", 39, 10),
+        ("NAIL", "buy", 30, 10),
+        ("KORU", "sell", 11.3, 1),
+        ("KORU", "buy", 9.4, 2),
+        ("SOXL", "sell", 86, 1),
+        ("SOXL", "buy", 72, 4),
+    ]
+    moments = (
+        (_kst(2026, 10, 29, 12, 0), "63"),
+        (_kst(2026, 10, 29, 15, 59), "63"),
+        (_kst(2026, 11, 3, 10, 0), "63"),
+        (_kst(2026, 11, 3, 9, 30), "62"),
+    )
+    for moment, kind in moments:
+        state, opens, fills, keys = _day_book()
+        code, out, world = _run_tracking(moment, state, opens, fills)
+        assert code == 0, out
+        assert "order type " + kind in out
+        assert world["placed"] == expected, (moment.isoformat(), world["placed"], out)
+        assert world["cancelled"] == []
+        assert world["exceptions"] == []
+        assert "exception placed" not in out
+        assert "ERROR" not in out
+        assert "NEEDS_REVIEW" not in out
+        saved = world["saved"]
+        assert saved["tickers"]["NAIL"]["sell"] == _idx("NAIL", 36)
+        assert saved["tickers"]["NAIL"]["buy"] == _idx("NAIL", 30)
+        assert saved["tickers"]["KORU"]["sell"] == _idx("KORU", 11.3)
+        assert saved["tickers"]["KORU"]["buy"] == _idx("KORU", 10.3)
+        assert saved["tickers"]["SOXL"]["sell"] == _idx("SOXL", 86)
+        assert saved["tickers"]["SOXL"]["buy"] == _idx("SOXL", 79)
+        for key in keys:
+            assert key in saved["handled"]
+        for _ticker, _side, _price, qty in world["placed"]:
+            assert 1 <= qty <= bot._HARD_MAX[_ticker]
+        booked = list(opens) + [
+            {"ticker": ticker, "side": side, "price": price, "qty": qty}
+            for ticker, side, price, qty in expected
+        ]
+        code, out, again = _run_tracking(moment, saved, booked, fills)
+        assert code == 0, out
+        assert again["placed"] == []
+        assert again["cancelled"] == []
+        assert again["exceptions"] == []
+        assert again["saved"]["tickers"]["NAIL"]["sell"] == _idx("NAIL", 36)
+        assert "OK dry" in out
+
+    state, opens, fills, _keys = _day_book()
+    bare = [order for order in opens if order.get("price") != 75]
+    code, out, world = _run_tracking(_kst(2026, 10, 29, 12, 0), state, bare, fills)
+    assert code == 1, out
+    assert "ERROR max_orders" in out
+    assert world["placed"] == []
+    assert world["cancelled"] == []
+    assert world["exceptions"] == []
+    assert world["saved"] is None
+
+
+def test_day_session_quantities():
+    _restore_guards()
+    os.environ["LIVE_TRADING"] = "on"
+    moment = _kst(2026, 10, 29, 12, 0)
+
+    def _one(ticker, sell_px, buy_px, double_used, opens, fill_side, fill_px, fill_qty):
+        os.environ["LIVE_TICKERS"] = ticker
+        state = bot._fresh_state()
+        state["exception_filled"] = True
+        state["tickers"][ticker] = {
+            "sell": _idx(ticker, sell_px),
+            "buy": _idx(ticker, buy_px),
+            "double_used": [_idx(ticker, price) for price in double_used],
+        }
+        key = "d4" * 32
+        code, out, world = _run_tracking(
+            moment,
+            bot._clean_state(state),
+            opens,
+            [_fill(ticker, fill_side, fill_px, key, fill_qty)],
+        )
+        assert code == 0, out
+        assert "order type 63" in out
+        assert world["cancelled"] == []
+        assert world["exceptions"] == []
+        assert key in world["saved"]["handled"]
+        return world
+
+    # First buy at or below the low level doubles. 20 is not open yet.
+    doubled = _one(
+        "NAIL",
+        26,
+        24,
+        [],
+        [
+            {"ticker": "NAIL", "side": "sell", "price": 26, "qty": 10},
+            {"ticker": "NAIL", "side": "sell", "price": 28, "qty": 10},
+            {"ticker": "NAIL", "side": "buy", "price": 22, "qty": 20},
+        ],
+        "buy",
+        24,
+        10,
+    )
+    assert doubled["placed"] == [("NAIL", "sell", 24, 10), ("NAIL", "buy", 20, 20)]
+
+    # A level already bought reverts to the base quantity.
+    reverted = _one(
+        "NAIL",
+        30,
+        26,
+        [22],
+        [
+            {"ticker": "NAIL", "side": "sell", "price": 30, "qty": 10},
+            {"ticker": "NAIL", "side": "sell", "price": 33, "qty": 10},
+            {"ticker": "NAIL", "side": "buy", "price": 24, "qty": 10},
+        ],
+        "buy",
+        26,
+        10,
+    )
+    assert reverted["placed"] == [("NAIL", "sell", 28, 10), ("NAIL", "buy", 22, 10)]
+    assert _idx("NAIL", 22) in reverted["saved"]["tickers"]["NAIL"]["double_used"]
+
+    koru = _one(
+        "KORU",
+        12.5,
+        11.3,
+        [],
+        [
+            {"ticker": "KORU", "side": "sell", "price": 12.5, "qty": 1},
+            {"ticker": "KORU", "side": "sell", "price": 13.5, "qty": 1},
+            {"ticker": "KORU", "side": "buy", "price": 10.3, "qty": 1},
+        ],
+        "buy",
+        11.3,
+        1,
+    )
+    assert koru["placed"] == [("KORU", "sell", 11.3, 1), ("KORU", "buy", 9.4, 2)]
+
+    soxl_at = _one(
+        "SOXL",
+        94,
+        86,
+        [],
+        [
+            {"ticker": "SOXL", "side": "sell", "price": 94, "qty": 1},
+            {"ticker": "SOXL", "side": "sell", "price": 103, "qty": 1},
+            {"ticker": "SOXL", "side": "buy", "price": 79, "qty": 1},
+        ],
+        "buy",
+        86,
+        1,
+    )
+    assert soxl_at["placed"] == [("SOXL", "sell", 86, 1), ("SOXL", "buy", 72, 4)]
+
+    soxl_below = _one(
+        "SOXL",
+        86,
+        79,
+        [],
+        [
+            {"ticker": "SOXL", "side": "sell", "price": 86, "qty": 1},
+            {"ticker": "SOXL", "side": "sell", "price": 94, "qty": 1},
+            {"ticker": "SOXL", "side": "buy", "price": 72, "qty": 4},
+        ],
+        "buy",
+        79,
+        1,
+    )
+    assert soxl_below["placed"] == [("SOXL", "sell", 79, 1), ("SOXL", "buy", 66, 2)]
+
+
+def test_day_session_partial_does_not_advance():
+    _restore_guards()
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "NAIL"
+    moment = _kst(2026, 10, 29, 12, 0)
+    nail_key = "e5" * 32
+    state = bot._fresh_state()
+    state["exception_filled"] = True
+    state["tickers"]["NAIL"] = {
+        "sell": _idx("NAIL", 33),
+        "buy": _idx("NAIL", 28),
+        "double_used": [],
+    }
+    state = bot._clean_state(state)
+    opens = [
+        {"ticker": "NAIL", "side": "sell", "price": 36, "qty": 10},
+        {"ticker": "NAIL", "side": "buy", "price": 28, "qty": 10},
+        {"ticker": "NAIL", "side": "buy", "price": 26, "qty": 10},
+    ]
+    fills = [_fill("NAIL", "sell", 33, nail_key, 10)]
+    seen = []
+
+    def place(_ticker, item, _counter):
+        seen.append((item["side"], item["price"]))
+        if len(seen) == 1:
+            return True
+        bot._last_reject = {
+            "ticker": "NAIL",
+            "side": item["side"],
+            "price": item["price"],
+            "http": 400,
+            "rsp_cd": "E63",
+            "rsp_msg": "day session type required",
+        }
+        return None
+
+    code, out, world = _run_tracking(moment, state, opens, fills, place)
+    assert code == 1, out
+    assert "order type 63" in out
+    assert seen == [("sell", 39), ("buy", 30)]
+    assert "REJECT NAIL buy 30" in out
+    assert world["cancelled"] == []
+    assert world["saved"]["tickers"]["NAIL"]["sell"] == _idx("NAIL", 33)
+    assert world["saved"]["tickers"]["NAIL"]["buy"] == _idx("NAIL", 28)
+    assert nail_key not in world["saved"]["handled"]
+
+
+def _cron_field(spec, value, low, high):
+    for part in spec.split(","):
+        step = 1
+        base = part
+        if "/" in part:
+            base, step_text = part.split("/", 1)
+            step = int(step_text)
+        if base == "*":
+            start, end = low, high
+        elif "-" in base:
+            left, right = base.split("-", 1)
+            start, end = int(left), int(right)
+        else:
+            start = end = int(base)
+        if start <= value <= end and (value - start) % step == 0:
+            return True
+    return False
+
+
+def _cron_hits(expr, minute, hour, dow):
+    fields = expr.split()
+    assert len(fields) == 5, expr
+    return (
+        _cron_field(fields[0], minute, 0, 59)
+        and _cron_field(fields[1], hour, 0, 23)
+        and _cron_field(fields[4], dow, 0, 7)
+    )
+
+
+def _workflow_crons(name):
+    root = os.path.dirname(os.path.abspath(__file__))
+    text = open(os.path.join(root, ".github", "workflows", name), encoding="utf-8").read()
+    found = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- cron:"):
+            found.append(stripped.split('"')[1])
+    return found
+
+
+def test_day_session_crons():
+    crons = _workflow_crons("ladder-intraday.yml")
+    assert "*/5 0-6 * * 1-5" in crons
+    assert "*/5 8-22 * * 1-5" in crons
+    assert "*/5 * * * 1-5" not in crons
+    # Monday/Wednesday/Friday in daylight time and in standard time.
+    days = (
+        datetime(2026, 10, 26, tzinfo=timezone.utc),
+        datetime(2026, 10, 28, tzinfo=timezone.utc),
+        datetime(2026, 10, 30, tzinfo=timezone.utc),
+        datetime(2026, 11, 2, tzinfo=timezone.utc),
+        datetime(2026, 11, 4, tzinfo=timezone.utc),
+        datetime(2026, 11, 6, tzinfo=timezone.utc),
+    )
+    for day in days:
+        assert day.isoweekday() <= 5, day.isoformat()
+        for hour in range(24):
+            for minute in range(0, 60, 5):
+                moment = day.replace(hour=hour, minute=minute)
+                hits = sum(_cron_hits(expr, minute, hour, day.isoweekday()) for expr in crons)
+                assert hits <= 1, (moment.isoformat(), hits)
+                kst = moment.astimezone(bot.KST)
+                tradable = bot._window_open(
+                    "intraday", kst, moment.astimezone(bot.ET)
+                ) and not bot._orders_blocked(kst)
+                if tradable:
+                    assert hits == 1, moment.isoformat()
+
+
 def main():
     try:
         test_session_table()
@@ -389,6 +874,11 @@ def main():
         test_reject_redaction_and_intraday_state()
         test_partial_leg_does_not_advance()
         test_crons_kept()
+        test_day_session_window()
+        test_day_session_fill_followup()
+        test_day_session_quantities()
+        test_day_session_partial_does_not_advance()
+        test_day_session_crons()
     finally:
         bot._now_kst = _ORIG_NOW
         bot._orders_blocked = _ORIG_BLOCKED

@@ -512,6 +512,9 @@ def test_workflows():
     assert '- cron: "12 0 * * 1-5"' in reset
     assert '- cron: "16 8 * * 1-5"' in reset
     assert "workflow_dispatch:" in intra
+    assert '- cron: "*/5 0-6 * * 1-5"' in intra
+    assert '- cron: "*/5 8-22 * * 1-5"' in intra
+    assert '- cron: "*/5 * * * 1-5"' not in intra
     assert "group: ladder-bot" in reset
     assert "group: ladder-bot" in seed
     assert "SEED_FORCE:" in seed

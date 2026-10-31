@@ -2,6 +2,7 @@
 
 No new order is sent on weekends or in the KST pre-reset windows
 08:00-09:10 and 16:00-17:10. Those runs log "skip: time guard" and exit.
+Intraday follow-up runs in the US session and in the KST day session.
 A live reset places whole tickers only, at most 6 new orders. A ticker
 that does not fit is left uncancelled and logged DEFERRED for a later run.
 Inquiry plus, when live and allowed, limit buy, limit sell, and full cancel.
@@ -236,10 +237,17 @@ def _in_us_session(now):
 
 
 def _window_open(mode, now_kst, now_et):
+    """True when this mode may look at the book.
+
+    Reset stays on the post-wipe KST slots. Intraday follows fills during
+    the US extended session and during the KST day session (09:10-16:59).
+    Order type is 63 there, or 62 while US after-hours is still open.
+    The 08:00-09:10 and 16:00-17:10 time guard is separate and still wins.
+    """
     if mode == "reset":
         return _in_reset_window(now_kst)
     if mode == "intraday":
-        return _in_us_session(now_et)
+        return _in_us_session(now_et) or _kst_day(now_kst)
     return False
 
 
