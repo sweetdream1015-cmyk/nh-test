@@ -164,6 +164,14 @@ def test_pairs_and_limits():
     assert not bot._orders_blocked(datetime(2026, 10, 29, 17, 10, tzinfo=bot.KST))
     assert not bot._orders_blocked(datetime(2026, 10, 29, 17, 11, tzinfo=bot.KST))
     assert bot._orders_blocked(datetime(2026, 10, 31, 17, 15, tzinfo=bot.KST))
+    sat = datetime(2026, 10, 31, tzinfo=bot.KST)
+    assert not bot._orders_blocked(sat.replace(hour=0, minute=30))
+    assert not bot._orders_blocked(sat.replace(hour=3, minute=0))
+    assert not bot._orders_blocked(sat.replace(hour=7, minute=30))
+    assert bot._orders_blocked(sat.replace(hour=9, minute=0))
+    assert bot._orders_blocked(sat.replace(hour=12, minute=0))
+    assert bot._orders_blocked(datetime(2026, 11, 1, 3, 0, tzinfo=bot.KST))
+    assert bot._orders_blocked(datetime(2026, 11, 1, 12, 0, tzinfo=bot.KST))
     assert bot._reset_slot(datetime(2026, 10, 29, 17, 11, tzinfo=bot.KST)) == "17"
     assert bot._reset_slot(datetime(2026, 10, 29, 9, 10, tzinfo=bot.KST)) == "09"
 
@@ -422,6 +430,7 @@ def _read_state(path):
 
 
 def test_seed_force():
+    os.environ.pop("SEED_FLAGS", None)
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "state.json")
         handled = "cd" * 32
@@ -495,6 +504,201 @@ def test_seed_force():
         assert open(broken, encoding="utf-8").read() == "{not json"
 
 
+def test_seed_flags():
+    os.environ.pop("SEED_FORCE", None)
+    os.environ.pop("SEED_FLAGS", None)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "state.json")
+        handled = "ef" * 32
+        _write_state(
+            path,
+            {
+                "version": 2,
+                "tickers": {
+                    "NAIL": _pair("NAIL", 33, 28),
+                    "KORU": _pair("KORU", 12.5, 10.3, [4]),
+                    "SOXL": _pair("SOXL", 103, 86),
+                },
+                "handled": [handled],
+                "exception_filled": False,
+                "reset_done": {"09": "20261029", "17": ""},
+            },
+        )
+        before = open(path, "rb").read()
+        os.environ["SEED_FLAGS"] = "exception_filled=yes"
+        code, out = _capture(seed_state.main)
+        assert code == 1, out
+        assert "ERROR config" in out
+        assert open(path, "rb").read() == before
+
+        os.environ["SEED_FLAGS"] = "SOXL.double_used=999"
+        code, out = _capture(seed_state.main)
+        assert code == 1, out
+        assert open(path, "rb").read() == before
+
+        os.environ["SEED_FLAGS"] = "exception_filled=true;SOXL.double_used=72"
+        orders = {"n": 0}
+
+        def _boom(*_args, **_kwargs):
+            orders["n"] += 1
+            raise AssertionError("seed placed an order")
+
+        old_place = bot._place
+        old_post = bot._post_order
+        bot._place = _boom
+        bot._post_order = _boom
+        try:
+            code, out = _capture(seed_state.main)
+        finally:
+            bot._place = old_place
+            bot._post_order = old_post
+        assert code == 0, out
+        assert orders["n"] == 0
+        assert "OK flags" in out
+        assert "placed" not in out
+        marked = _read_state(path)
+        assert marked["exception_filled"] is True
+        assert marked["tickers"]["SOXL"]["double_used"] == [_level("SOXL", 72)]
+        assert marked["tickers"]["SOXL"]["sell"] == _level("SOXL", 103)
+        assert marked["tickers"]["KORU"]["double_used"] == [4]
+        assert marked["tickers"]["NAIL"]["sell"] == _level("NAIL", 33)
+        assert handled in marked["handled"]
+        assert marked["reset_done"]["09"] == "20261029"
+
+        os.environ["SEED_FORCE"] = "KORU:13.5:11.3"
+        os.environ["SEED_FLAGS"] = "exception_filled=false;SOXL.double_used=72,66;KORU.double_used="
+        code, out = _capture(seed_state.main)
+        assert code == 0, out
+        assert "OK force" in out
+        assert orders["n"] == 0
+        both = _read_state(path)
+        assert both["exception_filled"] is False
+        assert both["tickers"]["KORU"]["sell"] == _level("KORU", 13.5)
+        assert both["tickers"]["KORU"]["buy"] == _level("KORU", 11.3)
+        assert both["tickers"]["KORU"]["double_used"] == []
+        assert both["tickers"]["SOXL"]["double_used"] == [
+            _level("SOXL", 72),
+            _level("SOXL", 66),
+        ]
+        assert both["tickers"]["NAIL"]["double_used"] == []
+        assert handled in both["handled"]
+
+        os.environ["SEED_FORCE"] = ""
+        os.environ["SEED_FLAGS"] = "QQQ.double_used=72"
+        snapshot = open(path, "rb").read()
+        code, out = _capture(seed_state.main)
+        assert code == 1, out
+        assert open(path, "rb").read() == snapshot
+
+        only_nail = os.path.join(tmp, "nail.json")
+        _write_state(
+            only_nail,
+            {
+                "version": 2,
+                "tickers": {"NAIL": _pair("NAIL", 33, 28)},
+                "handled": [],
+                "exception_filled": False,
+                "reset_done": {"09": "", "17": ""},
+            },
+        )
+        nail_before = open(only_nail, "rb").read()
+        os.environ["SEED_FLAGS"] = "SOXL.double_used=72"
+        code, out = _capture(seed_state.main)
+        assert code == 1, out
+        assert open(only_nail, "rb").read() == nail_before
+
+        bot._STATE_PATH = path
+        os.remove(path)
+        os.environ["SEED_FORCE"] = ""
+        os.environ["SEED_FLAGS"] = "exception_filled=true;NAIL.double_used=22"
+        code, out = _capture(seed_state.main)
+        assert code == 0, out
+        assert "OK flags" in out
+        created = _read_state(path)
+        assert created["exception_filled"] is True
+        assert created["tickers"]["NAIL"]["double_used"] == [_level("NAIL", 22)]
+        assert created["tickers"]["KORU"]["sell"] == _level("KORU", 12.5)
+        assert created["tickers"]["SOXL"]["double_used"] == []
+
+
+def test_reset_low_rung_sizes():
+    koru = ladders._CFG["KORU"]["ladder"]
+    assert koru[2] == 8.6
+    assert 8.5 not in koru
+    assert bot._buy_computed("SOXL", _level("SOXL", 72), []) == 4
+    assert bot._buy_computed("SOXL", _level("SOXL", 66), []) == 4
+    assert bot._buy_computed("SOXL", _level("SOXL", 60), []) == 4
+    assert bot._buy_computed("SOXL", _level("SOXL", 79), []) == 1
+    assert bot._buy_computed("SOXL", _level("SOXL", 66), [_level("SOXL", 66)]) == 1
+    assert bot._buy_computed("SOXL", _level("SOXL", 72), [_level("SOXL", 72)]) == 1
+    assert bot._buy_computed("KORU", _level("KORU", 8.6), []) == 2
+    assert bot._buy_computed("KORU", _level("KORU", 9.4), []) == 2
+    assert bot._buy_computed("NAIL", _level("NAIL", 30), []) == 10
+
+    cases = [
+        (
+            "SOXL",
+            79,
+            66,
+            [_level("SOXL", 72)],
+            [
+                ("sell", 79, 1),
+                ("sell", 86, 1),
+                ("buy", 66, 4),
+                ("buy", 60, 4),
+            ],
+        ),
+        (
+            "KORU",
+            11.3,
+            9.4,
+            [],
+            [
+                ("sell", 11.3, 1),
+                ("sell", 12.5, 1),
+                ("buy", 9.4, 2),
+                ("buy", 8.6, 2),
+            ],
+        ),
+        (
+            "NAIL",
+            36,
+            30,
+            [],
+            [
+                ("sell", 36, 10),
+                ("sell", 39, 10),
+                ("buy", 30, 10),
+                ("buy", 28, 10),
+            ],
+        ),
+    ]
+    os.environ["LIVE_TRADING"] = "on"
+    for ticker, sell_px, buy_px, used, expected in cases:
+        got = bot._desired(
+            ticker, _level(ticker, sell_px), _level(ticker, buy_px), 1.0, used
+        )
+        assert [(item["side"], item["price"], item["qty"]) for item in got] == expected
+        os.environ["LIVE_TICKERS"] = ticker
+        state = bot._clean_state(
+            {
+                "version": 2,
+                "tickers": {ticker: _pair(ticker, sell_px, buy_px, used)},
+                "handled": [],
+                "exception_filled": True,
+                "reset_done": {"09": "", "17": ""},
+            }
+        )
+        code, out, world = _run(state, [], {})
+        assert code == 0, out
+        assert world["placed"] == [
+            (ticker, side, price, qty) for side, price, qty in expected
+        ], (ticker, world["placed"], out)
+        assert world["cancelled"] == []
+        assert world["exceptions"] == []
+        assert "exception placed" not in out
+
+
 def test_workflows():
     root = os.path.dirname(os.path.abspath(__file__))
     reset = open(
@@ -512,9 +716,16 @@ def test_workflows():
     assert '- cron: "12 0 * * 1-5"' in reset
     assert '- cron: "16 8 * * 1-5"' in reset
     assert "workflow_dispatch:" in intra
+    assert '- cron: "*/5 0-6 * * 1-5"' in intra
+    assert '- cron: "*/5 8-22 * * 1-5"' in intra
+    assert '- cron: "*/5 0 * * 6"' in intra
+    assert '- cron: "*/5 * * * 1-5"' not in intra
     assert "group: ladder-bot" in reset
     assert "group: ladder-bot" in seed
     assert "SEED_FORCE:" in seed
+    assert "seed_flags:" in seed
+    assert "SEED_FLAGS:" in seed
+    assert "exception_filled=true;SOXL.double_used=72" in seed
 
 
 def main():
@@ -527,11 +738,14 @@ def main():
         test_intraday_unchanged()
         test_push_and_time_guard_place_nothing()
         test_seed_force()
+        test_seed_flags()
+        test_reset_low_rung_sizes()
         test_workflows()
     finally:
         bot._now_kst = _ORIG_NOW
         bot._STATE_PATH = _ORIG_STATE
         os.environ.pop("SEED_FORCE", None)
+        os.environ.pop("SEED_FLAGS", None)
     print("OK reset batch")
     return 0
 

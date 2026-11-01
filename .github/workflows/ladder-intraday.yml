@@ -3,8 +3,23 @@ name: ladder-intraday
 on:
   workflow_dispatch:
   schedule:
-    # Weekday poll, every 5 minutes UTC. The script skips outside the US session.
-    - cron: "*/5 * * * 1-5"
+    # Weekday polls, every 5 minutes UTC. The two ranges do not overlap.
+    # KST day session 09:00-15:59 = 00:00-06:59 UTC. 09:00-09:10 is the
+    # broker wipe, so those runs log the time guard and exit. Daylight
+    # time from 09:10 is order type 63. Standard time stays on US
+    # after-hours (62) until 10:00 KST (01:00 UTC), then 63. The existing
+    # 16:00-17:10 KST guard is 07:00-08:10 UTC, so this poll stops at 15:59.
+    - cron: "*/5 0-6 * * 1-5"
+    # US session 17:10-07:59 KST = 08:10-22:59 UTC. 08:00-09:10 KST
+    # (23:00-00:10 UTC) is the morning wipe guard and is not polled.
+    # Friday 15:00-22:59 UTC is Saturday 00:00-07:59 KST, still Friday
+    # in New York, so this range covers that morning too.
+    - cron: "*/5 8-22 * * 1-5"
+    # Standard time: Friday after-hours runs until 10:00 KST Saturday
+    # (20:00 EST). 09:10-09:55 KST is 00:10-00:55 UTC Saturday. 09:00-09:10
+    # is the wipe guard. Daylight time has already ended at 09:00 KST,
+    # so those runs hit the time guard and exit.
+    - cron: "*/5 0 * * 6"
   push:
     paths:
       - .github/workflows/ladder-intraday.yml

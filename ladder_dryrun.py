@@ -20,15 +20,14 @@ from datetime import datetime
 
 import gb_readonly_check as gb
 
-# Ladders copied from the ticker files. KORU's step below 9.4 is 8.5
-# (90% of 9.4, rounded to one decimal) instead of 8.6.
+# Ladders copied from the ticker files. KORU's rung below 9.4 is 8.6.
 _NAIL_LADDER = [
     9.4, 10.3, 11.3, 12.5, 13.5, 15, 16.5, 18, 20, 22, 24, 26, 28, 30, 33,
     36, 39, 42, 46, 50, 55, 60, 66, 72, 79, 86, 94, 103, 113, 125, 135, 150,
     165, 180, 200, 220,
 ]
 _KORU_LADDER = [
-    7.2, 7.9, 8.5, 9.4, 10.3, 11.3, 12.5, 13.5, 15, 16.5, 18, 20, 22, 24, 26,
+    7.2, 7.9, 8.6, 9.4, 10.3, 11.3, 12.5, 13.5, 15, 16.5, 18, 20, 22, 24, 26,
     28, 30, 33, 36, 39, 42, 46, 50, 55, 60, 66, 72,
 ]
 _SOXL_LADDER = [
@@ -45,12 +44,20 @@ _ISIN = {
 }
 
 
-def _buy_qty(base, threshold, at_threshold=None):
+def _buy_qty(base, threshold, at_threshold=None, low_at=None, low_qty=None):
+    """First-buy size. Above `threshold` is `base`.
+
+    Exactly `threshold` is `at_threshold` when that is set. At or below
+    `low_at` (default `threshold`) is `low_qty` (default `base * 2`).
+    A price between those two stays at `base`.
+    """
+
     def qty(price):
         if at_threshold is not None and abs(price - threshold) < 0.051:
             return at_threshold
-        if price <= threshold:
-            return base * 2
+        floor = threshold if low_at is None else low_at
+        if price <= floor:
+            return base * 2 if low_qty is None else low_qty
         return base
 
     return qty
@@ -62,7 +69,7 @@ _CFG = {
     "SOXL": {
         "ladder": _SOXL_LADDER,
         "base": 1,
-        "buy_qty": _buy_qty(1, 72, at_threshold=4),
+        "buy_qty": _buy_qty(1, 72, at_threshold=4, low_at=66, low_qty=4),
     },
 }
 

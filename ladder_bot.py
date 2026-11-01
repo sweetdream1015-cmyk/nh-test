@@ -1,7 +1,10 @@
 """Order-capable ladder bot. Live trading is off unless LIVE_TRADING is exactly on.
 
-No new order is sent on weekends or in the KST pre-reset windows
-08:00-09:10 and 16:00-17:10. Those runs log "skip: time guard" and exit.
+No new order is sent in the KST pre-reset windows 08:00-09:10 and
+16:00-17:10. Saturday KST stays open only through the end of Friday's
+US session (20:00 ET). Sunday, and Monday before 09:10 KST, are closed.
+Those runs log "skip: time guard" and exit.
+Intraday follow-up runs in the US session and in the KST day session.
 A live reset places whole tickers only, at most 6 new orders. A ticker
 that does not fit is left uncancelled and logged DEFERRED for a later run.
 Inquiry plus, when live and allowed, limit buy, limit sell, and full cancel.
@@ -189,17 +192,42 @@ def _session_skip(now_kst, now_et, mode):
     return reason or "skip: session closed"
 
 
+def _off_session_day(now_kst):
+    """Closed calendar days that are not a live US or KST session.
+
+    Saturday KST is still Friday in New York until 20:00 ET, so that
+    morning follows the same extended-hours clock as the order type.
+    The rest of Saturday, all of Sunday, and Monday before the 09:10
+    KST day session are closed.
+    """
+    weekday = now_kst.weekday()
+    if weekday == 5:
+        now_et = now_kst.astimezone(ET)
+        return not (now_et.weekday() == 4 and _in_us_session(now_et))
+    if weekday == 6:
+        return True
+    if weekday == 0 and _minutes(now_kst) < 9 * 60 + 10:
+        return True
+    return False
+
+
 def _orders_blocked(now):
     """True when a new order must not be sent.
 
-    Weekends, and weekday 08:00 inclusive to 09:10 exclusive plus 16:00
-    inclusive to 17:10 exclusive. The broker wipes resting orders at
-    09:00 and 17:00, so those spans are too late to place and too early
-    for the 09:10 and 17:10 resets. 09:10 and 17:10 themselves are allowed.
+    08:00 inclusive to 09:10 exclusive, and 16:00 inclusive to 17:10
+    exclusive, including Saturday morning while Friday's US session is
+    still open. The broker wipes resting orders at 09:00 and 17:00, so
+    those spans are too late to place and too early for the 09:10 and
+    17:10 resets. 09:10 and 17:10 themselves are allowed.
+
+    After Friday's US session ends at 20:00 ET, the rest of Saturday
+    KST, all of Sunday, and Monday before 09:10 KST are blocked even
+    outside those wipe windows.
     """
-    if now.weekday() >= 5:
+    now_kst = _as_kst(now)
+    if _off_session_day(now_kst):
         return True
-    minutes = now.hour * 60 + now.minute
+    minutes = _minutes(now_kst)
     if 8 * 60 <= minutes < 9 * 60 + 10:
         return True
     if 16 * 60 <= minutes < 17 * 60 + 10:
@@ -236,10 +264,17 @@ def _in_us_session(now):
 
 
 def _window_open(mode, now_kst, now_et):
+    """True when this mode may look at the book.
+
+    Reset stays on the post-wipe KST slots. Intraday follows fills during
+    the US extended session and during the KST day session (09:10-16:59).
+    Order type is 63 there, or 62 while US after-hours is still open.
+    The 08:00-09:10 and 16:00-17:10 time guard is separate and still wins.
+    """
     if mode == "reset":
         return _in_reset_window(now_kst)
     if mode == "intraday":
-        return _in_us_session(now_et)
+        return _in_us_session(now_et) or _kst_day(now_kst)
     return False
 
 
@@ -298,16 +333,27 @@ def _anchors(ticker, orders):
 
 
 def _in_double_zone(ticker, price):
+    """True where the first buy is above base, so double_used can revert it.
+
+    NAIL is at or below 22. KORU is at or below 9.4. SOXL is exactly 72
+    or at or below 66.
+    """
     if ticker == "NAIL":
         return price <= 22
     if ticker == "KORU":
         return price <= 9.4
     if ticker == "SOXL":
-        return price <= 72
+        return price <= 66 or abs(price - 72) < 0.051
     return False
 
 
 def _buy_computed(ticker, index, double_used):
+    """First-buy size, or base once that level is already in double_used.
+
+    SOXL is 4 on the first buy at 72 and at 66 or below, otherwise 1.
+    A used SOXL level is 1. KORU at or below 9.4 is 2, then 1. NAIL at
+    or below 22 is 20, then 10.
+    """
     ladder = _cfg(ticker)["ladder"]
     price = ladder[index]
     qty = _cfg(ticker)["buy_qty"](price)
@@ -675,9 +721,27 @@ def _pages(url, body, block):
     return None
 
 
+def _previous_trading_day(day):
+    """The weekday before `day`. Saturday and Sunday fold back to Friday."""
+    cursor = day - timedelta(days=1)
+    while cursor.weekday() >= 5:
+        cursor -= timedelta(days=1)
+    return cursor
+
+
 def _dates(now_kst):
-    today = now_kst.date()
-    return [(today - timedelta(days=offset)).strftime("%Y%m%d") for offset in (0, 1)]
+    """KST order dates to query: today, yesterday, and the previous weekday.
+
+    On Monday, yesterday is Sunday, so Friday is included as well.
+    Callers dedupe rows by fill key, and a key already in `handled`
+    is not stepped again.
+    """
+    today = _as_kst(now_kst).date()
+    found = []
+    for day in (today, today - timedelta(days=1), _previous_trading_day(today)):
+        if day not in found:
+            found.append(day)
+    return [day.strftime("%Y%m%d") for day in found]
 
 
 def _inquiry(account, now_kst, kind):
