@@ -49,9 +49,13 @@ def test_session_table():
         (_kst(2026, 10, 29, 17, 10), "reset", "61"),
         (_kst(2026, 10, 29, 17, 15), "intraday", "61"),
         (_kst(2026, 10, 29, 22, 29), "intraday", "61"),
-        # 09:30 ET cash open. No separate regular-session code in the repo.
-        (_kst(2026, 10, 29, 22, 30), "intraday", "61"),
-        (_kst(2026, 10, 30, 4, 59), "intraday", "61"),
+        # 09:30 ET cash open is 지정가 00, through 15:59. 16:00 is 62.
+        (_kst(2026, 10, 29, 22, 30), "intraday", "00"),
+        (_kst(2026, 10, 29, 22, 30), "reset", "00"),
+        (_kst(2026, 10, 30, 1, 34), "intraday", "00"),
+        (_kst(2026, 10, 30, 1, 34), "reset", "00"),
+        (_kst(2026, 10, 30, 4, 59), "intraday", "00"),
+        (_kst(2026, 10, 30, 4, 59), "reset", "00"),
         # 09:10 KST daylight time is 20:10 ET, after-hours already over.
         (_kst(2026, 10, 29, 9, 10), "reset", "63"),
         (_kst(2026, 10, 29, 9, 10), "intraday", "63"),
@@ -65,12 +69,22 @@ def test_session_table():
         (_kst(2026, 11, 2, 17, 59), "reset", None),
         (_kst(2026, 11, 2, 18, 0), "reset", "61"),
         (_kst(2026, 11, 2, 23, 29), "intraday", "61"),
-        (_kst(2026, 11, 2, 23, 30), "intraday", "61"),
+        # 09:30 EST cash open. Reset slot 17 is still open, and uses 00 too.
+        (_kst(2026, 11, 2, 23, 30), "intraday", "00"),
+        (_kst(2026, 11, 2, 23, 30), "reset", "00"),
+        # Failed ladder-intraday runs on 2026-11-03 KST: 10:34, 11:37, 12:32 EST.
+        (_kst(2026, 11, 3, 0, 34), "intraday", "00"),
+        (_kst(2026, 11, 3, 0, 34), "reset", "00"),
+        (_kst(2026, 11, 3, 1, 37), "intraday", "00"),
+        (_kst(2026, 11, 3, 2, 32), "intraday", "00"),
         # Monday 09:10 KST is still Sunday evening in New York. Not after-hours.
         (_kst(2026, 11, 2, 9, 10), "reset", "63"),
         # Tuesday 06:16 KST is Monday 16:16 EST.
+        (_kst(2026, 11, 3, 6, 0), "intraday", "62"),
         (_kst(2026, 11, 3, 6, 16), "intraday", "62"),
-        (_kst(2026, 11, 3, 5, 16), "intraday", "61"),
+        (_kst(2026, 11, 3, 5, 16), "intraday", "00"),
+        (_kst(2026, 11, 3, 5, 59), "intraday", "00"),
+        (_kst(2026, 11, 3, 5, 59), "reset", "00"),
         # 09:10 KST standard time overlaps after-hours. Reset waits. Intraday uses 62.
         (_kst(2026, 11, 3, 9, 10), "reset", None),
         (_kst(2026, 11, 3, 9, 10), "intraday", "62"),
@@ -100,6 +114,12 @@ def test_order_type_override():
     os.environ["ORDER_TYPE"] = "62"
     try:
         assert bot._order_type(_kst(2026, 10, 29, 17, 10), mode="reset") == "62"
+    finally:
+        os.environ.pop("ORDER_TYPE", None)
+    os.environ["ORDER_TYPE"] = "00"
+    try:
+        assert bot._order_type(_kst(2026, 10, 29, 12, 0), mode="intraday") == "00"
+        assert bot._order_type(_kst(2026, 11, 3, 0, 34), mode="reset") == "00"
     finally:
         os.environ.pop("ORDER_TYPE", None)
     os.environ["ORDER_TYPE"] = "99"
@@ -879,8 +899,10 @@ def test_weekend_guard_follows_us_session():
     for hour, minute in ((0, 30), (3, 0), (7, 30)):
         moment = sat.replace(hour=hour, minute=minute)
         assert not bot._orders_blocked(moment), moment.isoformat()
-    assert bot._order_type(sat.replace(hour=0, minute=30), _et_of(sat.replace(hour=0, minute=30)), "intraday") == "61"
-    assert bot._order_type(sat.replace(hour=3, minute=0), _et_of(sat.replace(hour=3, minute=0)), "intraday") == "61"
+    # Saturday morning KST is still Friday regular hours in New York.
+    assert bot._order_type(sat.replace(hour=0, minute=30), _et_of(sat.replace(hour=0, minute=30)), "intraday") == "00"
+    assert bot._order_type(sat.replace(hour=3, minute=0), _et_of(sat.replace(hour=3, minute=0)), "intraday") == "00"
+    assert bot._order_type(sat.replace(hour=0, minute=30), _et_of(sat.replace(hour=0, minute=30)), "reset") == "00"
     assert bot._order_type(sat.replace(hour=7, minute=30), _et_of(sat.replace(hour=7, minute=30)), "intraday") == "62"
     for hour, minute in ((9, 0), (9, 15), (12, 0), (17, 15), (23, 0)):
         moment = sat.replace(hour=hour, minute=minute)
@@ -901,6 +923,9 @@ def test_weekend_guard_follows_us_session():
     for hour, minute in ((0, 30), (3, 0), (7, 30), (9, 30)):
         moment = est_sat.replace(hour=hour, minute=minute)
         assert not bot._orders_blocked(moment), moment.isoformat()
+    assert bot._order_type(est_sat.replace(hour=0, minute=30), _et_of(est_sat.replace(hour=0, minute=30)), "intraday") == "00"
+    assert bot._order_type(est_sat.replace(hour=5, minute=30), _et_of(est_sat.replace(hour=5, minute=30)), "intraday") == "00"
+    assert bot._order_type(est_sat.replace(hour=5, minute=30), _et_of(est_sat.replace(hour=5, minute=30)), "reset") == "00"
     assert bot._order_type(est_sat.replace(hour=7, minute=30), _et_of(est_sat.replace(hour=7, minute=30)), "intraday") == "62"
     assert bot._order_type(est_sat.replace(hour=9, minute=30), _et_of(est_sat.replace(hour=9, minute=30)), "intraday") == "62"
     for hour, minute in ((8, 30), (9, 0), (10, 0), (12, 0)):
@@ -980,6 +1005,193 @@ def test_dates_cover_previous_trading_day():
     assert again["saved"]["handled"] == [nail_key]
 
 
+def test_regular_session_body_is_limit_00():
+    """Regular hours send 지정가 00 and the same fc_orr_uit_pr field."""
+    _restore_guards()
+    os.environ.pop("ORDER_TYPE", None)
+    cases = (
+        (_kst(2026, 10, 30, 1, 34), "intraday", "sell"),  # 12:34 EDT
+        (_kst(2026, 10, 29, 22, 30), "reset", "buy"),  # 09:30 EDT
+        (_kst(2026, 11, 3, 0, 34), "intraday", "sell"),  # 10:34 EST
+        (_kst(2026, 11, 3, 2, 32), "reset", "buy"),  # 12:32 EST
+    )
+    try:
+        for moment, mode, side in cases:
+            os.environ["LADDER_MODE"] = mode
+            _arm(moment)
+            captured = {}
+
+            def fake_post(_url, raw, _extra, captured=captured):
+                captured["body"] = json.loads(raw.decode())["Input_0"]
+                return 200, {}, {"Output_0": {"orr_no": "1"}}
+
+            gb._post_bearer = fake_post
+            result = bot._place("TEST", "NAIL", side, 42.0, 10, True, [0])
+            assert result is True, (moment.isoformat(), mode, side)
+            body = captured["body"]
+            assert body["ahi_nmn_pr_tp_cd"] == "00", (
+                moment.isoformat(),
+                mode,
+                body.get("ahi_nmn_pr_tp_cd"),
+            )
+            assert body["fc_orr_uit_pr"] == 42.0
+            assert body["iem_cd"] == "NAIL"
+            assert body["orr_qty"] == 10
+            assert body["fc_sec_trd_nat_cd"] == "200"
+            keys = {
+                "act_no",
+                "fc_sec_trd_nat_cd",
+                "iem_cd",
+                "orr_qty",
+                "fc_orr_uit_pr",
+                "ahi_nmn_pr_tp_cd",
+            }
+            if side == "buy":
+                assert body["wtm_cur_knd_cd"] == "1"
+                keys.add("wtm_cur_knd_cd")
+            assert set(body) == keys, sorted(body)
+    finally:
+        gb._post_bearer = _ORIG_POST
+        os.environ.pop("LADDER_MODE", None)
+
+
+def test_regular_reject_does_not_block_other_tickers():
+    """A NAIL reject during regular hours still lets KORU and SOXL run."""
+    _restore_guards()
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "NAIL,KORU,SOXL"
+    os.environ["LADDER_MODE"] = "intraday"
+    os.environ.pop("ORDER_TYPE", None)
+    others = [
+        ("KORU", "sell", 11.3, 1),
+        ("KORU", "buy", 9.4, 2),
+        ("SOXL", "sell", 86, 1),
+        ("SOXL", "buy", 72, 4),
+    ]
+    for moment in (
+        _kst(2026, 10, 30, 1, 34),  # 12:34 EDT
+        _kst(2026, 11, 3, 0, 34),  # 10:34 EST, the failed run
+    ):
+        state, opens, fills, keys = _day_book()
+        nail_key, koru_key, soxl_key = keys
+        seen = []
+
+        def place(ticker, item, _counter, seen=seen):
+            seen.append((ticker, item["side"], item["price"]))
+            if ticker != "NAIL":
+                return True
+            bot._last_reject = {
+                "ticker": "NAIL",
+                "side": item["side"],
+                "price": item["price"],
+                "http": 200,
+                "rsp_cd": "23530",
+                "rsp_msg": "프리마켓 주문시간이 아닙니다. 호가유형을 변경하세요.",
+            }
+            return None
+
+        code, out, world = _run_tracking(moment, state, opens, fills, place)
+        assert code == 1, out
+        assert "order type 00" in out
+        assert "REJECT NAIL sell 39 http 200 rsp_cd 23530" in out
+        assert "ERROR reject" in out
+        assert "ERROR unexpected" not in out
+        assert "OK live" not in out
+        assert "OK dry" not in out
+        assert seen[0] == ("NAIL", "sell", 39)
+        assert [item for item in seen if item[0] == "NAIL"] == [("NAIL", "sell", 39)]
+        assert world["placed"] == others, (moment.isoformat(), world["placed"])
+        assert world["cancelled"] == []
+        assert world["exceptions"] == []
+        saved = world["saved"]
+        assert saved["tickers"]["NAIL"]["sell"] == _idx("NAIL", 33)
+        assert saved["tickers"]["NAIL"]["buy"] == _idx("NAIL", 28)
+        assert nail_key not in saved["handled"]
+        assert saved["tickers"]["KORU"]["sell"] == _idx("KORU", 11.3)
+        assert saved["tickers"]["KORU"]["buy"] == _idx("KORU", 10.3)
+        assert saved["tickers"]["SOXL"]["sell"] == _idx("SOXL", 86)
+        assert saved["tickers"]["SOXL"]["buy"] == _idx("SOXL", 79)
+        assert koru_key in saved["handled"]
+        assert soxl_key in saved["handled"]
+
+
+def test_reset_reject_still_places_exception():
+    """A reset reject stops that ticker and still places the exception."""
+    _restore_guards()
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "SOXL"
+    os.environ["LADDER_MODE"] = "reset"
+    os.environ.pop("ORDER_TYPE", None)
+    for moment in (
+        _kst(2026, 10, 29, 22, 30),  # 09:30 EDT, reset slot 17
+        _kst(2026, 11, 2, 23, 30),  # 09:30 EST, reset slot 17
+    ):
+        state = bot._fresh_state()
+        state["exception_filled"] = False
+        state["tickers"]["SOXL"] = {
+            "sell": _idx("SOXL", 94),
+            "buy": _idx("SOXL", 86),
+            "double_used": [],
+        }
+        state = bot._clean_state(state)
+        world = {"saved": None, "placed": [], "exceptions": []}
+
+        def save_state(data, world=world):
+            world["saved"] = json.loads(json.dumps(data))
+
+        def place(ticker, item, _counter, world=world):
+            world["placed"].append((ticker, item["side"], item["price"]))
+            bot._last_reject = {
+                "ticker": ticker,
+                "side": item["side"],
+                "price": item["price"],
+                "http": 200,
+                "rsp_cd": "23530",
+                "rsp_msg": "regular session",
+            }
+            return None
+
+        def place_exception(_counter, world=world):
+            world["exceptions"].append((100, 75))
+            return True
+
+        actions = {
+            "place": place,
+            "cancel": lambda _ticker, _order: True,
+            "exists": lambda _ticker, _side, _index: False,
+            "confirm_clear": lambda _ticker: True,
+            "exception_open": lambda: False,
+            "place_exception": place_exception,
+            "save_state": save_state,
+        }
+        _arm(moment)
+        code, out = _capture(
+            lambda: bot.run(
+                "reset",
+                "workflow_dispatch",
+                moment,
+                _et_of(moment),
+                [],
+                [],
+                state,
+                actions,
+            )
+        )
+        assert code == 1, out
+        assert "order type 00" in out
+        assert "REJECT SOXL" in out
+        assert "rsp_cd 23530" in out
+        assert "exception placed 1" in out
+        assert "ERROR reject" in out
+        assert "ERROR unexpected" not in out
+        assert "OK live" not in out
+        assert len(world["placed"]) == 1
+        assert world["exceptions"] == [(100, 75)]
+        saved = world["saved"]
+        assert saved["reset_tickers"]["17"].get("SOXL", "") == ""
+        assert saved["reset_done"]["17"] == ""
+
+
 def main():
     try:
         test_session_table()
@@ -995,6 +1207,9 @@ def main():
         test_day_session_crons()
         test_weekend_guard_follows_us_session()
         test_dates_cover_previous_trading_day()
+        test_regular_session_body_is_limit_00()
+        test_regular_reject_does_not_block_other_tickers()
+        test_reset_reject_still_places_exception()
     finally:
         bot._now_kst = _ORIG_NOW
         bot._orders_blocked = _ORIG_BLOCKED
