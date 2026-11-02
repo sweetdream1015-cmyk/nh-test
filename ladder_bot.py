@@ -10,6 +10,8 @@ that does not fit is left uncancelled and logged DEFERRED for a later run.
 Inquiry plus, when live and allowed, limit buy, limit sell, and full cancel.
 The modify endpoint is never called. Prints counts, OK/ERROR codes, and
 on a broker reject the ticker, side, price, and redacted rsp_cd/rsp_msg.
+A reject stops the rest of that ticker only. Other tickers still run,
+then the process logs ERROR reject and exits non-zero.
 
 Spec fields used:
 - POST /oauth2/token
@@ -20,11 +22,11 @@ Spec fields used:
   cns_qty, orr_no, orr_dt, fc_sec_trd_nat_cd
 - POST /gbstock/order/v1/buy and /sell
   fc_sec_trd_nat_cd 200, iem_cd ticker, orr_qty, fc_orr_uit_pr,
-  ahi_nmn_pr_tp_cd from the US Eastern clock for premarket (61) and
-  after-hours (62), and from the KST clock for the day session (63).
+  ahi_nmn_pr_tp_cd from the US Eastern clock: premarket 61, regular
+  hours 00 (지정가), after-hours 62. The KST day session is 63.
   ORDER_TYPE overrides that when it is 00, 61, 62, or 63.
-  Spec requires fc_orr_uit_pr for 00, 61, 62, and 63. Buy also sends
-  wtm_cur_knd_cd 1.
+  Spec requires fc_orr_uit_pr for 00, 61, 62, and 63. There is no
+  separate price field for 00. Buy also sends wtm_cur_knd_cd 1.
 - POST /gbstock/order/v1/cancel
   org_orr_no, all_pat_dit_cd 1 (full cancel)
 """
@@ -120,10 +122,10 @@ def _minutes(now):
 def _us_bucket(now_et):
     """US session from America/New_York. None outside extended hours.
 
-    Premarket is 04:00 inclusive to 09:30 exclusive. After-hours is
-    16:00 inclusive to 20:00 exclusive, matching the intraday window
-    end. 09:30 and 16:00 are the regular cash open and close; the repo
-    notes do not name those two boundaries, only 04:00-20:00 ET.
+    Premarket is 04:00 inclusive to 09:30 exclusive. Regular hours are
+    09:30 inclusive to 16:00 exclusive and use 지정가 00. After-hours
+    is 16:00 inclusive to 20:00 exclusive, matching the intraday window
+    end.
     """
     if now_et.weekday() >= 5:
         return None
@@ -148,11 +150,11 @@ def _kst_day(now_kst):
 def _session(now_kst, now_et=None, mode=None):
     """Return (order type or None, skip line or "").
 
-    Codes from order_type_check: 61 premarket, 62 after-hours, 63 day
-    session. 00 is used only when ORDER_TYPE is 00.
-
-    US regular hours (09:30-16:00 ET) have no code in the repo. They
-    stay on 61, which is what the old KST clock sent in that region.
+    Codes from the gbstock spec (order_type_check): 00 is 지정가, a
+    limit with no session name, and is the regular-session order.
+    61 is premarket, 62 is after-hours, 63 is the KST day session.
+    The broker rejects 61 outside premarket. fc_orr_uit_pr is the
+    price on all four codes. Reset and intraday share this map.
     """
     override = _order_type_override()
     if override is None:
@@ -172,7 +174,7 @@ def _session(now_kst, now_et=None, mode=None):
     if bucket == "pre":
         return "61", ""
     if bucket == "regular":
-        return "61", ""
+        return "00", ""
     if day:
         return "63", ""
     if mode == "reset" and _reset_slot(now_kst) == "17":
@@ -181,7 +183,7 @@ def _session(now_kst, now_et=None, mode=None):
 
 
 def _order_type(now, now_et=None, mode=None):
-    """Session limit code. Never falls back to 00 unless ORDER_TYPE is 00."""
+    """Session limit code. Regular hours are 지정가 00."""
     return _session(now, now_et, mode)[0]
 
 
@@ -1387,18 +1389,43 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
 
     counter = [0]
     sent_any = False
+    rejected = False
 
-    def _rejected():
-        if not _log_reject():
-            return False
+    def _save_progress():
         if live:
             actions["save_state"](_clean_state(working))
-        print("ERROR reject")
+
+    def _note_reject():
+        """Log one broker reject and keep the other tickers going."""
+        nonlocal rejected
+        if not _log_reject():
+            return False
+        rejected = True
         return True
+
+    def _finish_reject():
+        _save_progress()
+        print("ERROR reject")
+        return 1
+
+    def _abort_unexpected():
+        print("ERROR unexpected")
+        if rejected:
+            _save_progress()
+            print("ERROR reject")
+        return 1
+
+    def _guard_stop():
+        if not _stop_for_guard():
+            return None
+        if rejected:
+            return _finish_reject()
+        return 0
 
     for plan in plans:
         placed = 0
         cancelled = 0
+        ticker_failed = False
         deferred = batch is not None and plan["ticker"] in batch["deferred"]
         already = (
             batch is not None
@@ -1414,48 +1441,57 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
             and not deferred
             and not already
         )
-        if touch and _stop_for_guard():
-            return 0
+        if touch:
+            stopped = _guard_stop()
+            if stopped is not None:
+                return stopped
         if touch and mode == "reset":
             for order in plan["cancel"]:
-                if _stop_for_guard():
-                    return 0
+                stopped = _guard_stop()
+                if stopped is not None:
+                    return stopped
                 result = actions["cancel"](plan["ticker"], order)
                 if result is None:
-                    if _rejected():
-                        return 1
-                    print("ERROR unexpected")
-                    return 1
+                    if _note_reject():
+                        ticker_failed = True
+                        break
+                    return _abort_unexpected()
                 if result:
                     cancelled += 1
                     sent_any = True
-            if plan["cancel"] and not actions["confirm_clear"](plan["ticker"]):
-                print("ERROR unexpected")
-                return 1
-        if touch:
+            # Orders still open after the cancels are not a broker reject.
+            # Stop the run, as before.
+            if (
+                not ticker_failed
+                and plan["cancel"]
+                and not actions["confirm_clear"](plan["ticker"])
+            ):
+                return _abort_unexpected()
+        if touch and not ticker_failed:
             for item in plan["place"]:
-                if _stop_for_guard():
-                    return 0
+                stopped = _guard_stop()
+                if stopped is not None:
+                    return stopped
                 exists = actions["exists"](plan["ticker"], item["side"], item["idx"])
                 if exists is None:
-                    print("ERROR unexpected")
-                    return 1
+                    return _abort_unexpected()
                 if exists:
                     continue
                 result = actions["place"](plan["ticker"], item, counter)
                 if result is None:
-                    if _rejected():
-                        return 1
-                    print("ERROR unexpected")
-                    return 1
+                    if _note_reject():
+                        ticker_failed = True
+                        break
+                    return _abort_unexpected()
                 if result:
                     placed += 1
                     sent_any = True
-            if mode == "intraday" and plan["remember"]:
+            # A partial ladder must not advance. The next run retries it.
+            if not ticker_failed and mode == "intraday" and plan["remember"]:
                 _remember(working, plan["remember"])
                 if plan["indexes"] is not None:
                     working["tickers"][plan["ticker"]] = plan["indexes"]
-            if mode == "reset":
+            if not ticker_failed and mode == "reset":
                 _remember(
                     working,
                     [
@@ -1490,25 +1526,26 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
     if hold_exception:
         print("DEFERRED exception")
     elif want_exception:
-        if _stop_for_guard():
-            return 0
+        stopped = _guard_stop()
+        if stopped is not None:
+            return stopped
         current = actions["exception_open"]()
         if current is None:
-            print("ERROR unexpected")
-            return 1
+            return _abort_unexpected()
         if current:
             settled_exception = True
         else:
             if counter[0] >= _MAX_NEW:
                 print("ERROR max_orders")
+                if rejected:
+                    _save_progress()
+                    print("ERROR reject")
                 return 1
             result = actions["place_exception"](counter)
             if result is None:
-                if _rejected():
-                    return 1
-                print("ERROR unexpected")
-                return 1
-            if result:
+                if not _note_reject():
+                    return _abort_unexpected()
+            elif result:
                 sent_any = True
                 print("exception placed 1")
                 settled_exception = True
@@ -1523,6 +1560,8 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
         and _all_reset_done(working, plans, allow, slot, today)
     ):
         working["reset_done"][slot] = today
+    if rejected:
+        return _finish_reject()
     if report_only:
         print("OK report_only")
     else:
