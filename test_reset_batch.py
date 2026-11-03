@@ -148,10 +148,11 @@ def test_pairs_and_limits():
         ("buy", 86, 1),
     ]
     assert _orders("KORU", 12.5, 10.3)[0] == ("sell", 12.5, 1)
-    assert bot._HARD_MAX == {"NAIL": 20, "KORU": 4, "SOXL": 4}
+    assert bot._HARD_MAX == {"NAIL": 40, "KORU": 4, "SOXL": 4}
     assert bot._MAX_NEW == 6
     assert bot._sized("NAIL", 20, 1) == 20
-    assert bot._sized("NAIL", 21, 1) is None
+    assert bot._sized("NAIL", 40, 1) == 40
+    assert bot._sized("NAIL", 41, 1) is None
     assert bot._sized("KORU", 4, 1) == 4
     assert bot._sized("KORU", 5, 1) is None
     assert bot._sized("SOXL", 4, 1) == 4
@@ -633,7 +634,14 @@ def test_reset_low_rung_sizes():
     assert bot._buy_computed("SOXL", _level("SOXL", 72), [_level("SOXL", 72)]) == 1
     assert bot._buy_computed("KORU", _level("KORU", 8.6), []) == 2
     assert bot._buy_computed("KORU", _level("KORU", 9.4), []) == 2
+    assert bot._buy_computed("NAIL", _level("NAIL", 24), []) == 10
+    assert bot._buy_computed("NAIL", _level("NAIL", 22), []) == 20
+    assert bot._buy_computed("NAIL", _level("NAIL", 20), []) == 40
+    assert bot._buy_computed("NAIL", _level("NAIL", 18), []) == 40
+    assert bot._buy_computed("NAIL", _level("NAIL", 16.5), []) == 40
     assert bot._buy_computed("NAIL", _level("NAIL", 30), []) == 10
+    assert bot._buy_computed("NAIL", _level("NAIL", 22), [_level("NAIL", 22)]) == 10
+    assert bot._buy_computed("NAIL", _level("NAIL", 20), [_level("NAIL", 20)]) == 10
 
     cases = [
         (
@@ -670,6 +678,30 @@ def test_reset_low_rung_sizes():
                 ("sell", 39, 10),
                 ("buy", 30, 10),
                 ("buy", 28, 10),
+            ],
+        ),
+        (
+            "NAIL",
+            26,
+            22,
+            [],
+            [
+                ("sell", 26, 10),
+                ("sell", 28, 10),
+                ("buy", 22, 20),
+                ("buy", 20, 40),
+            ],
+        ),
+        (
+            "NAIL",
+            26,
+            22,
+            [_level("NAIL", 20)],
+            [
+                ("sell", 26, 10),
+                ("sell", 28, 10),
+                ("buy", 22, 20),
+                ("buy", 20, 10),
             ],
         ),
     ]

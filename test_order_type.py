@@ -686,8 +686,42 @@ def test_day_session_quantities():
         assert key in world["saved"]["handled"]
         return world
 
-    # First buy at or below the low level doubles. 20 is not open yet.
-    doubled = _one(
+    # First buy at 22 is 2x. The new rung is 22; 24 is already open.
+    at_22 = _one(
+        "NAIL",
+        28,
+        26,
+        [],
+        [
+            {"ticker": "NAIL", "side": "sell", "price": 28, "qty": 10},
+            {"ticker": "NAIL", "side": "sell", "price": 30, "qty": 10},
+            {"ticker": "NAIL", "side": "buy", "price": 24, "qty": 10},
+        ],
+        "buy",
+        26,
+        10,
+    )
+    assert at_22["placed"] == [("NAIL", "sell", 26, 10), ("NAIL", "buy", 22, 20)]
+
+    # Above 22 stays at the base quantity.
+    at_24 = _one(
+        "NAIL",
+        30,
+        28,
+        [],
+        [
+            {"ticker": "NAIL", "side": "sell", "price": 30, "qty": 10},
+            {"ticker": "NAIL", "side": "sell", "price": 33, "qty": 10},
+            {"ticker": "NAIL", "side": "buy", "price": 26, "qty": 10},
+        ],
+        "buy",
+        28,
+        10,
+    )
+    assert at_24["placed"] == [("NAIL", "sell", 28, 10), ("NAIL", "buy", 24, 10)]
+
+    # First buy at 20 or below is 4x. 20 is not open yet.
+    at_20 = _one(
         "NAIL",
         26,
         24,
@@ -701,7 +735,41 @@ def test_day_session_quantities():
         24,
         10,
     )
-    assert doubled["placed"] == [("NAIL", "sell", 24, 10), ("NAIL", "buy", 20, 20)]
+    assert at_20["placed"] == [("NAIL", "sell", 24, 10), ("NAIL", "buy", 20, 40)]
+
+    at_18 = _one(
+        "NAIL",
+        24,
+        22,
+        [],
+        [
+            {"ticker": "NAIL", "side": "sell", "price": 24, "qty": 10},
+            {"ticker": "NAIL", "side": "sell", "price": 26, "qty": 10},
+            {"ticker": "NAIL", "side": "buy", "price": 20, "qty": 40},
+        ],
+        "buy",
+        22,
+        20,
+    )
+    assert at_18["placed"] == [("NAIL", "sell", 22, 10), ("NAIL", "buy", 18, 40)]
+
+    # A level already bought reverts to the base quantity.
+    used_20 = _one(
+        "NAIL",
+        26,
+        24,
+        [20],
+        [
+            {"ticker": "NAIL", "side": "sell", "price": 26, "qty": 10},
+            {"ticker": "NAIL", "side": "sell", "price": 28, "qty": 10},
+            {"ticker": "NAIL", "side": "buy", "price": 22, "qty": 20},
+        ],
+        "buy",
+        24,
+        10,
+    )
+    assert used_20["placed"] == [("NAIL", "sell", 24, 10), ("NAIL", "buy", 20, 10)]
+    assert _idx("NAIL", 20) in used_20["saved"]["tickers"]["NAIL"]["double_used"]
 
     # A level already bought reverts to the base quantity.
     reverted = _one(
