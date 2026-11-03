@@ -64,7 +64,12 @@ def _buy_qty(base, threshold, at_threshold=None, low_at=None, low_qty=None):
 
 
 _CFG = {
-    "NAIL": {"ladder": _NAIL_LADDER, "base": 10, "buy_qty": _buy_qty(10, 22)},
+    # 22 is 20 (2x). At or below 20 is 40 (4x). Above 22 stays 10.
+    "NAIL": {
+        "ladder": _NAIL_LADDER,
+        "base": 10,
+        "buy_qty": _buy_qty(10, 22, at_threshold=20, low_at=20, low_qty=40),
+    },
     "KORU": {"ladder": _KORU_LADDER, "base": 1, "buy_qty": _buy_qty(1, 9.4)},
     "SOXL": {
         "ladder": _SOXL_LADDER,

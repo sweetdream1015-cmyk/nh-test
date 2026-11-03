@@ -49,7 +49,7 @@ BUY_URL = gb.LIVE + "/gbstock/order/v1/buy"
 SELL_URL = gb.LIVE + "/gbstock/order/v1/sell"
 CANCEL_URL = gb.LIVE + "/gbstock/order/v1/cancel"
 _ORDER_URLS = {BUY_URL, SELL_URL, CANCEL_URL}
-_HARD_MAX = {"NAIL": 20, "KORU": 4, "SOXL": 4}
+_HARD_MAX = {"NAIL": 40, "KORU": 4, "SOXL": 4}
 _MAX_NEW = 6
 _TOKEN_PATH = os.environ.get("NHPLUG_TOKEN_PATH", ".nhplug-token/token.json")
 _STATE_PATH = os.environ.get("LADDER_STATE_PATH", ".ladder-state/state.json")
@@ -337,8 +337,8 @@ def _anchors(ticker, orders):
 def _in_double_zone(ticker, price):
     """True where the first buy is above base, so double_used can revert it.
 
-    NAIL is at or below 22. KORU is at or below 9.4. SOXL is exactly 72
-    or at or below 66.
+    NAIL is 22 and at or below 20. KORU is at or below 9.4. SOXL is
+    exactly 72 or at or below 66.
     """
     if ticker == "NAIL":
         return price <= 22
@@ -353,8 +353,8 @@ def _buy_computed(ticker, index, double_used):
     """First-buy size, or base once that level is already in double_used.
 
     SOXL is 4 on the first buy at 72 and at 66 or below, otherwise 1.
-    A used SOXL level is 1. KORU at or below 9.4 is 2, then 1. NAIL at
-    or below 22 is 20, then 10.
+    A used SOXL level is 1. KORU at or below 9.4 is 2, then 1. NAIL is
+    20 at 22 and 40 at 20 or below, then 10 once that level is used.
     """
     ladder = _cfg(ticker)["ladder"]
     price = ladder[index]
