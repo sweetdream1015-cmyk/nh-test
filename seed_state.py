@@ -8,9 +8,11 @@ next one down.
 SEED_FORCE=KORU:13.5:11.3,SOXL:113:94 overwrites only those tickers.
 Other tickers and handled fills stay as they are. double_used on a forced
 ticker is kept unless SEED_FLAGS replaces it.
-KORU's ladder has extra rungs below 9.4, so its indexes are not the NAIL/SOXL indexes.
-Rungs below 7.2 are generated about 10% apart and stored as negative indexes,
-so 7.2 stays index 0.
+NAIL, KORU, and SOXL share one ladder. Index 0 is 9.4 for every ticker.
+A file saved before that shared series stored KORU on its own map
+(7.2 at index 0, and generated 6.5 / 5.9 / 5.4 below it). Loading remaps
+KORU indexes whose prices still exist. 5.9 is not a rung, so that pair is
+dropped and reset logs NEEDS_REVIEW until SEED_FORCE names a real buy.
 
 SEED_FLAGS sets marks only. It never places or cancels.
 Clauses are separated by ';':

@@ -17,27 +17,91 @@ Unexecuted Output_0 uses iem_cd for the instrument, oss_sby_dit_cd
 import os
 import sys
 from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal
+from math import floor, log10
 
 import gb_readonly_check as gb
 
-# Ladders copied from the ticker files. KORU adds 8.6, 7.9, and 7.2 below
-# 9.4. Rungs below 7.2 are not stored on the list: each one is about 10%
-# under the previous rung and uses a negative index, so 7.2 stays index 0.
-_NAIL_LADDER = [
-    9.4, 10.3, 11.3, 12.5, 13.5, 15, 16.5, 18, 20, 22, 24, 26, 28, 30, 33,
-    36, 39, 42, 46, 50, 55, 60, 66, 72, 79, 86, 94, 103, 113, 125, 135, 150,
-    165, 180, 200, 220,
-]
-_KORU_LADDER = [
-    7.2, 7.9, 8.6, 9.4, 10.3, 11.3, 12.5, 13.5, 15, 16.5, 18, 20, 22, 24, 26,
-    28, 30, 33, 36, 39, 42, 46, 50, 55, 60, 66, 72,
-]
-_SOXL_LADDER = [
-    9.4, 10.3, 11.3, 12.5, 13.5, 15, 16.5, 18, 20, 22, 24, 26, 28, 30, 33,
-    36, 39, 42, 46, 50, 55, 60, 66, 72, 79, 86, 94, 103, 113, 125, 135, 150,
-    165, 180, 200, 220,
-]
+# One series for NAIL, KORU, and SOXL. The shape from 5.0 through 46
+# repeats every tenfold change in price: 50 is 5.0×10, 240 is 24×10.
+# Index 0 stays 9.4, so NAIL and SOXL indexes already on disk still
+# name the same prices. The list below is that coded run, 9.4 through
+# 220. Rungs under 9.4 are negative indexes (8.6 is -1, 5.0 is -7).
+# The same pattern continues under 5.0 (4.6, 4.2, 3.9, ...) and above
+# 220 (240, 260, 280, ...).
+_DECADE = (
+    Decimal("5.0"),
+    Decimal("5.5"),
+    Decimal("6.0"),
+    Decimal("6.6"),
+    Decimal("7.2"),
+    Decimal("7.9"),
+    Decimal("8.6"),
+    Decimal("9.4"),
+    Decimal("10.3"),
+    Decimal("11.3"),
+    Decimal("12.5"),
+    Decimal("13.5"),
+    Decimal("15"),
+    Decimal("16.5"),
+    Decimal("18"),
+    Decimal("20"),
+    Decimal("22"),
+    Decimal("24"),
+    Decimal("26"),
+    Decimal("28"),
+    Decimal("30"),
+    Decimal("33"),
+    Decimal("36"),
+    Decimal("39"),
+    Decimal("42"),
+    Decimal("46"),
+)
+_PER = len(_DECADE)
+_ANCHOR = 7  # slot of 9.4 inside the decade
+_TOP_INDEX = 35  # 220, last price stored on the coded list
+_EXTRA = 80  # rungs past 220; same step cap the old downward walk used
+_MATCH = 0.051
+
+
+def _publish(raw):
+    if raw == raw.to_integral_value():
+        return int(raw)
+    text = format(raw, "f").rstrip("0").rstrip(".")
+    if "." not in text:
+        return int(text)
+    return float(text)
+
+
+def _price_from_index(index):
+    """Price for `index` on the shared series, with no range check."""
+    slot = index + _ANCHOR
+    decade, offset = divmod(slot, _PER)
+    return _publish(_DECADE[offset] * (Decimal(10) ** decade))
+
+
+def _lowest_index():
+    """First rung that stays outside the match window of the one below it.
+
+    The matcher treats prices within 0.051 as the same rung. Two series
+    prices closer than that would alias, so the downward walk stops
+    above that pair.
+    """
+    index = 0
+    while index > -500:
+        gap = abs(float(_price_from_index(index)) - float(_price_from_index(index - 1)))
+        if gap <= _MATCH:
+            return index + 1
+        index -= 1
+    return index
+
+
+_MIN_INDEX = _lowest_index()
+_MAX_INDEX = _TOP_INDEX + _EXTRA
+_LADDER = tuple(_price_from_index(index) for index in range(_TOP_INDEX + 1))
+_NAIL_LADDER = _LADDER
+_KORU_LADDER = _LADDER
+_SOXL_LADDER = _LADDER
 
 # iem_cd on unexecuted rows is the ISIN. Never print these values.
 _ISIN = {
@@ -80,15 +144,15 @@ def _sell_shares(cfg):
 _CFG = {
     # 22 is 20 (2x). At or below 20 is 40 (4x). Above 22 stays 10.
     "NAIL": {
-        "ladder": _NAIL_LADDER,
+        "ladder": _LADDER,
         "base": 10,
         "buy_qty": _buy_qty(10, 22, at_threshold=20, low_at=20, low_qty=40),
     },
-    "KORU": {"ladder": _KORU_LADDER, "base": 1, "buy_qty": _buy_qty(1, 9.4)},
+    "KORU": {"ladder": _LADDER, "base": 1, "buy_qty": _buy_qty(1, 9.4)},
     # Sells are 2. base stays 1: buys above 72, and a level already in
     # double_used, are 1. First buy at 72, and at 66 or below, is 4.
     "SOXL": {
-        "ladder": _SOXL_LADDER,
+        "ladder": _LADDER,
         "base": 1,
         "sell_qty": 2,
         "buy_qty": _buy_qty(1, 72, at_threshold=4, low_at=66, low_qty=4),
@@ -117,109 +181,39 @@ def _float(value):
     return None
 
 
-def _level(ladder, price):
-    for index, level in enumerate(ladder):
-        if abs(level - price) < 0.051:
-            return index
-    return None
-
-
-def _as_decimal(price):
-    if isinstance(price, Decimal):
-        return price
-    return Decimal(str(price))
-
-
-def _round_tenth(raw):
-    return raw.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
-
-
-def _tenth_unclear(raw):
-    """True when `raw` sits exactly halfway between two one-decimal prices."""
-    return abs(raw - _round_tenth(raw)) == Decimal("0.05")
-
-
-def _next_rung(price, up):
-    """Next unknown price, about 10% from `price`, as one decimal.
-
-    The primary step is `price * 1.1` upward or `price / 1.1` downward.
-    A value exactly halfway between tenths is unclear, so that case uses
-    `price * 1.1` upward or `price * 0.9` downward, then the same rounding.
-    """
-    base = _as_decimal(price)
-    if up:
-        primary = base * Decimal("1.1")
-        fallback = primary
-    else:
-        primary = base / Decimal("1.1")
-        fallback = base * Decimal("0.9")
-    chosen = fallback if _tenth_unclear(primary) else primary
-    rounded = _round_tenth(chosen)
-    if rounded <= 0:
-        return None
-    if up and rounded <= base:
-        return None
-    if not up and rounded >= base:
-        return None
-    return rounded
-
-
-def _down_price(start, steps):
-    """`steps` rungs under `start`. None when the price cannot keep falling."""
-    if isinstance(steps, bool) or not isinstance(steps, int):
-        return None
-    if steps < 1 or steps > 80:
-        return None
-    current = _as_decimal(start)
-    for _ in range(steps):
-        nxt = _next_rung(current, up=False)
-        if nxt is None:
-            return None
-        current = nxt
-    return float(current)
-
-
 def _price_at(ticker, index):
-    """Coded ladder price, or a generated KORU price below 7.2.
-
-    Index 0 is the first coded rung. Negative indexes walk down from it
-    and do not shift the coded indexes stored in ladder state.
-    """
+    """Shared-ladder price. Index 0 is 9.4. None outside the walk."""
     if ticker not in _CFG or isinstance(index, bool) or not isinstance(index, int):
         return None
-    ladder = _CFG[ticker]["ladder"]
-    if 0 <= index < len(ladder):
-        return ladder[index]
-    if index < 0 and ticker == "KORU":
-        return _down_price(ladder[0], -index)
-    return None
+    if index < _MIN_INDEX or index > _MAX_INDEX:
+        return None
+    if 0 <= index <= _TOP_INDEX:
+        return _LADDER[index]
+    return _price_from_index(index)
 
 
 def _level_of(ticker, price):
-    """Ladder index for `price`, including KORU rungs generated below 7.2."""
+    """Ladder index for `price` on the shared series. None when it is not a rung."""
     if ticker not in _CFG:
         return None
     if isinstance(price, bool) or not isinstance(price, (int, float)):
         return None
-    ladder = _CFG[ticker]["ladder"]
-    found = _level(ladder, float(price))
-    if found is not None:
-        return found
-    if ticker != "KORU" or float(price) >= ladder[0]:
-        return None
-    current = _as_decimal(ladder[0])
     target = float(price)
-    for step in range(1, 81):
-        nxt = _next_rung(current, up=False)
-        if nxt is None:
-            return None
-        rung = float(nxt)
-        if abs(rung - target) < 0.051:
-            return -step
-        if rung < target - 0.051:
-            return None
-        current = nxt
-    return None
+    if not target > 0:
+        return None
+    exp = floor(log10(target / 5.0))
+    found = None
+    for decade in (exp - 1, exp, exp + 1):
+        for offset in range(_PER):
+            index = decade * _PER + offset - _ANCHOR
+            rung = _price_at(ticker, index)
+            if rung is None:
+                continue
+            if abs(float(rung) - target) < _MATCH:
+                if found is not None:
+                    return None
+                found = index
+    return found
 
 
 def _identify(row):
