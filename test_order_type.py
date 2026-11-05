@@ -604,7 +604,7 @@ def test_day_session_fill_followup():
         ("NAIL", "buy", 30, 10),
         ("KORU", "sell", 11.3, 1),
         ("KORU", "buy", 9.4, 2),
-        ("SOXL", "sell", 86, 1),
+        ("SOXL", "sell", 86, 2),
         ("SOXL", "buy", 72, 4),
     ]
     moments = (
@@ -819,7 +819,7 @@ def test_day_session_quantities():
         86,
         1,
     )
-    assert soxl_at["placed"] == [("SOXL", "sell", 86, 1), ("SOXL", "buy", 72, 4)]
+    assert soxl_at["placed"] == [("SOXL", "sell", 86, 2), ("SOXL", "buy", 72, 4)]
 
     soxl_below = _one(
         "SOXL",
@@ -835,7 +835,57 @@ def test_day_session_quantities():
         79,
         1,
     )
-    assert soxl_below["placed"] == [("SOXL", "sell", 79, 1), ("SOXL", "buy", 66, 4)]
+    assert soxl_below["placed"] == [("SOXL", "sell", 79, 2), ("SOXL", "buy", 66, 4)]
+
+    # Above 72 the new buy stays 1. The new sell is 2.
+    soxl_above = _one(
+        "SOXL",
+        103,
+        94,
+        [],
+        [
+            {"ticker": "SOXL", "side": "sell", "price": 103, "qty": 2},
+            {"ticker": "SOXL", "side": "sell", "price": 113, "qty": 2},
+            {"ticker": "SOXL", "side": "buy", "price": 86, "qty": 1},
+        ],
+        "buy",
+        94,
+        1,
+    )
+    assert soxl_above["placed"] == [("SOXL", "sell", 94, 2), ("SOXL", "buy", 79, 1)]
+
+    # A level already bought goes back to 1. The new sell is still 2.
+    soxl_used = _one(
+        "SOXL",
+        94,
+        86,
+        [72],
+        [
+            {"ticker": "SOXL", "side": "sell", "price": 94, "qty": 2},
+            {"ticker": "SOXL", "side": "sell", "price": 103, "qty": 2},
+            {"ticker": "SOXL", "side": "buy", "price": 79, "qty": 1},
+        ],
+        "buy",
+        86,
+        1,
+    )
+    assert soxl_used["placed"] == [("SOXL", "sell", 86, 2), ("SOXL", "buy", 72, 1)]
+
+    soxl_used_low = _one(
+        "SOXL",
+        86,
+        79,
+        [66],
+        [
+            {"ticker": "SOXL", "side": "sell", "price": 86, "qty": 2},
+            {"ticker": "SOXL", "side": "sell", "price": 94, "qty": 2},
+            {"ticker": "SOXL", "side": "buy", "price": 72, "qty": 4},
+        ],
+        "buy",
+        79,
+        1,
+    )
+    assert soxl_used_low["placed"] == [("SOXL", "sell", 79, 2), ("SOXL", "buy", 66, 1)]
 
 
 def test_day_session_partial_does_not_advance():
@@ -1133,7 +1183,7 @@ def test_regular_reject_does_not_block_other_tickers():
     others = [
         ("KORU", "sell", 11.3, 1),
         ("KORU", "buy", 9.4, 2),
-        ("SOXL", "sell", 86, 1),
+        ("SOXL", "sell", 86, 2),
         ("SOXL", "buy", 72, 4),
     ]
     for moment in (

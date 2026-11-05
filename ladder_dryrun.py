@@ -63,6 +63,17 @@ def _buy_qty(base, threshold, at_threshold=None, low_at=None, low_qty=None):
     return qty
 
 
+def _sell_shares(cfg):
+    """Share count for each sell rung.
+
+    Tickers without `sell_qty` sell `base`. `base` is also the ordinary
+    buy size and the size of a level already in double_used.
+    """
+    if "sell_qty" in cfg:
+        return cfg["sell_qty"]
+    return cfg["base"]
+
+
 _CFG = {
     # 22 is 20 (2x). At or below 20 is 40 (4x). Above 22 stays 10.
     "NAIL": {
@@ -71,9 +82,12 @@ _CFG = {
         "buy_qty": _buy_qty(10, 22, at_threshold=20, low_at=20, low_qty=40),
     },
     "KORU": {"ladder": _KORU_LADDER, "base": 1, "buy_qty": _buy_qty(1, 9.4)},
+    # Sells are 2. base stays 1: buys above 72, and a level already in
+    # double_used, are 1. First buy at 72, and at 66 or below, is 4.
     "SOXL": {
         "ladder": _SOXL_LADDER,
         "base": 1,
+        "sell_qty": 2,
         "buy_qty": _buy_qty(1, 72, at_threshold=4, low_at=66, low_qty=4),
     },
 }
@@ -152,7 +166,7 @@ def plan(ticker, orders):
     cfg = _CFG[ticker]
     ladder = cfg["ladder"]
     buy_qty = cfg["buy_qty"]
-    base = cfg["base"]
+    sell_qty = _sell_shares(cfg)
     ignored = 0
     buys = []
     sells = []
@@ -185,9 +199,9 @@ def plan(ticker, orders):
 
     buy_idx = max(index for index, _qty in buys)
     sell_idx = min(index for index, _qty in sells)
-    desired = [("sell", sell_idx, base), ("buy", buy_idx, buy_qty(ladder[buy_idx]))]
+    desired = [("sell", sell_idx, sell_qty), ("buy", buy_idx, buy_qty(ladder[buy_idx]))]
     if sell_idx + 1 < len(ladder):
-        desired.append(("sell", sell_idx + 1, base))
+        desired.append(("sell", sell_idx + 1, sell_qty))
     if buy_idx - 1 >= 0:
         desired.append(("buy", buy_idx - 1, buy_qty(ladder[buy_idx - 1])))
 
