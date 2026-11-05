@@ -17,6 +17,12 @@ Clauses are separated by ';':
   exception_filled=true|false
   TICKER.double_used=price,price   (replaces that ticker's list; empty clears)
 Example: exception_filled=true;SOXL.double_used=72
+
+exception_filled applies to the current one-time order, SOXL buy 200 at 38.
+true stores that order's id. false clears it. A saved true left by the
+retired 100 at 75 fill has no current id, so it is not this order and
+does not need to be reseeded false. Seeding true would mark 200 at 38
+finished and must not be done unless that fill has already happened.
 """
 
 import os
@@ -152,8 +158,12 @@ def _parse_flags(raw):
 
 def _apply_flags(state, flags):
     exception_filled, used = flags
-    if exception_filled is not None:
-        state["exception_filled"] = exception_filled
+    if exception_filled is True:
+        state["exception_filled"] = True
+        state["exception_id"] = bot._EXCEPTION_ID
+    elif exception_filled is False:
+        state["exception_filled"] = False
+        state["exception_id"] = ""
     for ticker, indexes in used.items():
         pair = state["tickers"].get(ticker)
         if not isinstance(pair, dict) or "sell" not in pair:

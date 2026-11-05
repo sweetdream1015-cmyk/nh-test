@@ -9,7 +9,7 @@ on:
         default: ""
         type: string
       seed_flags:
-        description: "주문 없이 표시만 저장. exception_filled=true 또는 false. 더블 매수 가격은 티커.double_used=가격,가격 이며 그 티커 목록을 바꿈. 빈 값이면 그 티커의 double_used를 지움. 세미콜론으로 구분. 예: exception_filled=true;SOXL.double_used=72. 비우면 표시는 그대로."
+        description: "주문 없이 표시만 저장. exception_filled=true 또는 false. 더블 매수 가격은 티커.double_used=가격,가격 이며 그 티커 목록을 바꿈. 빈 값이면 그 티커의 double_used를 지움. 세미콜론으로 구분. 예: exception_filled=true;SOXL.double_used=72. 비우면 표시는 그대로. 지금 1회 예외는 SOXL 매수 200주 38달러다. 100주 75달러 체결로 남은 true 는 이 예외가 아니므로 병합 뒤에 false 로 다시 심지 않는다. true 로 심으면 200@38 을 끝난 것으로 저장한다."
         required: false
         default: ""
         type: string
