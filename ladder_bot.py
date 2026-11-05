@@ -7,6 +7,10 @@ Those runs log "skip: time guard" and exit.
 Intraday follow-up runs in the US session and in the KST day session.
 A live reset places whole tickers only, at most 6 new orders. A ticker
 that does not fit is left uncancelled and logged DEFERRED for a later run.
+Reset also keeps one SOXL buy of 200 shares at 38 until that order fills
+once. The retired buy of 100 at 75 stays retired: exception_filled counts
+only when exception_id is soxl-buy-200-38, so the saved true from that
+fill does not block 200 at 38 and does not need to be reseeded.
 Inquiry plus, when live and allowed, limit buy, limit sell, and full cancel.
 The modify endpoint is never called. Prints counts, OK/ERROR codes, and
 on a broker reject the ticker, side, price, and redacted rsp_cd/rsp_msg.
@@ -51,6 +55,11 @@ CANCEL_URL = gb.LIVE + "/gbstock/order/v1/cancel"
 _ORDER_URLS = {BUY_URL, SELL_URL, CANCEL_URL}
 _HARD_MAX = {"NAIL": 40, "KORU": 4, "SOXL": 4}
 _MAX_NEW = 6
+# One-time reset buy. 100 at 75 filled on 2026-10-31 and must not return.
+_EXCEPTION_PRICE = 38
+_EXCEPTION_QTY = 200
+_EXCEPTION_ID = "soxl-buy-200-38"
+_EXCEPTION_TOL = 0.051
 _TOKEN_PATH = os.environ.get("NHPLUG_TOKEN_PATH", ".nhplug-token/token.json")
 _STATE_PATH = os.environ.get("LADDER_STATE_PATH", ".ladder-state/state.json")
 
@@ -634,6 +643,7 @@ def _fresh_state():
         "tickers": {},
         "handled": [],
         "exception_filled": False,
+        "exception_id": "",
         "reset_done": {"09": "", "17": ""},
         "reset_tickers": {"09": {}, "17": {}},
     }
@@ -911,6 +921,32 @@ def _cancel(account, ticker, order, live):
     return _post_order(CANCEL_URL, body)
 
 
+def _near_exception(price):
+    if isinstance(price, bool) or not isinstance(price, (int, float)):
+        return False
+    return abs(float(price) - _EXCEPTION_PRICE) < _EXCEPTION_TOL
+
+
+def _exception_order(order):
+    """Resting SOXL buy at the one-time price. Not a ladder rung."""
+    if order.get("ticker") != "SOXL" or order.get("side") != "buy":
+        return False
+    if not _near_exception(order.get("price")):
+        return False
+    qty = order.get("qty", 0)
+    if isinstance(qty, bool) or not isinstance(qty, (int, float)):
+        return False
+    return qty > 0
+
+
+def _exception_done(state):
+    """True only for this 200-at-38 order. A bare true is the retired 75 fill."""
+    return (
+        bool(state.get("exception_filled"))
+        and state.get("exception_id") == _EXCEPTION_ID
+    )
+
+
 def _place_exception(account, live, counter):
     global _last_reject
     _last_reject = None
@@ -926,8 +962,8 @@ def _place_exception(account, live, counter):
         "act_no": account,
         "fc_sec_trd_nat_cd": "200",
         "iem_cd": "SOXL",
-        "orr_qty": 100,
-        "fc_orr_uit_pr": 75,
+        "orr_qty": _EXCEPTION_QTY,
+        "fc_orr_uit_pr": _EXCEPTION_PRICE,
         "ahi_nmn_pr_tp_cd": kind,
         "wtm_cur_knd_cd": "1",
     }
@@ -935,15 +971,7 @@ def _place_exception(account, live, counter):
 
 
 def _exception_open(orders):
-    for order in orders:
-        if order.get("ticker") != "SOXL" or order.get("side") != "buy":
-            continue
-        price = order.get("price")
-        if isinstance(price, bool) or not isinstance(price, (int, float)):
-            continue
-        if abs(float(price) - 75) < 0.051 and order.get("qty", 0) > 0:
-            return True
-    return False
+    return any(_exception_order(order) for order in orders)
 
 
 def _exception_filled(fills, handled):
@@ -952,8 +980,7 @@ def _exception_filled(fills, handled):
             continue
         if order.get("key") in handled:
             continue
-        price = order.get("price")
-        if not isinstance(price, (int, float)) or abs(float(price) - 75) >= 0.051:
+        if not _near_exception(order.get("price")):
             continue
         if order.get("cancelled_qty", 0) > 0:
             continue
@@ -1096,7 +1123,8 @@ def _clean_state(state):
         "version": 2,
         "tickers": tickers,
         "handled": _pin_done_markers(handled, reset_tickers),
-        "exception_filled": bool(state.get("exception_filled")),
+        "exception_filled": _exception_done(state),
+        "exception_id": _EXCEPTION_ID if _exception_done(state) else "",
         "reset_done": done,
         "reset_tickers": reset_tickers,
     }
@@ -1272,6 +1300,7 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
     print(f"order type {kind}")
     if _exception_filled(fills, set(working["handled"])):
         working["exception_filled"] = True
+        working["exception_id"] = _EXCEPTION_ID
 
     plans = []
     for ticker in ("NAIL", "KORU", "SOXL"):
@@ -1293,7 +1322,9 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
                 review = True
                 place = []
             else:
-                cancel = list(buys + sells)
+                cancel = [
+                    order for order in buys + sells if not _exception_order(order)
+                ]
                 indexes = stored
         else:
             missing = _core_missing(stored, buys + sells)
@@ -1363,8 +1394,9 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
                 planned += 1
     want_exception = (
         live
+        and mode == "reset"
         and "SOXL" in allow
-        and not working["exception_filled"]
+        and not _exception_done(working)
         and not _exception_open(opens)
     )
     if want_exception:
@@ -1673,8 +1705,11 @@ def main():
         if fresh is None:
             return False
         for order in fresh:
-            if order.get("ticker") == ticker and order.get("idx") is not None:
-                return False
+            if order.get("ticker") != ticker or order.get("idx") is None:
+                continue
+            if _exception_order(order):
+                continue
+            return False
         return True
 
     def exception_open():

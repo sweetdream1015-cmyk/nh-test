@@ -440,7 +440,7 @@ def _run_tracking(moment, state, opens, fills, place_fn=None):
         return False
 
     def place_exception(_counter):
-        world["exceptions"].append((100, 75))
+        world["exceptions"].append((200, 38))
         return True
 
     def place(ticker, item, counter):
@@ -584,7 +584,7 @@ def _day_book():
         {"ticker": "SOXL", "side": "sell", "price": 94, "qty": 1},
         {"ticker": "SOXL", "side": "sell", "price": 103, "qty": 1},
         {"ticker": "SOXL", "side": "buy", "price": 79, "qty": 1},
-        {"ticker": "SOXL", "side": "buy", "price": 75, "qty": 100},
+        {"ticker": "SOXL", "side": "buy", "price": 38, "qty": 200},
     ]
     fills = [
         _fill("NAIL", "sell", 33, nail_key, 10),
@@ -647,15 +647,17 @@ def test_day_session_fill_followup():
         assert again["saved"]["tickers"]["NAIL"]["sell"] == _idx("NAIL", 36)
         assert "OK dry" in out
 
+    # 200@38 is a reset order. Intraday still places the six follow-ups
+    # when that buy is absent, and does not place the exception itself.
     state, opens, fills, _keys = _day_book()
-    bare = [order for order in opens if order.get("price") != 75]
+    bare = [order for order in opens if order.get("price") != 38]
     code, out, world = _run_tracking(_kst(2026, 10, 29, 12, 0), state, bare, fills)
-    assert code == 1, out
-    assert "ERROR max_orders" in out
-    assert world["placed"] == []
+    assert code == 0, out
+    assert world["placed"] == expected
     assert world["cancelled"] == []
     assert world["exceptions"] == []
-    assert world["saved"] is None
+    assert "exception placed" not in out
+    assert "ERROR" not in out
 
 
 def test_day_session_quantities():
@@ -1344,7 +1346,7 @@ def test_reset_reject_still_places_exception():
             return None
 
         def place_exception(_counter, world=world):
-            world["exceptions"].append((100, 75))
+            world["exceptions"].append((200, 38))
             return True
 
         actions = {
@@ -1378,7 +1380,7 @@ def test_reset_reject_still_places_exception():
         assert "ERROR unexpected" not in out
         assert "OK live" not in out
         assert len(world["placed"]) == 1
-        assert world["exceptions"] == [(100, 75)]
+        assert world["exceptions"] == [(200, 38)]
         saved = world["saved"]
         assert saved["reset_tickers"]["17"].get("SOXL", "") == ""
         assert saved["reset_done"]["17"] == ""
