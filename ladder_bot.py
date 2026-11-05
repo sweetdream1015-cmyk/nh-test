@@ -7,10 +7,11 @@ Those runs log "skip: time guard" and exit.
 Intraday follow-up runs in the US session and in the KST day session.
 A live reset places whole tickers only, at most 6 new orders. A ticker
 that does not fit is left uncancelled and logged DEFERRED for a later run.
-Reset also keeps one SOXL buy of 200 shares at 38 until that order fills
-once. The retired buy of 100 at 75 stays retired: exception_filled counts
-only when exception_id is soxl-buy-200-38, so the saved true from that
-fill does not block 200 at 38 and does not need to be reseeded.
+Reset also keeps one SOXL buy of 200 shares at 37.5 until that order fills
+once. The retired buys of 100 at 75 and 200 at 38 stay retired:
+exception_filled counts only when exception_id is soxl-buy-200-37-5, so a
+saved true from either of those fills does not block 200 at 37.5 and must
+not be reseeded true.
 Inquiry plus, when live and allowed, limit buy, limit sell, and full cancel.
 The modify endpoint is never called. Prints counts, OK/ERROR codes, and
 on a broker reject the ticker, side, price, and redacted rsp_cd/rsp_msg.
@@ -56,10 +57,11 @@ CANCEL_URL = gb.LIVE + "/gbstock/order/v1/cancel"
 _ORDER_URLS = {BUY_URL, SELL_URL, CANCEL_URL}
 _HARD_MAX = {"NAIL": 40, "KORU": 4, "SOXL": 4}
 _MAX_NEW = 6
-# One-time reset buy. 100 at 75 filled on 2026-10-31 and must not return.
-_EXCEPTION_PRICE = 38
+# One-time reset buy. 100 at 75 filled on 2026-10-31. 200 at 38 was the
+# previous one-time order. Neither fill is this order.
+_EXCEPTION_PRICE = 37.5
 _EXCEPTION_QTY = 200
-_EXCEPTION_ID = "soxl-buy-200-38"
+_EXCEPTION_ID = "soxl-buy-200-37-5"
 _EXCEPTION_TOL = 0.051
 # State written by this ladder. Older files omit it and store KORU on the
 # pre-shared map (7.2 at index 0, generated rungs below that).
@@ -1053,7 +1055,11 @@ def _exception_order(order):
 
 
 def _exception_done(state):
-    """True only for this 200-at-38 order. A bare true is the retired 75 fill."""
+    """True only for this 200-at-37.5 order.
+
+    A bare true is the retired 75 fill. soxl-buy-200-38 is the retired
+    200-at-38 order. Neither one blocks 200 at 37.5.
+    """
     return (
         bool(state.get("exception_filled"))
         and state.get("exception_id") == _EXCEPTION_ID
