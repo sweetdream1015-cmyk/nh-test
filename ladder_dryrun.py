@@ -17,10 +17,13 @@ Unexecuted Output_0 uses iem_cd for the instrument, oss_sby_dit_cd
 import os
 import sys
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 
 import gb_readonly_check as gb
 
-# Ladders copied from the ticker files. KORU's rung below 9.4 is 8.6.
+# Ladders copied from the ticker files. KORU adds 8.6, 7.9, and 7.2 below
+# 9.4. Rungs below 7.2 are not stored on the list: each one is about 10%
+# under the previous rung and uses a negative index, so 7.2 stays index 0.
 _NAIL_LADDER = [
     9.4, 10.3, 11.3, 12.5, 13.5, 15, 16.5, 18, 20, 22, 24, 26, 28, 30, 33,
     36, 39, 42, 46, 50, 55, 60, 66, 72, 79, 86, 94, 103, 113, 125, 135, 150,
@@ -121,6 +124,104 @@ def _level(ladder, price):
     return None
 
 
+def _as_decimal(price):
+    if isinstance(price, Decimal):
+        return price
+    return Decimal(str(price))
+
+
+def _round_tenth(raw):
+    return raw.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+
+
+def _tenth_unclear(raw):
+    """True when `raw` sits exactly halfway between two one-decimal prices."""
+    return abs(raw - _round_tenth(raw)) == Decimal("0.05")
+
+
+def _next_rung(price, up):
+    """Next unknown price, about 10% from `price`, as one decimal.
+
+    The primary step is `price * 1.1` upward or `price / 1.1` downward.
+    A value exactly halfway between tenths is unclear, so that case uses
+    `price * 1.1` upward or `price * 0.9` downward, then the same rounding.
+    """
+    base = _as_decimal(price)
+    if up:
+        primary = base * Decimal("1.1")
+        fallback = primary
+    else:
+        primary = base / Decimal("1.1")
+        fallback = base * Decimal("0.9")
+    chosen = fallback if _tenth_unclear(primary) else primary
+    rounded = _round_tenth(chosen)
+    if rounded <= 0:
+        return None
+    if up and rounded <= base:
+        return None
+    if not up and rounded >= base:
+        return None
+    return rounded
+
+
+def _down_price(start, steps):
+    """`steps` rungs under `start`. None when the price cannot keep falling."""
+    if isinstance(steps, bool) or not isinstance(steps, int):
+        return None
+    if steps < 1 or steps > 80:
+        return None
+    current = _as_decimal(start)
+    for _ in range(steps):
+        nxt = _next_rung(current, up=False)
+        if nxt is None:
+            return None
+        current = nxt
+    return float(current)
+
+
+def _price_at(ticker, index):
+    """Coded ladder price, or a generated KORU price below 7.2.
+
+    Index 0 is the first coded rung. Negative indexes walk down from it
+    and do not shift the coded indexes stored in ladder state.
+    """
+    if ticker not in _CFG or isinstance(index, bool) or not isinstance(index, int):
+        return None
+    ladder = _CFG[ticker]["ladder"]
+    if 0 <= index < len(ladder):
+        return ladder[index]
+    if index < 0 and ticker == "KORU":
+        return _down_price(ladder[0], -index)
+    return None
+
+
+def _level_of(ticker, price):
+    """Ladder index for `price`, including KORU rungs generated below 7.2."""
+    if ticker not in _CFG:
+        return None
+    if isinstance(price, bool) or not isinstance(price, (int, float)):
+        return None
+    ladder = _CFG[ticker]["ladder"]
+    found = _level(ladder, float(price))
+    if found is not None:
+        return found
+    if ticker != "KORU" or float(price) >= ladder[0]:
+        return None
+    current = _as_decimal(ladder[0])
+    target = float(price)
+    for step in range(1, 81):
+        nxt = _next_rung(current, up=False)
+        if nxt is None:
+            return None
+        rung = float(nxt)
+        if abs(rung - target) < 0.051:
+            return -step
+        if rung < target - 0.051:
+            return None
+        current = nxt
+    return None
+
+
 def _identify(row):
     iem = _text(row.get("iem_cd")).upper()
     if iem in _CFG:
@@ -164,7 +265,6 @@ def _quiet_emit(name, status, payload):
 def plan(ticker, orders):
     """Compare open orders to the desired pair. `orders` are side/price/qty."""
     cfg = _CFG[ticker]
-    ladder = cfg["ladder"]
     buy_qty = cfg["buy_qty"]
     sell_qty = _sell_shares(cfg)
     ignored = 0
@@ -177,7 +277,7 @@ def plan(ticker, orders):
         if not isinstance(price, (int, float)) or isinstance(price, bool):
             ignored += 1
             continue
-        index = _level(ladder, float(price))
+        index = _level_of(ticker, float(price))
         if index is None or side not in ("buy", "sell") or not isinstance(qty, int) or qty <= 0:
             ignored += 1
             continue
@@ -199,17 +299,24 @@ def plan(ticker, orders):
 
     buy_idx = max(index for index, _qty in buys)
     sell_idx = min(index for index, _qty in sells)
-    desired = [("sell", sell_idx, sell_qty), ("buy", buy_idx, buy_qty(ladder[buy_idx]))]
-    if sell_idx + 1 < len(ladder):
+    buy_price = _price_at(ticker, buy_idx)
+    sell_price = _price_at(ticker, sell_idx)
+    if buy_price is None or sell_price is None:
+        return result
+    desired = [("sell", sell_idx, sell_qty), ("buy", buy_idx, buy_qty(buy_price))]
+    up_price = _price_at(ticker, sell_idx + 1)
+    if up_price is not None:
         desired.append(("sell", sell_idx + 1, sell_qty))
-    if buy_idx - 1 >= 0:
-        desired.append(("buy", buy_idx - 1, buy_qty(ladder[buy_idx - 1])))
+    down_price = _price_at(ticker, buy_idx - 1)
+    if down_price is not None:
+        desired.append(("buy", buy_idx - 1, buy_qty(down_price)))
 
     actual = [("buy", index, qty) for index, qty in buys]
     actual.extend(("sell", index, qty) for index, qty in sells)
     third = buy_idx - 2
-    if third >= 0:
-        exempt = ("buy", third, buy_qty(ladder[third]))
+    third_price = _price_at(ticker, third)
+    if third_price is not None:
+        exempt = ("buy", third, buy_qty(third_price))
         if exempt in actual:
             actual.remove(exempt)
 

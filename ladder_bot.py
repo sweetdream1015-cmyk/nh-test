@@ -295,7 +295,7 @@ def _sized(ticker, computed, mult):
 def _level_of(ticker, price):
     if not isinstance(price, (int, float)) or isinstance(price, bool):
         return None
-    return ladders._level(_cfg(ticker)["ladder"], float(price))
+    return ladders._level_of(ticker, float(price))
 
 
 def _split(ticker, orders):
@@ -320,10 +320,7 @@ def _anchors(ticker, orders):
         return None
     buy_idx = max(order["idx"] for order in buys)
     sell_idx = min(order["idx"] for order in sells)
-    ladder = _cfg(ticker)["ladder"]
-    if not (0 <= buy_idx < sell_idx < len(ladder) - 1):
-        return None
-    if buy_idx - 1 < 0:
+    if not _valid_pair(ticker, sell_idx, buy_idx):
         return None
     return {
         "buys": buys,
@@ -356,8 +353,9 @@ def _buy_computed(ticker, index, double_used):
     A used SOXL level is 1. KORU at or below 9.4 is 2, then 1. NAIL is
     20 at 22 and 40 at 20 or below, then 10 once that level is used.
     """
-    ladder = _cfg(ticker)["ladder"]
-    price = ladder[index]
+    price = ladders._price_at(ticker, index)
+    if price is None:
+        return None
     qty = _cfg(ticker)["buy_qty"](price)
     if index in set(double_used) and _in_double_zone(ticker, price):
         return _cfg(ticker)["base"]
@@ -367,7 +365,6 @@ def _buy_computed(ticker, index, double_used):
 def _desired(ticker, sell_idx, buy_idx, mult, double_used=()):
     if not _valid_pair(ticker, sell_idx, buy_idx):
         return None
-    ladder = _cfg(ticker)["ladder"]
     sell_qty = ladders._sell_shares(_cfg(ticker))
     specs = [
         ("sell", sell_idx, sell_qty),
@@ -377,10 +374,11 @@ def _desired(ticker, sell_idx, buy_idx, mult, double_used=()):
     ]
     out = []
     for side, index, computed in specs:
+        price = ladders._price_at(ticker, index)
         qty = _sized(ticker, computed, mult)
-        if qty is None:
+        if price is None or qty is None:
             return None
-        out.append({"side": side, "idx": index, "price": ladder[index], "qty": qty})
+        out.append({"side": side, "idx": index, "price": price, "qty": qty})
     return out
 
 
@@ -399,7 +397,6 @@ def intraday_adds(ticker, open_orders, fills, mult):
     if {item["side"] for item in fills} == {"buy", "sell"}:
         return None
     buys, sells, _ignored = _split(ticker, [dict(order) for order in open_orders])
-    ladder = _cfg(ticker)["ladder"]
     buy_qty = _cfg(ticker)["buy_qty"]
     sell_qty = ladders._sell_shares(_cfg(ticker))
     side = fills[0]["side"]
@@ -411,28 +408,31 @@ def intraday_adds(ticker, open_orders, fills, mult):
         if side == "sell":
             sell_idx = max(order["idx"] for order in sells) + 1
             buy_idx = max(order["idx"] for order in buys) + 1
-            if sell_idx >= len(ladder) or buy_idx >= len(ladder):
-                return None
             if buy_idx >= min(order["idx"] for order in sells):
                 return None
-            pair = [("sell", sell_idx, sell_qty), ("buy", buy_idx, buy_qty(ladder[buy_idx]))]
         else:
             buy_idx = min(order["idx"] for order in buys) - 1
             sell_idx = min(order["idx"] for order in sells) - 1
-            if buy_idx < 0 or sell_idx < 0:
-                return None
             if sell_idx <= max(order["idx"] for order in buys):
                 return None
+        sell_price = ladders._price_at(ticker, sell_idx)
+        buy_price = ladders._price_at(ticker, buy_idx)
+        if sell_price is None or buy_price is None:
+            return None
+        if side == "sell":
+            pair = [("sell", sell_idx, sell_qty), ("buy", buy_idx, buy_qty(buy_price))]
+        else:
             pair = [
-                ("buy", buy_idx, buy_qty(ladder[buy_idx])),
+                ("buy", buy_idx, buy_qty(buy_price)),
                 ("sell", sell_idx, sell_qty),
             ]
         for add_side, index, computed in pair:
             qty = _sized(ticker, computed, mult)
-            if qty is None:
+            price = ladders._price_at(ticker, index)
+            if qty is None or price is None:
                 return None
             adds.append(
-                {"side": add_side, "idx": index, "price": ladder[index], "qty": qty}
+                {"side": add_side, "idx": index, "price": price, "qty": qty}
             )
         sells.append({"side": "sell", "idx": sell_idx})
         buys.append({"side": "buy", "idx": buy_idx})
@@ -981,12 +981,17 @@ def _valid_pair(ticker, sell_idx, buy_idx):
         return False
     if not isinstance(sell_idx, int) or not isinstance(buy_idx, int):
         return False
-    ladder = _cfg(ticker)["ladder"]
-    return 0 <= buy_idx < sell_idx < len(ladder) - 1 and buy_idx >= 1
+    if buy_idx >= sell_idx:
+        return False
+    return (
+        ladders._price_at(ticker, sell_idx) is not None
+        and ladders._price_at(ticker, sell_idx + 1) is not None
+        and ladders._price_at(ticker, buy_idx) is not None
+        and ladders._price_at(ticker, buy_idx - 1) is not None
+    )
 
 
 def _used_indexes(ticker, raw):
-    ladder = _cfg(ticker)["ladder"]
     found = []
     if not isinstance(raw, list):
         return found
@@ -994,12 +999,13 @@ def _used_indexes(ticker, raw):
         index = None
         if isinstance(item, bool):
             continue
-        if isinstance(item, int) and 0 <= item < len(ladder):
-            index = item
+        if isinstance(item, int):
+            if ladders._price_at(ticker, item) is not None:
+                index = item
         else:
             price = ladders._float(item)
             if price is not None:
-                index = ladders._level(ladder, price)
+                index = ladders._level_of(ticker, price)
         if index is not None and index not in found:
             found.append(index)
     return found
@@ -1040,7 +1046,9 @@ def _baseline_ok(ticker, buys, sells, anchor):
     if not extra:
         return True
     third = anchor["buy"] - 2
-    return third >= 0 and extra == {("buy", third)}
+    if ladders._price_at(ticker, third) is None:
+        return False
+    return extra == {("buy", third)}
 
 
 def _next_pair(ticker, buys, sells, adds):
@@ -1108,7 +1116,9 @@ def _step_sell(ticker, pair):
 
 def _step_buy(ticker, pair):
     used = list(pair.get("double_used") or [])
-    price = _cfg(ticker)["ladder"][pair["buy"]]
+    price = ladders._price_at(ticker, pair["buy"])
+    if price is None:
+        return None
     if _in_double_zone(ticker, price) and pair["buy"] not in used:
         used.append(pair["buy"])
     sell_idx = pair["sell"] - 1

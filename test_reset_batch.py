@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 from datetime import datetime
+from decimal import Decimal
 
 import ladder_bot as bot
 import ladder_dryrun as ladders
@@ -19,7 +20,7 @@ _ORIG_STATE = bot._STATE_PATH
 
 
 def _level(ticker, price):
-    return ladders._level(ladders._CFG[ticker]["ladder"], price)
+    return ladders._level_of(ticker, price)
 
 
 def _pair(ticker, sell_px, buy_px, double_used=()):
@@ -914,6 +915,240 @@ def test_soxl_sell_qty_and_buy_rules():
     )["ok"]
 
 
+def test_koru_extends_below_7_2():
+    """7.2 is not a floor. 6.5 and the next ~10% rungs are real KORU buys."""
+    assert ladders._KORU_LADDER[:4] == [7.2, 7.9, 8.6, 9.4]
+    assert ladders._KORU_LADDER[-1] == 72
+    assert 6.5 not in ladders._KORU_LADDER
+    assert [_level("KORU", price) for price in (7.2, 7.9, 8.6, 9.4, 13.5)] == [
+        0,
+        1,
+        2,
+        3,
+        7,
+    ]
+    assert [_level("KORU", price) for price in (6.5, 5.9, 5.4, 4.9, 4.5, 4.1)] == [
+        -1,
+        -2,
+        -3,
+        -4,
+        -5,
+        -6,
+    ]
+    assert [ladders._price_at("KORU", index) for index in range(-1, -7, -1)] == [
+        6.5,
+        5.9,
+        5.4,
+        4.9,
+        4.5,
+        4.1,
+    ]
+    assert ladders._level_of("KORU", 6.4) is None
+    assert ladders._next_rung(Decimal("1.155"), up=False) == Decimal("1.0")
+
+    assert ladders._NAIL_LADDER[0] == 9.4 and ladders._NAIL_LADDER[-1] == 220
+    assert ladders._SOXL_LADDER[0] == 9.4 and ladders._SOXL_LADDER[-1] == 220
+    assert ladders._CFG["SOXL"]["sell_qty"] == 2
+    assert ladders._CFG["SOXL"]["base"] == 1
+    assert "sell_qty" not in ladders._CFG["KORU"]
+    assert ladders._price_at("NAIL", -1) is None
+    assert ladders._price_at("SOXL", -1) is None
+    assert ladders._price_at("SOXL", len(ladders._SOXL_LADDER)) is None
+    assert ladders._price_at("NAIL", len(ladders._NAIL_LADDER)) is None
+    assert bot._desired("NAIL", _level("NAIL", 11.3), _level("NAIL", 9.4), 1.0) is None
+    assert (
+        bot._step_buy(
+            "NAIL",
+            {"sell": _level("NAIL", 11.3), "buy": _level("NAIL", 10.3), "double_used": []},
+        )
+        is None
+    )
+    nail_floor = bot.intraday_adds(
+        "NAIL",
+        [
+            {"side": "sell", "price": 10.3, "qty": 10},
+            {"side": "sell", "price": 11.3, "qty": 10},
+            {"side": "buy", "price": 9.4, "qty": 40},
+        ],
+        [{"side": "buy", "idx": _level("NAIL", 10.3)}],
+        1.0,
+    )
+    assert nail_floor is None
+
+    assert bot._buy_computed("KORU", _level("KORU", 6.5), []) == 2
+    assert bot._buy_computed("KORU", _level("KORU", 5.9), []) == 2
+    assert bot._buy_computed("KORU", _level("KORU", 5.4), []) == 2
+    assert bot._buy_computed("KORU", _level("KORU", 6.5), [_level("KORU", 6.5)]) == 1
+    assert bot._buy_computed("KORU", _level("KORU", 7.2), []) == 2
+
+    at_floor = bot._desired("KORU", _level("KORU", 8.6), _level("KORU", 7.2), 1.0, [])
+    assert [(item["side"], item["price"], item["qty"]) for item in at_floor] == [
+        ("sell", 8.6, 1),
+        ("sell", 9.4, 1),
+        ("buy", 7.2, 2),
+        ("buy", 6.5, 2),
+    ]
+    below = bot._desired(
+        "KORU",
+        _level("KORU", 7.9),
+        _level("KORU", 6.5),
+        1.0,
+        [_level("KORU", 7.2)],
+    )
+    assert [(item["side"], item["price"], item["qty"]) for item in below] == [
+        ("sell", 7.9, 1),
+        ("sell", 8.6, 1),
+        ("buy", 6.5, 2),
+        ("buy", 5.9, 2),
+    ]
+    used_low = bot._desired(
+        "KORU",
+        _level("KORU", 7.9),
+        _level("KORU", 6.5),
+        1.0,
+        [_level("KORU", 6.5)],
+    )
+    assert [(item["side"], item["price"], item["qty"]) for item in used_low] == [
+        ("sell", 7.9, 1),
+        ("sell", 8.6, 1),
+        ("buy", 6.5, 1),
+        ("buy", 5.9, 2),
+    ]
+
+    pair = {"sell": _level("KORU", 8.6), "buy": _level("KORU", 7.2), "double_used": []}
+    stepped_buys = []
+    for _ in range(4):
+        pair = bot._step_buy("KORU", pair)
+        assert pair
+        stepped_buys.append(ladders._price_at("KORU", pair["buy"]))
+    assert stepped_buys == [6.5, 5.9, 5.4, 4.9]
+
+    added = bot.intraday_adds(
+        "KORU",
+        [
+            {"side": "sell", "price": 8.6, "qty": 1},
+            {"side": "sell", "price": 9.4, "qty": 1},
+            {"side": "buy", "price": 7.2, "qty": 2},
+        ],
+        [{"side": "buy", "idx": _level("KORU", 7.9)}],
+        1.0,
+    )
+    assert [(item["side"], item["price"], item["qty"]) for item in added] == [
+        ("buy", 6.5, 2),
+        ("sell", 7.9, 1),
+    ]
+    further = bot.intraday_adds(
+        "KORU",
+        [
+            {"side": "sell", "price": 7.9, "qty": 1},
+            {"side": "sell", "price": 8.6, "qty": 1},
+            {"side": "buy", "price": 6.5, "qty": 2},
+        ],
+        [{"side": "buy", "idx": _level("KORU", 7.2)}],
+        1.0,
+    )
+    assert [(item["side"], item["price"], item["qty"]) for item in further] == [
+        ("buy", 5.9, 2),
+        ("sell", 7.2, 1),
+    ]
+
+    missing = ladders.plan(
+        "KORU",
+        _book(
+            [
+                ("sell", 8.6, 1),
+                ("sell", 9.4, 1),
+                ("buy", 7.2, 2),
+            ]
+        ),
+    )
+    assert missing["ignored"] == 0
+    assert missing["ok"] is False
+    assert missing["would_place"] == 1
+    assert ladders.plan(
+        "KORU",
+        _book(
+            [
+                ("sell", 8.6, 1),
+                ("sell", 9.4, 1),
+                ("buy", 7.2, 2),
+                ("buy", 6.5, 2),
+            ]
+        ),
+    )["ok"]
+    odd = ladders.plan(
+        "KORU",
+        _book(
+            [
+                ("sell", 8.6, 1),
+                ("sell", 9.4, 1),
+                ("buy", 7.2, 2),
+                ("buy", 6.4, 2),
+            ]
+        ),
+    )
+    assert odd["ignored"] == 1
+    assert odd["would_place"] == 1
+    assert ladders.plan(
+        "KORU",
+        _book(
+            [
+                ("sell", 7.9, 1),
+                ("sell", 8.6, 1),
+                ("buy", 6.5, 2),
+                ("buy", 5.9, 2),
+            ]
+        ),
+    )["ok"]
+    assert not ladders.plan(
+        "KORU",
+        _book(
+            [
+                ("sell", 7.9, 1),
+                ("sell", 8.6, 1),
+                ("buy", 6.5, 1),
+                ("buy", 5.9, 2),
+            ]
+        ),
+    )["ok"]
+
+    flags = seed_state._parse_flags("KORU.double_used=6.5,7.2")
+    assert flags[1]["KORU"] == [-1, 0]
+    assert seed_state._parse_flags("KORU.double_used=6.4") is None
+    assert seed_state._parse_force("KORU:7.9:6.5")["KORU"] == (
+        _level("KORU", 7.9),
+        _level("KORU", 6.5),
+    )
+    assert seed_state._parse_force("NAIL:11.3:9.4") is None
+
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "KORU"
+    state = bot._clean_state(
+        {
+            "version": 2,
+            "tickers": {"KORU": _pair("KORU", 8.6, 7.2)},
+            "handled": [],
+            "exception_filled": True,
+            "reset_done": {"09": "", "17": ""},
+        }
+    )
+    assert state["tickers"]["KORU"]["sell"] == 2
+    assert state["tickers"]["KORU"]["buy"] == 0
+    morning = datetime(2026, 10, 29, 9, 10, tzinfo=bot.KST)
+    code, out, world = _run(state, [], {}, when=morning)
+    assert code == 0, out
+    assert "order type 63" in out
+    assert world["placed"] == [
+        ("KORU", "sell", 8.6, 1),
+        ("KORU", "sell", 9.4, 1),
+        ("KORU", "buy", 7.2, 2),
+        ("KORU", "buy", 6.5, 2),
+    ]
+    assert world["cancelled"] == []
+    assert "NEEDS_REVIEW KORU" not in out
+    assert world["saved"]["tickers"]["KORU"]["buy"] == 0
+
+
 def test_workflows():
     root = os.path.dirname(os.path.abspath(__file__))
     reset = open(
@@ -956,6 +1191,7 @@ def main():
         test_seed_flags()
         test_reset_low_rung_sizes()
         test_soxl_sell_qty_and_buy_rules()
+        test_koru_extends_below_7_2()
         test_workflows()
     finally:
         bot._now_kst = _ORIG_NOW
