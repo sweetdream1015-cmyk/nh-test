@@ -368,10 +368,10 @@ def _desired(ticker, sell_idx, buy_idx, mult, double_used=()):
     if not _valid_pair(ticker, sell_idx, buy_idx):
         return None
     ladder = _cfg(ticker)["ladder"]
-    base = _cfg(ticker)["base"]
+    sell_qty = ladders._sell_shares(_cfg(ticker))
     specs = [
-        ("sell", sell_idx, base),
-        ("sell", sell_idx + 1, base),
+        ("sell", sell_idx, sell_qty),
+        ("sell", sell_idx + 1, sell_qty),
         ("buy", buy_idx, _buy_computed(ticker, buy_idx, double_used)),
         ("buy", buy_idx - 1, _buy_computed(ticker, buy_idx - 1, double_used)),
     ]
@@ -401,7 +401,7 @@ def intraday_adds(ticker, open_orders, fills, mult):
     buys, sells, _ignored = _split(ticker, [dict(order) for order in open_orders])
     ladder = _cfg(ticker)["ladder"]
     buy_qty = _cfg(ticker)["buy_qty"]
-    base = _cfg(ticker)["base"]
+    sell_qty = ladders._sell_shares(_cfg(ticker))
     side = fills[0]["side"]
     ordered = sorted(fills, key=lambda item: item["idx"], reverse=(side == "buy"))
     adds = []
@@ -415,7 +415,7 @@ def intraday_adds(ticker, open_orders, fills, mult):
                 return None
             if buy_idx >= min(order["idx"] for order in sells):
                 return None
-            pair = [("sell", sell_idx, base), ("buy", buy_idx, buy_qty(ladder[buy_idx]))]
+            pair = [("sell", sell_idx, sell_qty), ("buy", buy_idx, buy_qty(ladder[buy_idx]))]
         else:
             buy_idx = min(order["idx"] for order in buys) - 1
             sell_idx = min(order["idx"] for order in sells) - 1
@@ -425,7 +425,7 @@ def intraday_adds(ticker, open_orders, fills, mult):
                 return None
             pair = [
                 ("buy", buy_idx, buy_qty(ladder[buy_idx])),
-                ("sell", sell_idx, base),
+                ("sell", sell_idx, sell_qty),
             ]
         for add_side, index, computed in pair:
             qty = _sized(ticker, computed, mult)

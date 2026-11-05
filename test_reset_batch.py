@@ -142,8 +142,8 @@ def test_pairs_and_limits():
         ("buy", 10.3, 1),
     ]
     assert _orders("SOXL", 113, 94) == [
-        ("sell", 113, 1),
-        ("sell", 125, 1),
+        ("sell", 113, 2),
+        ("sell", 125, 2),
         ("buy", 94, 1),
         ("buy", 86, 1),
     ]
@@ -650,10 +650,22 @@ def test_reset_low_rung_sizes():
             66,
             [_level("SOXL", 72)],
             [
-                ("sell", 79, 1),
-                ("sell", 86, 1),
+                ("sell", 79, 2),
+                ("sell", 86, 2),
                 ("buy", 66, 4),
                 ("buy", 60, 4),
+            ],
+        ),
+        (
+            "SOXL",
+            86,
+            72,
+            [_level("SOXL", 72), _level("SOXL", 66)],
+            [
+                ("sell", 86, 2),
+                ("sell", 94, 2),
+                ("buy", 72, 1),
+                ("buy", 66, 1),
             ],
         ),
         (
@@ -731,6 +743,177 @@ def test_reset_low_rung_sizes():
         assert "exception placed" not in out
 
 
+def _book(orders):
+    return [{"side": side, "price": price, "qty": qty} for side, price, qty in orders]
+
+
+def test_soxl_sell_qty_and_buy_rules():
+    """SOXL sells are 2 everywhere. Buys stay on the existing rule."""
+    cfg = ladders._CFG["SOXL"]
+    ladder = cfg["ladder"]
+    assert cfg["base"] == 1
+    assert cfg["sell_qty"] == 2
+    assert ladders._sell_shares(cfg) == 2
+    assert ladders._sell_shares(ladders._CFG["NAIL"]) == 10
+    assert ladders._sell_shares(ladders._CFG["KORU"]) == 1
+    assert "sell_qty" not in ladders._CFG["NAIL"]
+    assert "sell_qty" not in ladders._CFG["KORU"]
+
+    used = [_level("SOXL", price) for price in (72, 66, 60, 55)]
+    for sell_idx in range(2, len(ladder) - 1):
+        buy_idx = sell_idx - 1
+        for flags, label in (((), "first"), (used, "used")):
+            desired = bot._desired("SOXL", sell_idx, buy_idx, 1.0, flags)
+            assert desired, (label, sell_idx)
+            for item in desired:
+                price = item["price"]
+                if item["side"] == "sell":
+                    assert item["qty"] == 2, (label, item)
+                    continue
+                boosted = abs(price - 72) < 0.051 or price <= 66
+                if boosted and item["idx"] in set(flags):
+                    assert item["qty"] == 1, (label, item)
+                elif boosted:
+                    assert item["qty"] == 4, (label, item)
+                else:
+                    assert item["qty"] == 1, (label, item)
+
+    added = bot.intraday_adds(
+        "SOXL",
+        [
+            {"side": "sell", "price": 94, "qty": 1},
+            {"side": "sell", "price": 103, "qty": 1},
+            {"side": "buy", "price": 79, "qty": 1},
+        ],
+        [{"side": "buy", "idx": _level("SOXL", 86)}],
+        1.0,
+    )
+    assert [(item["side"], item["price"], item["qty"]) for item in added] == [
+        ("buy", 72, 4),
+        ("sell", 86, 2),
+    ]
+    nail_added = bot.intraday_adds(
+        "NAIL",
+        [
+            {"side": "sell", "price": 33, "qty": 10},
+            {"side": "sell", "price": 36, "qty": 10},
+            {"side": "buy", "price": 26, "qty": 10},
+        ],
+        [{"side": "buy", "idx": _level("NAIL", 28)}],
+        1.0,
+    )
+    assert [(item["side"], item["price"], item["qty"]) for item in nail_added] == [
+        ("buy", 24, 10),
+        ("sell", 30, 10),
+    ]
+    koru_added = bot.intraday_adds(
+        "KORU",
+        [
+            {"side": "sell", "price": 12.5, "qty": 1},
+            {"side": "sell", "price": 13.5, "qty": 1},
+            {"side": "buy", "price": 10.3, "qty": 1},
+        ],
+        [{"side": "buy", "idx": _level("KORU", 11.3)}],
+        1.0,
+    )
+    assert [(item["side"], item["price"], item["qty"]) for item in koru_added] == [
+        ("buy", 9.4, 2),
+        ("sell", 11.3, 1),
+    ]
+
+    assert ladders.plan(
+        "SOXL",
+        _book(
+            [
+                ("sell", 113, 2),
+                ("sell", 125, 2),
+                ("buy", 94, 1),
+                ("buy", 86, 1),
+            ]
+        ),
+    )["ok"]
+    stale = ladders.plan(
+        "SOXL",
+        _book(
+            [
+                ("sell", 113, 1),
+                ("sell", 125, 1),
+                ("buy", 94, 1),
+                ("buy", 86, 1),
+            ]
+        ),
+    )
+    assert stale["ok"] is False
+    assert stale["would_place"] == 2
+    assert stale["would_cancel"] == 2
+    assert ladders.plan(
+        "SOXL",
+        _book(
+            [
+                ("sell", 86, 2),
+                ("sell", 94, 2),
+                ("buy", 72, 4),
+                ("buy", 66, 4),
+            ]
+        ),
+    )["ok"]
+    assert not ladders.plan(
+        "SOXL",
+        _book(
+            [
+                ("sell", 113, 2),
+                ("sell", 125, 2),
+                ("buy", 94, 2),
+                ("buy", 86, 1),
+            ]
+        ),
+    )["ok"]
+    assert ladders.plan(
+        "NAIL",
+        _book(
+            [
+                ("sell", 33, 10),
+                ("sell", 36, 10),
+                ("buy", 28, 10),
+                ("buy", 26, 10),
+            ]
+        ),
+    )["ok"]
+    assert ladders.plan(
+        "NAIL",
+        _book(
+            [
+                ("sell", 26, 10),
+                ("sell", 28, 10),
+                ("buy", 22, 20),
+                ("buy", 20, 40),
+            ]
+        ),
+    )["ok"]
+    assert ladders.plan(
+        "KORU",
+        _book(
+            [
+                ("sell", 13.5, 1),
+                ("sell", 15, 1),
+                ("buy", 11.3, 1),
+                ("buy", 10.3, 1),
+            ]
+        ),
+    )["ok"]
+    assert ladders.plan(
+        "KORU",
+        _book(
+            [
+                ("sell", 11.3, 1),
+                ("sell", 12.5, 1),
+                ("buy", 9.4, 2),
+                ("buy", 8.6, 2),
+            ]
+        ),
+    )["ok"]
+
+
 def test_workflows():
     root = os.path.dirname(os.path.abspath(__file__))
     reset = open(
@@ -772,6 +955,7 @@ def main():
         test_seed_force()
         test_seed_flags()
         test_reset_low_rung_sizes()
+        test_soxl_sell_qty_and_buy_rules()
         test_workflows()
     finally:
         bot._now_kst = _ORIG_NOW
