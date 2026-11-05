@@ -8,9 +8,11 @@ next one down.
 SEED_FORCE=KORU:13.5:11.3,SOXL:113:94 overwrites only those tickers.
 Other tickers and handled fills stay as they are. double_used on a forced
 ticker is kept unless SEED_FLAGS replaces it.
-KORU's ladder has extra rungs below 9.4, so its indexes are not the NAIL/SOXL indexes.
-Rungs below 7.2 are generated about 10% apart and stored as negative indexes,
-so 7.2 stays index 0.
+NAIL, KORU, and SOXL share one ladder. Index 0 is 9.4 for every ticker.
+A file saved before that shared series stored KORU on its own map
+(7.2 at index 0, and generated 6.5 / 5.9 / 5.4 below it). Loading remaps
+KORU indexes whose prices still exist. 5.9 is not a rung, so that pair is
+dropped and reset logs NEEDS_REVIEW until SEED_FORCE names a real buy.
 
 SEED_FLAGS sets marks only. It never places or cancels.
 Clauses are separated by ';':
@@ -18,11 +20,11 @@ Clauses are separated by ';':
   TICKER.double_used=price,price   (replaces that ticker's list; empty clears)
 Example: exception_filled=true;SOXL.double_used=72
 
-exception_filled applies to the current one-time order, SOXL buy 200 at 38.
+exception_filled applies to the current one-time order, SOXL buy 200 at 37.5.
 true stores that order's id. false clears it. A saved true left by the
-retired 100 at 75 fill has no current id, so it is not this order and
-does not need to be reseeded false. Seeding true would mark 200 at 38
-finished and must not be done unless that fill has already happened.
+retired 100 at 75 fill, or by the retired id soxl-buy-200-38, is not this
+order. Do not seed true after the switch to 37.5: that marks 200 at 37.5
+finished. Do not reseed false either. The old true is already ignored.
 """
 
 import os

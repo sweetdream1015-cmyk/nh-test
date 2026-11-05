@@ -7,10 +7,11 @@ Those runs log "skip: time guard" and exit.
 Intraday follow-up runs in the US session and in the KST day session.
 A live reset places whole tickers only, at most 6 new orders. A ticker
 that does not fit is left uncancelled and logged DEFERRED for a later run.
-Reset also keeps one SOXL buy of 200 shares at 38 until that order fills
-once. The retired buy of 100 at 75 stays retired: exception_filled counts
-only when exception_id is soxl-buy-200-38, so the saved true from that
-fill does not block 200 at 38 and does not need to be reseeded.
+Reset also keeps one SOXL buy of 200 shares at 37.5 until that order fills
+once. The retired buys of 100 at 75 and 200 at 38 stay retired:
+exception_filled counts only when exception_id is soxl-buy-200-37-5, so a
+saved true from either of those fills does not block 200 at 37.5 and must
+not be reseeded true.
 Inquiry plus, when live and allowed, limit buy, limit sell, and full cancel.
 The modify endpoint is never called. Prints counts, OK/ERROR codes, and
 on a broker reject the ticker, side, price, and redacted rsp_cd/rsp_msg.
@@ -42,6 +43,7 @@ import sys
 import time
 import urllib.parse
 from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
 import gb_readonly_check as gb
@@ -55,11 +57,19 @@ CANCEL_URL = gb.LIVE + "/gbstock/order/v1/cancel"
 _ORDER_URLS = {BUY_URL, SELL_URL, CANCEL_URL}
 _HARD_MAX = {"NAIL": 40, "KORU": 4, "SOXL": 4}
 _MAX_NEW = 6
-# One-time reset buy. 100 at 75 filled on 2026-10-31 and must not return.
-_EXCEPTION_PRICE = 38
+# One-time reset buy. 100 at 75 filled on 2026-10-31. 200 at 38 was the
+# previous one-time order. Neither fill is this order.
+_EXCEPTION_PRICE = 37.5
 _EXCEPTION_QTY = 200
-_EXCEPTION_ID = "soxl-buy-200-38"
+_EXCEPTION_ID = "soxl-buy-200-37-5"
 _EXCEPTION_TOL = 0.051
+# State written by this ladder. Older files omit it and store KORU on the
+# pre-shared map (7.2 at index 0, generated rungs below that).
+_LADDER_ID = "shared"
+_KORU_LEGACY = (
+    7.2, 7.9, 8.6, 9.4, 10.3, 11.3, 12.5, 13.5, 15, 16.5, 18, 20, 22, 24, 26,
+    28, 30, 33, 36, 39, 42, 46, 50, 55, 60, 66, 72,
+)
 _TOKEN_PATH = os.environ.get("NHPLUG_TOKEN_PATH", ".nhplug-token/token.json")
 _STATE_PATH = os.environ.get("LADDER_STATE_PATH", ".ladder-state/state.json")
 
@@ -511,13 +521,117 @@ def _save_json(path, data):
     os.chmod(path, 0o600)
 
 
+def _legacy_tenth(raw):
+    return raw.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+
+
+def _legacy_next_down(price):
+    """One old KORU rung under `price`. That generator is not the live series."""
+    base = price if isinstance(price, Decimal) else Decimal(str(price))
+    primary = base / Decimal("1.1")
+    if abs(primary - _legacy_tenth(primary)) == Decimal("0.05"):
+        chosen = base * Decimal("0.9")
+    else:
+        chosen = primary
+    rounded = _legacy_tenth(chosen)
+    if rounded <= 0 or rounded >= base:
+        return None
+    return rounded
+
+
+def _legacy_koru_price(index):
+    """Price a pre-shared KORU index named. None when that index was not a rung."""
+    if isinstance(index, bool) or not isinstance(index, int):
+        return None
+    if 0 <= index < len(_KORU_LEGACY):
+        return _KORU_LEGACY[index]
+    if index > -1 or index < -80:
+        return None
+    current = Decimal(str(_KORU_LEGACY[0]))
+    for _ in range(-index):
+        current = _legacy_next_down(current)
+        if current is None:
+            return None
+    return float(current)
+
+
+def _shared_index_exact(price):
+    """Shared index for `price` only when it is that rung, not a neighbor.
+
+    The trading matcher allows 0.051, which is enough for 1.7 to look like
+    1.65. Remapping uses this tighter check.
+    """
+    mapped = ladders._level_of("KORU", float(price))
+    if mapped is None:
+        return None
+    rung = ladders._price_at("KORU", mapped)
+    if rung is None or abs(float(rung) - float(price)) > 0.001:
+        return None
+    return mapped
+
+
+def _legacy_koru_index(index):
+    """Shared-ladder index for an old KORU index, or None if that price is gone."""
+    price = _legacy_koru_price(index)
+    if price is None:
+        return None
+    return _shared_index_exact(price)
+
+
+def _migrate_koru_pair(pair):
+    """Rewrite one old KORU pair onto the shared ladder.
+
+    None means the sell or the buy is not a shared rung (the generated
+    6.5 / 5.9 / 5.4 steps). The caller drops the pair so reset reviews
+    KORU instead of trading the wrong prices.
+    """
+    if not isinstance(pair, dict):
+        return None
+    sell = _legacy_koru_index(pair.get("sell"))
+    buy = _legacy_koru_index(pair.get("buy"))
+    if not _valid_pair("KORU", sell, buy):
+        return None
+    used = []
+    raw_used = pair.get("double_used")
+    if isinstance(raw_used, list):
+        for item in raw_used:
+            if isinstance(item, bool):
+                continue
+            if isinstance(item, int):
+                mapped = _legacy_koru_index(item)
+            else:
+                price = ladders._float(item)
+                mapped = None if price is None else _shared_index_exact(price)
+            if mapped is not None and mapped not in used:
+                used.append(mapped)
+    return {"sell": sell, "buy": buy, "double_used": used}
+
+
+def _migrate_loaded(data):
+    """Map a pre-shared file onto this ladder. NAIL and SOXL indexes stay."""
+    if not isinstance(data, dict) or data.get("ladder_id") == _LADDER_ID:
+        return data
+    migrated = dict(data)
+    raw = migrated.get("tickers")
+    if isinstance(raw, dict) and "KORU" in raw:
+        tickers = dict(raw)
+        pair = _migrate_koru_pair(tickers.get("KORU"))
+        if pair is None:
+            tickers.pop("KORU", None)
+        else:
+            tickers["KORU"] = pair
+        migrated["tickers"] = tickers
+    migrated["ladder_id"] = _LADDER_ID
+    return migrated
+
+
 def _load_state():
     data = _load_json(_STATE_PATH)
     if not data or data.get("version") not in (1, 2):
         return None
     if not isinstance(data.get("handled"), list):
         return None
-    return data
+    return _migrate_loaded(data)
 
 
 def _done_marker(slot, ticker, today):
@@ -640,6 +754,7 @@ def _reset_batch(plans, allow, state, slot, today, want_exception):
 def _fresh_state():
     return {
         "version": 2,
+        "ladder_id": _LADDER_ID,
         "tickers": {},
         "handled": [],
         "exception_filled": False,
@@ -940,7 +1055,11 @@ def _exception_order(order):
 
 
 def _exception_done(state):
-    """True only for this 200-at-38 order. A bare true is the retired 75 fill."""
+    """True only for this 200-at-37.5 order.
+
+    A bare true is the retired 75 fill. soxl-buy-200-38 is the retired
+    200-at-38 order. Neither one blocks 200 at 37.5.
+    """
     return (
         bool(state.get("exception_filled"))
         and state.get("exception_id") == _EXCEPTION_ID
@@ -1121,6 +1240,7 @@ def _clean_state(state):
     reset_tickers = _clean_reset_tickers(state.get("reset_tickers"))
     return {
         "version": 2,
+        "ladder_id": _LADDER_ID,
         "tickers": tickers,
         "handled": _pin_done_markers(handled, reset_tickers),
         "exception_filled": _exception_done(state),

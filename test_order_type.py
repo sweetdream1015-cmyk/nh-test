@@ -440,7 +440,7 @@ def _run_tracking(moment, state, opens, fills, place_fn=None):
         return False
 
     def place_exception(_counter):
-        world["exceptions"].append((200, 38))
+        world["exceptions"].append((200, 37.5))
         return True
 
     def place(ticker, item, counter):
@@ -584,7 +584,7 @@ def _day_book():
         {"ticker": "SOXL", "side": "sell", "price": 94, "qty": 1},
         {"ticker": "SOXL", "side": "sell", "price": 103, "qty": 1},
         {"ticker": "SOXL", "side": "buy", "price": 79, "qty": 1},
-        {"ticker": "SOXL", "side": "buy", "price": 38, "qty": 200},
+        {"ticker": "SOXL", "side": "buy", "price": 37.5, "qty": 200},
     ]
     fills = [
         _fill("NAIL", "sell", 33, nail_key, 10),
@@ -647,10 +647,10 @@ def test_day_session_fill_followup():
         assert again["saved"]["tickers"]["NAIL"]["sell"] == _idx("NAIL", 36)
         assert "OK dry" in out
 
-    # 200@38 is a reset order. Intraday still places the six follow-ups
+    # 200@37.5 is a reset order. Intraday still places the six follow-ups
     # when that buy is absent, and does not place the exception itself.
     state, opens, fills, _keys = _day_book()
-    bare = [order for order in opens if order.get("price") != 38]
+    bare = [order for order in opens if order.get("price") != 37.5]
     code, out, world = _run_tracking(_kst(2026, 10, 29, 12, 0), state, bare, fills)
     assert code == 0, out
     assert world["placed"] == expected
@@ -891,7 +891,7 @@ def test_day_session_quantities():
 
 
 def test_koru_buy_fill_steps_below_7_2():
-    """Filling 7.2 moves the core buy to 6.5, still a first buy of 2."""
+    """Filling 7.2 moves the core buy to 6.6, still a first buy of 2."""
     _restore_guards()
     os.environ["LIVE_TRADING"] = "on"
     os.environ["LIVE_TICKERS"] = "KORU"
@@ -920,7 +920,7 @@ def test_koru_buy_fill_steps_below_7_2():
         assert key in world["saved"]["handled"]
         return world
 
-    # The 7.9 core buy fills while 7.2 is already open, so intraday places 2@6.5.
+    # The 7.9 core buy fills while 7.2 is already open, so intraday places 2@6.6.
     placed = _book(
         8.6,
         7.9,
@@ -931,36 +931,36 @@ def test_koru_buy_fill_steps_below_7_2():
         ],
         7.9,
     )
-    assert placed["placed"] == [("KORU", "sell", 7.9, 1), ("KORU", "buy", 6.5, 2)]
+    assert placed["placed"] == [("KORU", "sell", 7.9, 1), ("KORU", "buy", 6.6, 2)]
     assert placed["saved"]["tickers"]["KORU"]["sell"] == _idx("KORU", 7.9)
     assert placed["saved"]["tickers"]["KORU"]["buy"] == _idx("KORU", 7.2)
 
-    # Filling the 7.2 core buy steps that core down onto 6.5 at qty 2.
+    # Filling the 7.2 core buy steps that core down onto 6.6 at qty 2.
     stepped = _book(
         8.6,
         7.2,
         [
             {"ticker": "KORU", "side": "sell", "price": 8.6, "qty": 1},
             {"ticker": "KORU", "side": "sell", "price": 9.4, "qty": 1},
-            {"ticker": "KORU", "side": "buy", "price": 6.5, "qty": 2},
+            {"ticker": "KORU", "side": "buy", "price": 6.6, "qty": 2},
         ],
         7.2,
     )
-    assert stepped["placed"] == [("KORU", "sell", 7.9, 1), ("KORU", "buy", 5.9, 2)]
+    assert stepped["placed"] == [("KORU", "sell", 7.9, 1), ("KORU", "buy", 6.0, 2)]
     saved = stepped["saved"]["tickers"]["KORU"]
     assert saved["sell"] == _idx("KORU", 7.9)
-    assert saved["buy"] == _idx("KORU", 6.5)
-    assert saved["buy"] == -1
+    assert saved["buy"] == _idx("KORU", 6.6)
+    assert saved["buy"] == -4
     assert _idx("KORU", 7.2) in saved["double_used"]
-    assert _idx("KORU", 6.5) not in saved["double_used"]
+    assert _idx("KORU", 6.6) not in saved["double_used"]
     desired = bot._desired(
         "KORU", saved["sell"], saved["buy"], 1.0, saved["double_used"]
     )
     assert [(item["side"], item["price"], item["qty"]) for item in desired] == [
         ("sell", 7.9, 1),
         ("sell", 8.6, 1),
-        ("buy", 6.5, 2),
-        ("buy", 5.9, 2),
+        ("buy", 6.6, 2),
+        ("buy", 6.0, 2),
     ]
 
 
@@ -1346,7 +1346,7 @@ def test_reset_reject_still_places_exception():
             return None
 
         def place_exception(_counter, world=world):
-            world["exceptions"].append((200, 38))
+            world["exceptions"].append((200, 37.5))
             return True
 
         actions = {
@@ -1380,7 +1380,7 @@ def test_reset_reject_still_places_exception():
         assert "ERROR unexpected" not in out
         assert "OK live" not in out
         assert len(world["placed"]) == 1
-        assert world["exceptions"] == [(200, 38)]
+        assert world["exceptions"] == [(200, 37.5)]
         saved = world["saved"]
         assert saved["reset_tickers"]["17"].get("SOXL", "") == ""
         assert saved["reset_done"]["17"] == ""

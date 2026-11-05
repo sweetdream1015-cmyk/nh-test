@@ -6,8 +6,6 @@ import os
 import sys
 import tempfile
 from datetime import datetime
-from decimal import Decimal
-
 import ladder_bot as bot
 import ladder_dryrun as ladders
 import seed_state
@@ -82,7 +80,7 @@ def _actions(world):
         if counter[0] >= bot._MAX_NEW:
             return None
         counter[0] += 1
-        world["exceptions"].append((200, 38))
+        world["exceptions"].append((200, 37.5))
         world["exception_open"] = True
         return True
 
@@ -138,9 +136,8 @@ def _strip_maps(state):
 
 
 def test_pairs_and_limits():
-    assert _level("KORU", 13.5) == 7
-    assert _level("SOXL", 13.5) == 4
-    assert _level("KORU", 11.3) == 5
+    assert _level("KORU", 13.5) == _level("SOXL", 13.5) == _level("NAIL", 13.5) == 4
+    assert _level("KORU", 11.3) == _level("SOXL", 11.3) == 2
     assert _level("SOXL", 113) == 28
     assert _level("SOXL", 94) == 26
     assert _level("NAIL", 33) == 14
@@ -273,7 +270,7 @@ def test_three_resets():
     code, out, world = _run(_strip_maps(saved), [], world)
     assert code == 0, out
     assert world["placed"] == _tagged("SOXL", 113, 94)
-    assert world["exceptions"] == [(200, 38)]
+    assert world["exceptions"] == [(200, 37.5)]
     assert "exception placed 1" in out
     assert "ERROR" not in out
     saved = world["saved"]
@@ -282,7 +279,7 @@ def test_three_resets():
     assert saved["exception_filled"] is False
     assert saved["exception_id"] == ""
     assert _HANDLED in saved["handled"]
-    assert saved["tickers"]["KORU"]["sell"] == 7
+    assert saved["tickers"]["KORU"]["sell"] == _level("KORU", 13.5)
     assert saved["tickers"]["SOXL"]["sell"] == 28
 
     code, out, world = _run(saved, [], world)
@@ -313,18 +310,18 @@ def test_deferred_not_cancelled_and_exception_survives():
     opens = [
         {"ticker": "NAIL", "side": "sell", "price": 33, "qty": 10, "orr_no": 1},
         {"ticker": "KORU", "side": "buy", "price": 10.3, "qty": 1, "orr_no": 2},
-        {"ticker": "SOXL", "side": "buy", "price": 38, "qty": 200, "orr_no": 38},
+        {"ticker": "SOXL", "side": "buy", "price": 37.5, "qty": 200, "orr_no": 38},
     ]
     world = {}
     code, out, world = _run(state, opens, world)
     assert code == 0, out
     assert [item[0] for item in world["cancelled"]] == ["NAIL"]
-    assert all(item[1] != 38 for item in world["cancelled"])
+    assert all(item[1] != 37.5 for item in world["cancelled"])
     assert [item[0] for item in world["placed"]] == ["NAIL", "NAIL", "NAIL", "NAIL"]
     assert world["exceptions"] == []
 
     done = world["saved"]
-    # SOXL's turn. The 200@38 buy is not a ladder rung, so the reset must not cancel it.
+    # SOXL's turn. The 200@37.5 buy is not a ladder rung, so the reset must not cancel it.
     code, _out, world = _run(done, opens, world)
     assert code == 0
     code, out, world = _run(world["saved"], opens, world)
@@ -459,7 +456,7 @@ def test_seed_force():
                 "version": 2,
                 "tickers": {
                     "NAIL": _pair("NAIL", 33, 28),
-                    "KORU": _pair("KORU", 12.5, 10.3, [4]),
+                    "KORU": _pair("KORU", 12.5, 10.3, [_level("KORU", 10.3)]),
                     "SOXL": _pair("SOXL", 103, 86),
                 },
                 "handled": [handled],
@@ -490,9 +487,9 @@ def test_seed_force():
             "buy": 12,
             "double_used": [],
         }
-        assert forced["tickers"]["KORU"]["sell"] == 7
-        assert forced["tickers"]["KORU"]["buy"] == 5
-        assert forced["tickers"]["KORU"]["double_used"] == [4]
+        assert forced["tickers"]["KORU"]["sell"] == _level("KORU", 13.5)
+        assert forced["tickers"]["KORU"]["buy"] == _level("KORU", 11.3)
+        assert forced["tickers"]["KORU"]["double_used"] == [_level("KORU", 10.3)]
         assert forced["tickers"]["SOXL"]["sell"] == 28
         assert forced["tickers"]["SOXL"]["buy"] == 26
         assert handled in forced["handled"]
@@ -504,7 +501,7 @@ def test_seed_force():
         code, out = _capture(seed_state.main)
         assert code == 0, out
         assert "OK skip" in out
-        assert _read_state(path)["tickers"]["KORU"]["sell"] == 7
+        assert _read_state(path)["tickers"]["KORU"]["sell"] == _level("KORU", 13.5)
 
         os.remove(path)
         os.environ["SEED_FORCE"] = "KORU:13.5:11.3"
@@ -512,7 +509,7 @@ def test_seed_force():
         assert code == 0, out
         fresh = _read_state(path)
         assert fresh["tickers"]["NAIL"]["sell"] == 14
-        assert fresh["tickers"]["KORU"]["sell"] == 7
+        assert fresh["tickers"]["KORU"]["sell"] == _level("KORU", 13.5)
         assert fresh["tickers"]["SOXL"]["sell"] == _level("SOXL", 103)
 
         broken = os.path.join(tmp, "broken.json")
@@ -537,7 +534,7 @@ def test_seed_flags():
                 "version": 2,
                 "tickers": {
                     "NAIL": _pair("NAIL", 33, 28),
-                    "KORU": _pair("KORU", 12.5, 10.3, [4]),
+                    "KORU": _pair("KORU", 12.5, 10.3, [_level("KORU", 10.3)]),
                     "SOXL": _pair("SOXL", 103, 86),
                 },
                 "handled": [handled],
@@ -582,7 +579,7 @@ def test_seed_flags():
         assert marked["exception_id"] == bot._EXCEPTION_ID
         assert marked["tickers"]["SOXL"]["double_used"] == [_level("SOXL", 72)]
         assert marked["tickers"]["SOXL"]["sell"] == _level("SOXL", 103)
-        assert marked["tickers"]["KORU"]["double_used"] == [4]
+        assert marked["tickers"]["KORU"]["double_used"] == [_level("KORU", 10.3)]
         assert marked["tickers"]["NAIL"]["sell"] == _level("NAIL", 33)
         assert handled in marked["handled"]
         assert marked["reset_done"]["09"] == "20261029"
@@ -646,9 +643,10 @@ def test_seed_flags():
 
 
 def test_reset_low_rung_sizes():
-    koru = ladders._CFG["KORU"]["ladder"]
-    assert koru[2] == 8.6
-    assert 8.5 not in koru
+    assert ladders._NAIL_LADDER is ladders._KORU_LADDER is ladders._SOXL_LADDER
+    assert ladders._price_at("KORU", 2) == 11.3
+    assert ladders._level_of("KORU", 8.6) == ladders._level_of("NAIL", 8.6)
+    assert ladders._level_of("NAIL", 8.5) is None
     assert bot._buy_computed("SOXL", _level("SOXL", 72), []) == 4
     assert bot._buy_computed("SOXL", _level("SOXL", 66), []) == 4
     assert bot._buy_computed("SOXL", _level("SOXL", 60), []) == 4
@@ -938,55 +936,70 @@ def test_soxl_sell_qty_and_buy_rules():
     )["ok"]
 
 
-def test_koru_extends_below_7_2():
-    """7.2 is not a floor. 6.5 and the next ~10% rungs are real KORU buys."""
-    assert ladders._KORU_LADDER[:4] == [7.2, 7.9, 8.6, 9.4]
-    assert ladders._KORU_LADDER[-1] == 72
-    assert 6.5 not in ladders._KORU_LADDER
-    assert [_level("KORU", price) for price in (7.2, 7.9, 8.6, 9.4, 13.5)] == [
-        0,
-        1,
-        2,
-        3,
-        7,
+def test_shared_ladder():
+    """NAIL, KORU, and SOXL share one series, extended below 5.0 and above 220."""
+    listed = [
+        5.0, 5.5, 6.0, 6.6, 7.2, 7.9, 8.6, 9.4, 10.3, 11.3, 12.5, 13.5, 15,
+        16.5, 18, 20, 22, 24, 26, 28, 30, 33, 36, 39, 42, 46, 50, 55, 60, 66, 72,
     ]
-    assert [_level("KORU", price) for price in (6.5, 5.9, 5.4, 4.9, 4.5, 4.1)] == [
-        -1,
-        -2,
-        -3,
-        -4,
-        -5,
-        -6,
+    indexes = [_level("SOXL", price) for price in listed]
+    assert indexes == list(range(-7, -7 + len(listed)))
+    assert indexes[listed.index(9.4)] == 0
+    for price in listed:
+        assert _level("NAIL", price) == _level("KORU", price) == _level("SOXL", price)
+    for index in range(ladders._MIN_INDEX, ladders._MAX_INDEX + 1):
+        price = ladders._price_at("NAIL", index)
+        assert price is not None
+        assert _level("KORU", price) == index
+        assert _level("SOXL", price) == index
+        assert ladders._price_at("KORU", index) == price
+    assert [ladders._price_at("NAIL", index) for index in (-8, -9, -10)] == [4.6, 4.2, 3.9]
+    assert [ladders._price_at("KORU", index) for index in (35, 36, 37, 38)] == [
+        220, 240, 260, 280,
     ]
-    assert [ladders._price_at("KORU", index) for index in range(-1, -7, -1)] == [
-        6.5,
-        5.9,
-        5.4,
-        4.9,
-        4.5,
-        4.1,
-    ]
-    assert ladders._level_of("KORU", 6.4) is None
-    assert ladders._next_rung(Decimal("1.155"), up=False) == Decimal("1.0")
+    assert ladders._price_at("SOXL", ladders._MIN_INDEX) == 0.66
+    assert ladders._price_at("SOXL", ladders._MIN_INDEX - 1) is None
+    assert ladders._price_at("SOXL", ladders._MAX_INDEX + 1) is None
+    for price in (6.5, 5.9, 5.4, 4.9, 4.5, 4.1, 6.4, 8.5):
+        assert _level("NAIL", price) is None
+        assert _level("KORU", price) is None
+        assert _level("SOXL", price) is None
 
-    assert ladders._NAIL_LADDER[0] == 9.4 and ladders._NAIL_LADDER[-1] == 220
-    assert ladders._SOXL_LADDER[0] == 9.4 and ladders._SOXL_LADDER[-1] == 220
+    assert ladders._LADDER[0] == 9.4 and ladders._LADDER[-1] == 220
+    assert ladders._NAIL_LADDER is ladders._KORU_LADDER is ladders._SOXL_LADDER
+    assert _level("SOXL", 113) == 28
+    assert _level("NAIL", 42) == 17 and _level("NAIL", 36) == 15
+    assert _level("SOXL", 46) == 18 and _level("SOXL", 39) == 16
+    assert _level("KORU", 7.2) == -3 and _level("KORU", 6.0) == -5
     assert ladders._CFG["SOXL"]["sell_qty"] == 2
     assert ladders._CFG["SOXL"]["base"] == 1
     assert "sell_qty" not in ladders._CFG["KORU"]
-    assert ladders._price_at("NAIL", -1) is None
-    assert ladders._price_at("SOXL", -1) is None
-    assert ladders._price_at("SOXL", len(ladders._SOXL_LADDER)) is None
-    assert ladders._price_at("NAIL", len(ladders._NAIL_LADDER)) is None
-    assert bot._desired("NAIL", _level("NAIL", 11.3), _level("NAIL", 9.4), 1.0) is None
-    assert (
-        bot._step_buy(
-            "NAIL",
-            {"sell": _level("NAIL", 11.3), "buy": _level("NAIL", 10.3), "double_used": []},
-        )
-        is None
+
+    for price in (6.6, 6.0, 5.5, 5.0, 4.6, 0.66):
+        koru_idx = _level("KORU", price)
+        nail_idx = _level("NAIL", price)
+        soxl_idx = _level("SOXL", price)
+        assert bot._buy_computed("KORU", koru_idx, []) == 2
+        assert bot._buy_computed("KORU", koru_idx, [koru_idx]) == 1
+        assert bot._buy_computed("NAIL", nail_idx, []) == 40
+        assert bot._buy_computed("NAIL", nail_idx, [nail_idx]) == 10
+        assert bot._buy_computed("SOXL", soxl_idx, []) == 4
+        assert bot._buy_computed("SOXL", soxl_idx, [soxl_idx]) == 1
+
+    low_nail = bot._desired("NAIL", _level("NAIL", 11.3), _level("NAIL", 9.4), 1.0)
+    assert [(item["side"], item["price"], item["qty"]) for item in low_nail] == [
+        ("sell", 11.3, 10),
+        ("sell", 12.5, 10),
+        ("buy", 9.4, 40),
+        ("buy", 8.6, 40),
+    ]
+    stepped_nail = bot._step_buy(
+        "NAIL",
+        {"sell": _level("NAIL", 11.3), "buy": _level("NAIL", 10.3), "double_used": []},
     )
-    nail_floor = bot.intraday_adds(
+    assert ladders._price_at("NAIL", stepped_nail["sell"]) == 10.3
+    assert ladders._price_at("NAIL", stepped_nail["buy"]) == 9.4
+    nail_cross = bot.intraday_adds(
         "NAIL",
         [
             {"side": "sell", "price": 10.3, "qty": 10},
@@ -996,55 +1009,77 @@ def test_koru_extends_below_7_2():
         [{"side": "buy", "idx": _level("NAIL", 10.3)}],
         1.0,
     )
-    assert nail_floor is None
+    assert nail_cross is None
+    nail_down = bot.intraday_adds(
+        "NAIL",
+        [
+            {"side": "sell", "price": 11.3, "qty": 10},
+            {"side": "sell", "price": 12.5, "qty": 10},
+            {"side": "buy", "price": 9.4, "qty": 40},
+        ],
+        [{"side": "buy", "idx": _level("NAIL", 10.3)}],
+        1.0,
+    )
+    assert [(item["side"], item["price"], item["qty"]) for item in nail_down] == [
+        ("buy", 8.6, 40),
+        ("sell", 10.3, 10),
+    ]
+    high = bot._desired("SOXL", _level("SOXL", 220), _level("SOXL", 200), 1.0)
+    assert [(item["side"], item["price"], item["qty"]) for item in high] == [
+        ("sell", 220, 2),
+        ("sell", 240, 2),
+        ("buy", 200, 1),
+        ("buy", 180, 1),
+    ]
+    high_nail = bot._desired("NAIL", _level("NAIL", 220), _level("NAIL", 200), 1.0)
+    assert [(item["side"], item["price"], item["qty"]) for item in high_nail] == [
+        ("sell", 220, 10),
+        ("sell", 240, 10),
+        ("buy", 200, 10),
+        ("buy", 180, 10),
+    ]
 
-    assert bot._buy_computed("KORU", _level("KORU", 6.5), []) == 2
-    assert bot._buy_computed("KORU", _level("KORU", 5.9), []) == 2
-    assert bot._buy_computed("KORU", _level("KORU", 5.4), []) == 2
-    assert bot._buy_computed("KORU", _level("KORU", 6.5), [_level("KORU", 6.5)]) == 1
-    assert bot._buy_computed("KORU", _level("KORU", 7.2), []) == 2
-
-    at_floor = bot._desired("KORU", _level("KORU", 8.6), _level("KORU", 7.2), 1.0, [])
-    assert [(item["side"], item["price"], item["qty"]) for item in at_floor] == [
+    at_low = bot._desired("KORU", _level("KORU", 8.6), _level("KORU", 7.2), 1.0, [])
+    assert [(item["side"], item["price"], item["qty"]) for item in at_low] == [
         ("sell", 8.6, 1),
         ("sell", 9.4, 1),
         ("buy", 7.2, 2),
-        ("buy", 6.5, 2),
+        ("buy", 6.6, 2),
     ]
     below = bot._desired(
         "KORU",
         _level("KORU", 7.9),
-        _level("KORU", 6.5),
+        _level("KORU", 6.6),
         1.0,
         [_level("KORU", 7.2)],
     )
     assert [(item["side"], item["price"], item["qty"]) for item in below] == [
         ("sell", 7.9, 1),
         ("sell", 8.6, 1),
-        ("buy", 6.5, 2),
-        ("buy", 5.9, 2),
+        ("buy", 6.6, 2),
+        ("buy", 6.0, 2),
     ]
     used_low = bot._desired(
         "KORU",
         _level("KORU", 7.9),
-        _level("KORU", 6.5),
+        _level("KORU", 6.6),
         1.0,
-        [_level("KORU", 6.5)],
+        [_level("KORU", 6.6)],
     )
     assert [(item["side"], item["price"], item["qty"]) for item in used_low] == [
         ("sell", 7.9, 1),
         ("sell", 8.6, 1),
-        ("buy", 6.5, 1),
-        ("buy", 5.9, 2),
+        ("buy", 6.6, 1),
+        ("buy", 6.0, 2),
     ]
 
     pair = {"sell": _level("KORU", 8.6), "buy": _level("KORU", 7.2), "double_used": []}
     stepped_buys = []
-    for _ in range(4):
+    for _ in range(5):
         pair = bot._step_buy("KORU", pair)
         assert pair
         stepped_buys.append(ladders._price_at("KORU", pair["buy"]))
-    assert stepped_buys == [6.5, 5.9, 5.4, 4.9]
+    assert stepped_buys == [6.6, 6.0, 5.5, 5.0, 4.6]
 
     added = bot.intraday_adds(
         "KORU",
@@ -1057,7 +1092,7 @@ def test_koru_extends_below_7_2():
         1.0,
     )
     assert [(item["side"], item["price"], item["qty"]) for item in added] == [
-        ("buy", 6.5, 2),
+        ("buy", 6.6, 2),
         ("sell", 7.9, 1),
     ]
     further = bot.intraday_adds(
@@ -1065,13 +1100,13 @@ def test_koru_extends_below_7_2():
         [
             {"side": "sell", "price": 7.9, "qty": 1},
             {"side": "sell", "price": 8.6, "qty": 1},
-            {"side": "buy", "price": 6.5, "qty": 2},
+            {"side": "buy", "price": 6.6, "qty": 2},
         ],
         [{"side": "buy", "idx": _level("KORU", 7.2)}],
         1.0,
     )
     assert [(item["side"], item["price"], item["qty"]) for item in further] == [
-        ("buy", 5.9, 2),
+        ("buy", 6.0, 2),
         ("sell", 7.2, 1),
     ]
 
@@ -1095,7 +1130,7 @@ def test_koru_extends_below_7_2():
                 ("sell", 8.6, 1),
                 ("sell", 9.4, 1),
                 ("buy", 7.2, 2),
-                ("buy", 6.5, 2),
+                ("buy", 6.6, 2),
             ]
         ),
     )["ok"]
@@ -1106,7 +1141,7 @@ def test_koru_extends_below_7_2():
                 ("sell", 8.6, 1),
                 ("sell", 9.4, 1),
                 ("buy", 7.2, 2),
-                ("buy", 6.4, 2),
+                ("buy", 6.5, 2),
             ]
         ),
     )
@@ -1118,8 +1153,8 @@ def test_koru_extends_below_7_2():
             [
                 ("sell", 7.9, 1),
                 ("sell", 8.6, 1),
-                ("buy", 6.5, 2),
-                ("buy", 5.9, 2),
+                ("buy", 6.6, 2),
+                ("buy", 6.0, 2),
             ]
         ),
     )["ok"]
@@ -1129,20 +1164,52 @@ def test_koru_extends_below_7_2():
             [
                 ("sell", 7.9, 1),
                 ("sell", 8.6, 1),
-                ("buy", 6.5, 1),
-                ("buy", 5.9, 2),
+                ("buy", 6.6, 1),
+                ("buy", 6.0, 2),
+            ]
+        ),
+    )["ok"]
+    assert ladders.plan(
+        "SOXL",
+        _book(
+            [
+                ("sell", 240, 2),
+                ("sell", 260, 2),
+                ("buy", 220, 1),
+                ("buy", 200, 1),
+            ]
+        ),
+    )["ok"]
+    assert ladders.plan(
+        "NAIL",
+        _book(
+            [
+                ("sell", 9.4, 10),
+                ("sell", 10.3, 10),
+                ("buy", 8.6, 40),
+                ("buy", 7.9, 40),
             ]
         ),
     )["ok"]
 
-    flags = seed_state._parse_flags("KORU.double_used=6.5,7.2")
-    assert flags[1]["KORU"] == [-1, 0]
+    flags = seed_state._parse_flags("KORU.double_used=6.0,7.2")
+    assert flags[1]["KORU"] == [_level("KORU", 6.0), _level("KORU", 7.2)]
+    assert seed_state._parse_flags("KORU.double_used=6.5,7.2") is None
+    assert seed_state._parse_flags("KORU.double_used=5.9") is None
     assert seed_state._parse_flags("KORU.double_used=6.4") is None
-    assert seed_state._parse_force("KORU:7.9:6.5")["KORU"] == (
+    assert seed_state._parse_force("KORU:7.9:6.5") is None
+    assert seed_state._parse_force("KORU:7.9:6.0")["KORU"] == (
         _level("KORU", 7.9),
-        _level("KORU", 6.5),
+        _level("KORU", 6.0),
     )
-    assert seed_state._parse_force("NAIL:11.3:9.4") is None
+    assert seed_state._parse_force("NAIL:11.3:9.4")["NAIL"] == (
+        _level("NAIL", 11.3),
+        _level("NAIL", 9.4),
+    )
+    assert seed_state._parse_force("SOXL:72:5.0")["SOXL"] == (
+        _level("SOXL", 72),
+        _level("SOXL", 5.0),
+    )
 
     os.environ["LIVE_TRADING"] = "on"
     os.environ["LIVE_TICKERS"] = "KORU"
@@ -1155,8 +1222,9 @@ def test_koru_extends_below_7_2():
             "reset_done": {"09": "", "17": ""},
         }
     )
-    assert state["tickers"]["KORU"]["sell"] == 2
-    assert state["tickers"]["KORU"]["buy"] == 0
+    assert state["ladder_id"] == "shared"
+    assert state["tickers"]["KORU"]["sell"] == _level("KORU", 8.6)
+    assert state["tickers"]["KORU"]["buy"] == _level("KORU", 7.2)
     morning = datetime(2026, 10, 29, 9, 10, tzinfo=bot.KST)
     code, out, world = _run(state, [], {}, when=morning)
     assert code == 0, out
@@ -1165,11 +1233,85 @@ def test_koru_extends_below_7_2():
         ("KORU", "sell", 8.6, 1),
         ("KORU", "sell", 9.4, 1),
         ("KORU", "buy", 7.2, 2),
-        ("KORU", "buy", 6.5, 2),
+        ("KORU", "buy", 6.6, 2),
     ]
     assert world["cancelled"] == []
     assert "NEEDS_REVIEW KORU" not in out
-    assert world["saved"]["tickers"]["KORU"]["buy"] == 0
+    assert world["saved"]["tickers"]["KORU"]["buy"] == _level("KORU", 7.2)
+    assert world["saved"]["ladder_id"] == "shared"
+
+
+def test_legacy_koru_state_does_not_trade_5_9():
+    """Old KORU index -2 was 5.9. Loading drops that pair instead of repricing it."""
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "NAIL,KORU,SOXL"
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "state.json")
+        bot._STATE_PATH = path
+        bot._save_json(
+            path,
+            {
+                "version": 2,
+                "tickers": {
+                    "NAIL": {"sell": 17, "buy": 15, "double_used": []},
+                    "KORU": {"sell": 0, "buy": -2, "double_used": [-1]},
+                    "SOXL": {"sell": 18, "buy": 16, "double_used": []},
+                },
+                "handled": [],
+                "exception_filled": True,
+                "exception_id": bot._EXCEPTION_ID,
+                "reset_done": {"09": "", "17": ""},
+            },
+        )
+        loaded = bot._load_state()
+        assert loaded["ladder_id"] == "shared"
+        assert "KORU" not in loaded["tickers"]
+        assert loaded["tickers"]["NAIL"] == {"sell": 17, "buy": 15, "double_used": []}
+        assert loaded["tickers"]["SOXL"] == {"sell": 18, "buy": 16, "double_used": []}
+        assert ladders._price_at("NAIL", 17) == 42
+        assert ladders._price_at("NAIL", 15) == 36
+        assert ladders._price_at("SOXL", 18) == 46
+        assert ladders._price_at("SOXL", 16) == 39
+        assert bot._legacy_koru_index(0) == _level("KORU", 7.2)
+        assert bot._legacy_koru_index(-2) is None
+        assert bot._legacy_koru_index(-15) is None
+        assert "KORU" not in bot._load_state()["tickers"]
+
+        mapped = bot._migrate_loaded(
+            {
+                "version": 2,
+                "tickers": {"KORU": {"sell": 2, "buy": 0, "double_used": [3, -1]}},
+                "handled": [],
+            }
+        )
+        assert mapped["tickers"]["KORU"]["sell"] == _level("KORU", 8.6)
+        assert mapped["tickers"]["KORU"]["buy"] == _level("KORU", 7.2)
+        assert mapped["tickers"]["KORU"]["double_used"] == [_level("KORU", 9.4)]
+
+        kept = bot._migrate_loaded(
+            {
+                "version": 2,
+                "ladder_id": "shared",
+                "tickers": {
+                    "KORU": {
+                        "sell": _level("KORU", 7.2),
+                        "buy": _level("KORU", 6.0),
+                        "double_used": [],
+                    }
+                },
+                "handled": [],
+            }
+        )
+        assert kept["tickers"]["KORU"]["sell"] == _level("KORU", 7.2)
+        assert kept["tickers"]["KORU"]["buy"] == _level("KORU", 6.0)
+
+        morning = datetime(2026, 10, 29, 9, 10, tzinfo=bot.KST)
+        code, out, world = _run(bot._clean_state(loaded), [], {}, when=morning)
+        assert code == 0, out
+        assert "NEEDS_REVIEW KORU" in out
+        assert "DEFERRED SOXL" in out
+        assert world["placed"] == _tagged("NAIL", 42, 36)
+        assert all(row[0] != "KORU" for row in world["placed"])
 
 
 def _legacy_soxl():
@@ -1195,32 +1337,49 @@ def _fill_at(price, qty, key, cancelled=0):
     }
 
 
-def test_soxl_exception_200_at_38():
-    """One-time SOXL buy 200@38. The retired 100@75 fill does not count."""
-    assert bot._EXCEPTION_PRICE == 38
+def test_soxl_exception_200_at_37_5():
+    """One-time SOXL buy 200@37.5. Fills at 75 and at 38 do not count."""
+    assert bot._EXCEPTION_PRICE == 37.5
     assert bot._EXCEPTION_QTY == 200
+    assert bot._EXCEPTION_ID == "soxl-buy-200-37-5"
     assert bot._HARD_MAX["SOXL"] == 4
+    assert ladders._level_of("SOXL", 37.5) is None
     assert bot._exception_open(
-        [{"ticker": "SOXL", "side": "buy", "price": 38, "qty": 200}]
+        [{"ticker": "SOXL", "side": "buy", "price": 37.5, "qty": 200}]
     )
     assert bot._exception_open(
-        [{"ticker": "SOXL", "side": "buy", "price": 38.05, "qty": 1}]
+        [{"ticker": "SOXL", "side": "buy", "price": 37.55, "qty": 1}]
     )
     assert not bot._exception_open(
         [{"ticker": "SOXL", "side": "buy", "price": 75, "qty": 100}]
     )
     assert not bot._exception_open(
+        [{"ticker": "SOXL", "side": "buy", "price": 38, "qty": 200}]
+    )
+    assert not bot._exception_open(
         [{"ticker": "SOXL", "side": "buy", "price": 39, "qty": 200}]
     )
     assert not bot._exception_open(
-        [{"ticker": "SOXL", "side": "sell", "price": 38, "qty": 200}]
+        [{"ticker": "SOXL", "side": "sell", "price": 37.5, "qty": 200}]
     )
     assert not bot._exception_open(
-        [{"ticker": "NAIL", "side": "buy", "price": 38, "qty": 200}]
+        [{"ticker": "NAIL", "side": "buy", "price": 37.5, "qty": 200}]
     )
     legacy = bot._clean_state(_legacy_soxl())
     assert legacy["exception_filled"] is False
     assert legacy["exception_id"] == ""
+    retired_38 = bot._clean_state(
+        {
+            "version": 2,
+            "tickers": {},
+            "handled": [],
+            "exception_filled": True,
+            "exception_id": "soxl-buy-200-38",
+            "reset_done": {"09": "", "17": ""},
+        }
+    )
+    assert retired_38["exception_filled"] is False
+    assert retired_38["exception_id"] == ""
     done = bot._clean_state(
         {
             "version": 2,
@@ -1234,9 +1393,11 @@ def test_soxl_exception_200_at_38():
     assert done["exception_filled"] is True
     assert done["exception_id"] == bot._EXCEPTION_ID
     assert not bot._exception_filled([_fill_at(75, 100, "ab" * 32)], set())
-    assert bot._exception_filled([_fill_at(38, 200, "cd" * 32)], set())
+    assert not bot._exception_filled([_fill_at(38, 200, "12" * 32)], set())
+    assert bot._exception_filled([_fill_at(37.5, 200, "cd" * 32)], set())
+    assert bot._exception_filled([_fill_at(37.55, 200, "34" * 32)], set())
     assert not bot._exception_filled(
-        [_fill_at(38, 200, "ef" * 32, cancelled=200)], set()
+        [_fill_at(37.5, 200, "ef" * 32, cancelled=200)], set()
     )
 
     os.environ["LIVE_TRADING"] = "on"
@@ -1248,7 +1409,7 @@ def test_soxl_exception_200_at_38():
         {"ticker": "SOXL", "side": side, "price": price, "qty": qty}
         for side, price, qty in _orders("SOXL", 113, 94)
     ]
-    resting = {"ticker": "SOXL", "side": "buy", "price": 38, "qty": 200, "orr_no": 38}
+    resting = {"ticker": "SOXL", "side": "buy", "price": 37.5, "qty": 200, "orr_no": 375}
     early = datetime(2026, 11, 5, 9, 59, tzinfo=bot.KST)
     morning = datetime(2026, 11, 5, 10, 0, tzinfo=bot.KST)
     before_evening = datetime(2026, 11, 5, 17, 10, tzinfo=bot.KST)
@@ -1297,14 +1458,14 @@ def test_soxl_exception_200_at_38():
     assert code == 0, out
     assert "order type 63" in out
     assert placed["placed"] == ladder
-    assert placed["exceptions"] == [(200, 38)]
+    assert placed["exceptions"] == [(200, 37.5)]
     assert placed["cancelled"] == []
     assert "exception placed 1" in out
     assert placed["saved"]["exception_filled"] is False
     assert placed["saved"]["exception_id"] == ""
     assert placed["saved"]["reset_done"]["09"] == "20261105"
     for _ticker, _side, price, qty in placed["placed"]:
-        assert price != 38 and price != 75
+        assert price != 37.5 and price != 38 and price != 75
         if _side == "sell":
             assert qty == 2
 
@@ -1313,7 +1474,7 @@ def test_soxl_exception_200_at_38():
     )
     assert code == 0, out
     assert "order type 61" in out
-    assert world["exceptions"] == [(200, 38)]
+    assert world["exceptions"] == [(200, 37.5)]
     assert "exception placed 1" in out
     assert world["saved"]["exception_filled"] is False
 
@@ -1322,7 +1483,7 @@ def test_soxl_exception_200_at_38():
     )
     assert code == 0, out
     assert "order type 61" in out
-    assert world["exceptions"] == [(200, 38)]
+    assert world["exceptions"] == [(200, 37.5)]
     assert world["placed"] == ladder
 
     code, out, held = _run(
@@ -1331,7 +1492,7 @@ def test_soxl_exception_200_at_38():
     assert code == 0, out
     assert held["exceptions"] == []
     assert "exception placed" not in out
-    assert all(item[1] != 38 for item in held["cancelled"])
+    assert all(item[1] != 37.5 for item in held["cancelled"])
     assert held["placed"] == ladder
     assert held["saved"]["exception_filled"] is False
 
@@ -1341,7 +1502,7 @@ def test_soxl_exception_200_at_38():
     assert code == 0, out
     assert held["exceptions"] == []
     assert "exception placed" not in out
-    assert 38 not in [item[1] for item in held["cancelled"]]
+    assert 37.5 not in [item[1] for item in held["cancelled"]]
     assert len(held["cancelled"]) == 4
 
     code, out, world = _run(
@@ -1357,15 +1518,43 @@ def test_soxl_exception_200_at_38():
         _legacy_soxl(), [old], {"exception_open": False}, when=evening
     )
     assert code == 0, out
-    assert world["exceptions"] == [(200, 38)]
+    assert world["exceptions"] == [(200, 37.5)]
     assert all(item[1] != 75 for item in world["cancelled"])
+
+    retired = {"ticker": "SOXL", "side": "buy", "price": 38, "qty": 200, "orr_no": 38}
+    code, out, world = _run(
+        _legacy_soxl(), [retired], {"exception_open": False}, when=morning
+    )
+    assert code == 0, out
+    assert world["exceptions"] == [(200, 37.5)]
+    assert "exception placed 1" in out
+    assert all(item[1] != 38 and item[1] != 37.5 for item in world["cancelled"])
+
+    code, out, world = _run(
+        {
+            "version": 2,
+            "tickers": {"SOXL": _pair("SOXL", 113, 94)},
+            "handled": [],
+            "exception_filled": True,
+            "exception_id": "soxl-buy-200-38",
+            "reset_done": {"09": "", "17": ""},
+        },
+        [],
+        {"exception_open": False},
+        when=morning,
+        fills=[_fill_at(38, 200, "12" * 32)],
+    )
+    assert code == 0, out
+    assert world["exceptions"] == [(200, 37.5)]
+    assert world["saved"]["exception_filled"] is False
+    assert world["saved"]["exception_id"] == ""
 
     code, out, filled = _run(
         _legacy_soxl(),
         [],
         {},
         when=morning,
-        fills=[_fill_at(38, 200, "cd" * 32)],
+        fills=[_fill_at(37.5, 200, "cd" * 32)],
     )
     assert code == 0, out
     assert filled["exceptions"] == []
@@ -1403,7 +1592,7 @@ def test_soxl_exception_200_at_38():
         book,
         {},
         when=morning,
-        fills=[_fill_at(38, 200, "cd" * 32)],
+        fills=[_fill_at(37.5, 200, "cd" * 32)],
         mode="intraday",
     )
     assert code == 0, out
@@ -1418,10 +1607,10 @@ def test_soxl_exception_200_at_38():
         [],
         {"exception_open": False},
         when=evening,
-        fills=[_fill_at(38, 200, "ef" * 32, cancelled=200)],
+        fills=[_fill_at(37.5, 200, "ef" * 32, cancelled=200)],
     )
     assert code == 0, out
-    assert world["exceptions"] == [(200, 38)]
+    assert world["exceptions"] == [(200, 37.5)]
     assert world["saved"]["exception_filled"] is False
     assert world["saved"]["exception_id"] == ""
 
@@ -1452,7 +1641,7 @@ def test_soxl_exception_200_at_38():
     body = captured["body"]
     assert body["iem_cd"] == "SOXL"
     assert body["orr_qty"] == 200
-    assert body["fc_orr_uit_pr"] == 38
+    assert body["fc_orr_uit_pr"] == 37.5
     assert body["wtm_cur_knd_cd"] == "1"
     assert body["ahi_nmn_pr_tp_cd"] == "00"
     assert body["fc_sec_trd_nat_cd"] == "200"
@@ -1509,8 +1698,9 @@ def main():
         test_seed_flags()
         test_reset_low_rung_sizes()
         test_soxl_sell_qty_and_buy_rules()
-        test_koru_extends_below_7_2()
-        test_soxl_exception_200_at_38()
+        test_shared_ladder()
+        test_legacy_koru_state_does_not_trade_5_9()
+        test_soxl_exception_200_at_37_5()
         test_workflows()
     finally:
         bot._now_kst = _ORIG_NOW
