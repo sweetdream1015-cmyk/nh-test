@@ -24,7 +24,7 @@ def _et_of(moment):
 
 
 def _idx(ticker, price):
-    return ladders._level(ladders._CFG[ticker]["ladder"], price)
+    return ladders._level_of(ticker, price)
 
 
 def _capture(fn):
@@ -888,6 +888,80 @@ def test_day_session_quantities():
     assert soxl_used_low["placed"] == [("SOXL", "sell", 79, 2), ("SOXL", "buy", 66, 1)]
 
 
+def test_koru_buy_fill_steps_below_7_2():
+    """Filling 7.2 moves the core buy to 6.5, still a first buy of 2."""
+    _restore_guards()
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "KORU"
+    moment = _kst(2026, 10, 29, 12, 0)
+
+    def _book(sell_px, buy_px, opens, fill_px):
+        state = bot._fresh_state()
+        state["exception_filled"] = True
+        state["tickers"]["KORU"] = {
+            "sell": _idx("KORU", sell_px),
+            "buy": _idx("KORU", buy_px),
+            "double_used": [],
+        }
+        key = "e5" * 32
+        code, out, world = _run_tracking(
+            moment,
+            bot._clean_state(state),
+            opens,
+            [_fill("KORU", "buy", fill_px, key, 2)],
+        )
+        assert code == 0, out
+        assert world["cancelled"] == []
+        assert world["exceptions"] == []
+        assert "NEEDS_REVIEW KORU" not in out
+        assert "ERROR" not in out
+        assert key in world["saved"]["handled"]
+        return world
+
+    # The 7.9 core buy fills while 7.2 is already open, so intraday places 2@6.5.
+    placed = _book(
+        8.6,
+        7.9,
+        [
+            {"ticker": "KORU", "side": "sell", "price": 8.6, "qty": 1},
+            {"ticker": "KORU", "side": "sell", "price": 9.4, "qty": 1},
+            {"ticker": "KORU", "side": "buy", "price": 7.2, "qty": 2},
+        ],
+        7.9,
+    )
+    assert placed["placed"] == [("KORU", "sell", 7.9, 1), ("KORU", "buy", 6.5, 2)]
+    assert placed["saved"]["tickers"]["KORU"]["sell"] == _idx("KORU", 7.9)
+    assert placed["saved"]["tickers"]["KORU"]["buy"] == _idx("KORU", 7.2)
+
+    # Filling the 7.2 core buy steps that core down onto 6.5 at qty 2.
+    stepped = _book(
+        8.6,
+        7.2,
+        [
+            {"ticker": "KORU", "side": "sell", "price": 8.6, "qty": 1},
+            {"ticker": "KORU", "side": "sell", "price": 9.4, "qty": 1},
+            {"ticker": "KORU", "side": "buy", "price": 6.5, "qty": 2},
+        ],
+        7.2,
+    )
+    assert stepped["placed"] == [("KORU", "sell", 7.9, 1), ("KORU", "buy", 5.9, 2)]
+    saved = stepped["saved"]["tickers"]["KORU"]
+    assert saved["sell"] == _idx("KORU", 7.9)
+    assert saved["buy"] == _idx("KORU", 6.5)
+    assert saved["buy"] == -1
+    assert _idx("KORU", 7.2) in saved["double_used"]
+    assert _idx("KORU", 6.5) not in saved["double_used"]
+    desired = bot._desired(
+        "KORU", saved["sell"], saved["buy"], 1.0, saved["double_used"]
+    )
+    assert [(item["side"], item["price"], item["qty"]) for item in desired] == [
+        ("sell", 7.9, 1),
+        ("sell", 8.6, 1),
+        ("buy", 6.5, 2),
+        ("buy", 5.9, 2),
+    ]
+
+
 def test_day_session_partial_does_not_advance():
     _restore_guards()
     os.environ["LIVE_TRADING"] = "on"
@@ -1321,6 +1395,7 @@ def main():
         test_day_session_window()
         test_day_session_fill_followup()
         test_day_session_quantities()
+        test_koru_buy_fill_steps_below_7_2()
         test_day_session_partial_does_not_advance()
         test_day_session_crons()
         test_weekend_guard_follows_us_session()

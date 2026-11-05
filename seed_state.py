@@ -9,6 +9,8 @@ SEED_FORCE=KORU:13.5:11.3,SOXL:113:94 overwrites only those tickers.
 Other tickers and handled fills stay as they are. double_used on a forced
 ticker is kept unless SEED_FLAGS replaces it.
 KORU's ladder has extra rungs below 9.4, so its indexes are not the NAIL/SOXL indexes.
+Rungs below 7.2 are generated about 10% apart and stored as negative indexes,
+so 7.2 stays index 0.
 
 SEED_FLAGS sets marks only. It never places or cancels.
 Clauses are separated by ';':
@@ -32,9 +34,8 @@ _SEED_PRICES = {
 
 
 def _pair_from_prices(ticker, sell_px, buy_px):
-    ladder = ladders._CFG[ticker]["ladder"]
-    sell_idx = ladders._level(ladder, sell_px)
-    buy_idx = ladders._level(ladder, buy_px)
+    sell_idx = ladders._level_of(ticker, sell_px)
+    buy_idx = ladders._level_of(ticker, buy_px)
     if not bot._valid_pair(ticker, sell_idx, buy_idx):
         return None
     return sell_idx, buy_idx
@@ -139,7 +140,7 @@ def _parse_flags(raw):
                 price = ladders._float(bit.strip())
                 if price is None:
                     return None
-                index = ladders._level(ladders._CFG[ticker]["ladder"], price)
+                index = ladders._level_of(ticker, price)
                 if index is None or index in indexes:
                     return None
                 indexes.append(index)
