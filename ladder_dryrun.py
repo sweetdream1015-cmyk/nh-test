@@ -148,14 +148,15 @@ _CFG = {
         "base": 10,
         "buy_qty": _buy_qty(10, 22, at_threshold=20, low_at=20, low_qty=40),
     },
-    "KORU": {"ladder": _LADDER, "base": 1, "buy_qty": _buy_qty(1, 9.4)},
-    # Sells are 2. base stays 1: buys above 72, and a level already in
-    # double_used, are 1. First buy at 72, and at 66 or below, is 4.
+    # First buy at 6 or below is 2. 6.6 and above stay 1, used or not.
+    "KORU": {"ladder": _LADDER, "base": 1, "buy_qty": _buy_qty(1, 6)},
+    # Buys and sells are 2. First buy at 39 or below is 4, then 2
+    # once that level is in double_used. 42 and above stay 2.
     "SOXL": {
         "ladder": _LADDER,
-        "base": 1,
+        "base": 2,
         "sell_qty": 2,
-        "buy_qty": _buy_qty(1, 72, at_threshold=4, low_at=66, low_qty=4),
+        "buy_qty": _buy_qty(2, 39),
     },
 }
 
