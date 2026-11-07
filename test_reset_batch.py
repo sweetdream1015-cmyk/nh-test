@@ -1048,6 +1048,7 @@ def test_shared_ladder():
         ("buy", 7.2, 2),
         ("buy", 6.6, 2),
     ]
+    # This saved pair buys 1 at 6.6. The pair above still buys 2 there.
     below = bot._desired(
         "KORU",
         _level("KORU", 7.9),
@@ -1058,7 +1059,7 @@ def test_shared_ladder():
     assert [(item["side"], item["price"], item["qty"]) for item in below] == [
         ("sell", 7.9, 1),
         ("sell", 8.6, 1),
-        ("buy", 6.6, 2),
+        ("buy", 6.6, 1),
         ("buy", 6.0, 2),
     ]
     used_low = bot._desired(
@@ -1149,7 +1150,7 @@ def test_shared_ladder():
     )
     assert odd["ignored"] == 1
     assert odd["would_place"] == 1
-    assert ladders.plan(
+    assert not ladders.plan(
         "KORU",
         _book(
             [
@@ -1160,7 +1161,7 @@ def test_shared_ladder():
             ]
         ),
     )["ok"]
-    assert not ladders.plan(
+    assert ladders.plan(
         "KORU",
         _book(
             [
@@ -1658,6 +1659,145 @@ def test_soxl_exception_200_at_37_5():
     }
 
 
+def test_saved_anchor_buy_sizes():
+    """SOXL 50/42 and KORU 7.9/6.6 keep the confirmed buy sizes.
+
+    Other pairs, sells, and NAIL stay on the existing formula. The
+    override does not edit double_used.
+    """
+    soxl_used = [_level("SOXL", price) for price in (72, 66, 60, 55, 50, 46, 42, 39)]
+    koru_used = [_level("KORU", price) for price in (9.4, 8.6, 7.9, 7.2)]
+
+    def _rows(ticker, sell, buy, used):
+        got = bot._desired(
+            ticker, _level(ticker, sell), _level(ticker, buy), 1.0, used
+        )
+        return [(item["side"], item["price"], item["qty"]) for item in got]
+
+    assert _rows("SOXL", 50, 42, soxl_used) == [
+        ("sell", 50, 2),
+        ("sell", 55, 2),
+        ("buy", 42, 2),
+        ("buy", 39, 4),
+    ]
+    assert _rows("SOXL", 50, 42, []) == _rows("SOXL", 50, 42, soxl_used)
+    assert _rows("SOXL", 46, 42, []) == [
+        ("sell", 46, 2),
+        ("sell", 50, 2),
+        ("buy", 42, 4),
+        ("buy", 39, 4),
+    ]
+    assert _rows("SOXL", 55, 46, soxl_used) == [
+        ("sell", 55, 2),
+        ("sell", 60, 2),
+        ("buy", 46, 1),
+        ("buy", 42, 1),
+    ]
+    stepped = bot._step_buy(
+        "SOXL",
+        {
+            "sell": _level("SOXL", 50),
+            "buy": _level("SOXL", 42),
+            "double_used": list(soxl_used),
+        },
+    )
+    assert [ladders._price_at("SOXL", stepped["sell"]), ladders._price_at("SOXL", stepped["buy"])] == [46, 39]
+    assert _rows("SOXL", 46, 39, stepped["double_used"]) == [
+        ("sell", 46, 2),
+        ("sell", 50, 2),
+        ("buy", 39, 1),
+        ("buy", 36, 4),
+    ]
+    assert _rows("KORU", 7.9, 6.6, koru_used) == [
+        ("sell", 7.9, 1),
+        ("sell", 8.6, 1),
+        ("buy", 6.6, 1),
+        ("buy", 6.0, 2),
+    ]
+    assert _rows("KORU", 8.6, 7.2, koru_used) == [
+        ("sell", 8.6, 1),
+        ("sell", 9.4, 1),
+        ("buy", 7.2, 1),
+        ("buy", 6.6, 2),
+    ]
+    assert _rows("NAIL", 39, 33, []) == [
+        ("sell", 39, 10),
+        ("sell", 42, 10),
+        ("buy", 33, 10),
+        ("buy", 30, 10),
+    ]
+    assert _rows("NAIL", 26, 22, []) == [
+        ("sell", 26, 10),
+        ("sell", 28, 10),
+        ("buy", 22, 20),
+        ("buy", 20, 40),
+    ]
+    assert bot._EXCEPTION_QTY == 200 and bot._EXCEPTION_PRICE == 37.5
+    assert all(rung != 37.5 for _name, _sell, _buy, rung, _qty in ladders._ANCHOR_BUY)
+
+    os.environ["LIVE_TRADING"] = "on"
+    saved_rows = {}
+    for ticker, sell, buy, used in (
+        ("SOXL", 50, 42, soxl_used),
+        ("KORU", 7.9, 6.6, koru_used),
+        ("NAIL", 39, 33, []),
+    ):
+        os.environ["LIVE_TICKERS"] = ticker
+        state = bot._clean_state(
+            {
+                "version": 2,
+                "tickers": {ticker: _pair(ticker, sell, buy, used)},
+                "handled": [],
+                "exception_filled": True,
+                "exception_id": bot._EXCEPTION_ID,
+                "reset_done": {"09": "", "17": ""},
+            }
+        )
+        before = list(state["tickers"][ticker]["double_used"])
+        code, out, world = _run(state, [], {})
+        assert code == 0, out
+        saved_rows[ticker] = _rows(ticker, sell, buy, used)
+        assert world["placed"] == [
+            (ticker, side, price, qty) for side, price, qty in saved_rows[ticker]
+        ]
+        assert world["cancelled"] == []
+        assert world["exceptions"] == []
+        kept = world["saved"]["tickers"][ticker]
+        assert kept["sell"] == _level(ticker, sell)
+        assert kept["buy"] == _level(ticker, buy)
+        assert kept["double_used"] == before
+
+    os.environ["LIVE_TICKERS"] = "NAIL,KORU,SOXL"
+    combined = bot._fresh_state()
+    combined["exception_filled"] = True
+    combined["exception_id"] = bot._EXCEPTION_ID
+    opens = []
+    for ticker, sell, buy, used in (
+        ("NAIL", 39, 33, []),
+        ("KORU", 7.9, 6.6, koru_used),
+        ("SOXL", 50, 42, soxl_used),
+    ):
+        combined["tickers"][ticker] = _pair(ticker, sell, buy, used)
+        for side, price, qty in saved_rows[ticker]:
+            opens.append(
+                {"ticker": ticker, "side": side, "price": price, "qty": qty, "orr_no": 1}
+            )
+    code, out, world = _run(bot._clean_state(combined), opens, {}, mode="intraday")
+    assert code == 0, out
+    assert world["placed"] == []
+    assert world["cancelled"] == []
+    assert "NEEDS_REVIEW" not in out
+    for ticker, sell, buy, used in (
+        ("NAIL", 39, 33, []),
+        ("KORU", 7.9, 6.6, koru_used),
+        ("SOXL", 50, 42, soxl_used),
+    ):
+        kept = world["saved"]["tickers"][ticker]
+        assert kept["sell"] == _level(ticker, sell)
+        assert kept["buy"] == _level(ticker, buy)
+        assert kept["double_used"] == list(used)
+
+
 def test_unexpected_stop_names_reason_not_book():
     """A reset stop names the ticker and reason, and does not print the book."""
     os.environ["LIVE_TRADING"] = "on"
@@ -1823,6 +1963,7 @@ def main():
         test_shared_ladder()
         test_legacy_koru_state_does_not_trade_5_9()
         test_soxl_exception_200_at_37_5()
+        test_saved_anchor_buy_sizes()
         test_unexpected_stop_names_reason_not_book()
         test_workflows()
     finally:

@@ -159,6 +159,37 @@ _CFG = {
     },
 }
 
+# Buy sizes for two saved anchor pairs only. Not a new rung rule.
+# While the pair is SOXL sell 50 / buy 42, that buy is 2 and the buy
+# under it (39) is 4. While the pair is KORU sell 7.9 / buy 6.6, that
+# buy is 1 and the buy under it stays on buy_qty. Sells are untouched.
+# Any other pair returns None. Coming back to the same pair uses these
+# sizes again; a one-shot flag would let the next reset restore the
+# old counts while the anchors have not moved.
+_ANCHOR_BUY = (
+    ("SOXL", 50, 42, 42, 2),
+    ("SOXL", 50, 42, 39, 4),
+    ("KORU", 7.9, 6.6, 6.6, 1),
+)
+
+
+def _near(left, right):
+    if isinstance(left, bool) or isinstance(right, bool):
+        return False
+    if not isinstance(left, (int, float)) or not isinstance(right, (int, float)):
+        return False
+    return abs(float(left) - float(right)) < _MATCH
+
+
+def _anchor_buy_qty(ticker, sell_price, buy_price, order_price):
+    """Qty for one buy rung of a saved anchor pair, or None to keep the formula."""
+    for name, sell, buy, rung, qty in _ANCHOR_BUY:
+        if name != ticker:
+            continue
+        if _near(sell_price, sell) and _near(buy_price, buy) and _near(order_price, rung):
+            return qty
+    return None
+
 
 def _text(value):
     if isinstance(value, str):
@@ -297,20 +328,27 @@ def plan(ticker, orders):
     sell_price = _price_at(ticker, sell_idx)
     if buy_price is None or sell_price is None:
         return result
-    desired = [("sell", sell_idx, sell_qty), ("buy", buy_idx, buy_qty(buy_price))]
+
+    def _buy_size(price):
+        special = _anchor_buy_qty(ticker, sell_price, buy_price, price)
+        if special is not None:
+            return special
+        return buy_qty(price)
+
+    desired = [("sell", sell_idx, sell_qty), ("buy", buy_idx, _buy_size(buy_price))]
     up_price = _price_at(ticker, sell_idx + 1)
     if up_price is not None:
         desired.append(("sell", sell_idx + 1, sell_qty))
     down_price = _price_at(ticker, buy_idx - 1)
     if down_price is not None:
-        desired.append(("buy", buy_idx - 1, buy_qty(down_price)))
+        desired.append(("buy", buy_idx - 1, _buy_size(down_price)))
 
     actual = [("buy", index, qty) for index, qty in buys]
     actual.extend(("sell", index, qty) for index, qty in sells)
     third = buy_idx - 2
     third_price = _price_at(ticker, third)
     if third_price is not None:
-        exempt = ("buy", third, buy_qty(third_price))
+        exempt = ("buy", third, _buy_size(third_price))
         if exempt in actual:
             actual.remove(exempt)
 

@@ -891,7 +891,10 @@ def test_day_session_quantities():
 
 
 def test_koru_buy_fill_steps_below_7_2():
-    """Filling 7.2 moves the core buy to 6.6, still a first buy of 2."""
+    """Filling 7.9 still places the first buy of 2 at 6.6.
+
+    Filling 7.2 lands on the saved 7.9/6.6 pair, whose buy at 6.6 is 1.
+    """
     _restore_guards()
     os.environ["LIVE_TRADING"] = "on"
     os.environ["LIVE_TICKERS"] = "KORU"
@@ -935,7 +938,8 @@ def test_koru_buy_fill_steps_below_7_2():
     assert placed["saved"]["tickers"]["KORU"]["sell"] == _idx("KORU", 7.9)
     assert placed["saved"]["tickers"]["KORU"]["buy"] == _idx("KORU", 7.2)
 
-    # Filling the 7.2 core buy steps that core down onto 6.6 at qty 2.
+    # Filling the 7.2 core buy steps onto 6.6. The open 6.6 stays put.
+    # The saved pair is then 7.9/6.6, whose next plan buys 1 there.
     stepped = _book(
         8.6,
         7.2,
@@ -959,7 +963,7 @@ def test_koru_buy_fill_steps_below_7_2():
     assert [(item["side"], item["price"], item["qty"]) for item in desired] == [
         ("sell", 7.9, 1),
         ("sell", 8.6, 1),
-        ("buy", 6.6, 2),
+        ("buy", 6.6, 1),
         ("buy", 6.0, 2),
     ]
 
