@@ -106,13 +106,15 @@ def _run(
     when=None,
     fills=None,
     mode="reset",
+    actions=None,
 ):
     moment = when or _FIXED
     bot._now_kst = lambda: moment
     world["placed"] = []
     world["cancelled"] = []
     world["exceptions"] = []
-    actions = _actions(world)
+    if actions is None:
+        actions = _actions(world)
     code, out = _capture(
         lambda: bot.run(
             mode,
@@ -1656,6 +1658,126 @@ def test_soxl_exception_200_at_37_5():
     }
 
 
+def test_unexpected_stop_names_reason_not_book():
+    """A reset stop names the ticker and reason, and does not print the book."""
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "NAIL,KORU,SOXL"
+    marker = bot._done_marker("17", "NAIL", _TODAY)
+    state = {
+        "version": 2,
+        "ladder_id": "shared",
+        "tickers": {
+            "NAIL": _pair("NAIL", 39, 33),
+            "KORU": _pair("KORU", 7.9, 6.6),
+            "SOXL": _pair("SOXL", 50, 42, (_level("SOXL", 42),)),
+        },
+        "handled": [marker],
+        "exception_filled": True,
+        "exception_id": bot._EXCEPTION_ID,
+        "reset_done": {"09": "", "17": ""},
+        "reset_tickers": {"09": {}, "17": {}},
+    }
+    resting = {
+        "ticker": "KORU",
+        "side": "buy",
+        "price": 6.6,
+        "qty": 2,
+        "orr_no": "991122",
+    }
+
+    def _stop(confirm, cancel_result=True, exists_result=False, place_result=True):
+        world = {}
+        actions = _actions(world)
+
+        def cancel(ticker, order):
+            world["cancelled"].append((ticker, order.get("price"), order.get("orr_no")))
+            return cancel_result
+
+        def place(ticker, item, counter):
+            if place_result is None:
+                return None
+            return _actions(world)["place"](ticker, item, counter)
+
+        actions["cancel"] = cancel
+        actions["confirm_clear"] = lambda _ticker: confirm
+        actions["exists"] = lambda *_args: exists_result
+        actions["place"] = place
+        code, out, world = _run(state, [resting], world, actions=actions)
+        assert "6.6" not in out
+        assert "991122" not in out
+        assert "SOXL open" not in out
+        assert "KORU open" not in out
+        assert "NAIL skip done" in out
+        saved = world["saved"]["reset_tickers"]["17"]
+        assert saved.get("KORU") != _TODAY
+        assert saved.get("SOXL") != _TODAY
+        assert world["placed"] == []
+        assert world["exceptions"] == []
+        return code, out, world
+
+    code, out, world = _stop(False)
+    assert code == 1
+    assert "ERROR unexpected remain KORU" in out
+    assert out.count("ERROR unexpected") == 1
+    assert world["cancelled"] == [("KORU", 6.6, "991122")]
+
+    code, out, _world = _stop(None)
+    assert code == 1
+    assert "ERROR unexpected inquiry KORU" in out
+    assert "ERROR unexpected remain" not in out
+
+    code, out, world = _stop(True, cancel_result=None)
+    assert code == 1
+    assert "ERROR unexpected cancel KORU" in out
+    assert world["cancelled"] == [("KORU", 6.6, "991122")]
+
+    empty = {
+        "version": 2,
+        "ladder_id": "shared",
+        "tickers": {"KORU": _pair("KORU", 7.9, 6.6)},
+        "handled": [],
+        "exception_filled": True,
+        "exception_id": bot._EXCEPTION_ID,
+        "reset_done": {"09": "", "17": ""},
+        "reset_tickers": {"09": {}, "17": {}},
+    }
+    os.environ["LIVE_TICKERS"] = "KORU"
+    world = {}
+    actions = _actions(world)
+    actions["exists"] = lambda *_args: None
+    code, out, world = _run(empty, [], world, actions=actions)
+    assert code == 1, out
+    assert "ERROR unexpected exists KORU" in out
+    assert world["placed"] == []
+    assert "6.6" not in out
+
+    world = {}
+    actions = _actions(world)
+    actions["exists"] = lambda *_args: False
+    actions["place"] = lambda *_args: None
+    code, out, world = _run(empty, [], world, actions=actions)
+    assert code == 1, out
+    assert "ERROR unexpected place KORU" in out
+    assert world["placed"] == []
+    assert "6.6" not in out
+
+    class SecretError(Exception):
+        pass
+
+    leaked = SecretError("act_no 123456 token 6.6")
+    assert bot._unexpected_line("select") == "ERROR unexpected select"
+    assert bot._unexpected_line("nope", "NAIL") == "ERROR unexpected error NAIL"
+    line = bot._unexpected_type(leaked)
+    assert line == "ERROR unexpected SecretError"
+    assert "123456" not in line
+    assert "act_no" not in line
+    assert "token" not in line
+    assert "6.6" not in line
+    SecretError.__name__ = "has space"
+    assert bot._unexpected_type(leaked) == "ERROR unexpected"
+    assert "123456" not in bot._unexpected_type(leaked)
+
+
 def test_workflows():
     root = os.path.dirname(os.path.abspath(__file__))
     reset = open(
@@ -1701,6 +1823,7 @@ def main():
         test_shared_ladder()
         test_legacy_koru_state_does_not_trade_5_9()
         test_soxl_exception_200_at_37_5()
+        test_unexpected_stop_names_reason_not_book()
         test_workflows()
     finally:
         bot._now_kst = _ORIG_NOW
