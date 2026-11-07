@@ -12,10 +12,10 @@ once. The retired buys of 100 at 75 and 200 at 38 stay retired:
 exception_filled counts only when exception_id is soxl-buy-200-37-5, so a
 saved true from either of those fills does not block 200 at 37.5 and must
 not be reseeded true.
-Two saved pairs keep a buy size the usual formula does not produce.
-SOXL sell 50 / buy 42 buys 2 at 42 and 4 at 39. KORU sell 7.9 / buy 6.6
-buys 1 at 6.6. Other pairs, every sell, NAIL, and double_used stay on
-the existing rule. The sizes return if that same pair is current again.
+SOXL buys and sells 2. A first SOXL buy at 39 or below is 4, then 2
+once that level is in double_used. KORU buys and sells 1. A first KORU
+buy at 6 or below is 2, then 1. NAIL is unchanged. Saved double_used
+is kept as written.
 Inquiry plus, when live and allowed, limit buy, limit sell, and full cancel.
 The modify endpoint is never called. Prints counts, OK/ERROR codes, and
 on a broker reject the ticker, side, price, and redacted rsp_cd/rsp_msg.
@@ -362,24 +362,24 @@ def _anchors(ticker, orders):
 def _in_double_zone(ticker, price):
     """True where the first buy is above base, so double_used can revert it.
 
-    NAIL is 22 and at or below 20. KORU is at or below 9.4. SOXL is
-    exactly 72 or at or below 66.
+    NAIL is 22 and at or below 20. KORU is at or below 6. SOXL is at
+    or below 39.
     """
     if ticker == "NAIL":
         return price <= 22
     if ticker == "KORU":
-        return price <= 9.4
+        return price <= 6
     if ticker == "SOXL":
-        return price <= 66 or abs(price - 72) < 0.051
+        return price <= 39
     return False
 
 
 def _buy_computed(ticker, index, double_used):
     """First-buy size, or base once that level is already in double_used.
 
-    SOXL is 4 on the first buy at 72 and at 66 or below, otherwise 1.
-    A used SOXL level is 1. KORU at or below 9.4 is 2, then 1. NAIL is
-    20 at 22 and 40 at 20 or below, then 10 once that level is used.
+    SOXL is 2, or 4 on the first buy at 39 or below. A used SOXL level
+    there is 2. KORU is 1, or 2 on the first buy at 6 or below, then 1.
+    NAIL is 20 at 22 and 40 at 20 or below, then 10 once that level is used.
     """
     price = ladders._price_at(ticker, index)
     if price is None:
@@ -394,21 +394,11 @@ def _desired(ticker, sell_idx, buy_idx, mult, double_used=()):
     if not _valid_pair(ticker, sell_idx, buy_idx):
         return None
     sell_qty = ladders._sell_shares(_cfg(ticker))
-    sell_px = ladders._price_at(ticker, sell_idx)
-    buy_px = ladders._price_at(ticker, buy_idx)
-
-    def _buy_for(index):
-        price = ladders._price_at(ticker, index)
-        special = ladders._anchor_buy_qty(ticker, sell_px, buy_px, price)
-        if special is not None:
-            return special
-        return _buy_computed(ticker, index, double_used)
-
     specs = [
         ("sell", sell_idx, sell_qty),
         ("sell", sell_idx + 1, sell_qty),
-        ("buy", buy_idx, _buy_for(buy_idx)),
-        ("buy", buy_idx - 1, _buy_for(buy_idx - 1)),
+        ("buy", buy_idx, _buy_computed(ticker, buy_idx, double_used)),
+        ("buy", buy_idx - 1, _buy_computed(ticker, buy_idx - 1, double_used)),
     ]
     out = []
     for side, index, computed in specs:

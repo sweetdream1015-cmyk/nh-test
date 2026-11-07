@@ -159,8 +159,8 @@ def test_pairs_and_limits():
     assert _orders("SOXL", 113, 94) == [
         ("sell", 113, 2),
         ("sell", 125, 2),
-        ("buy", 94, 1),
-        ("buy", 86, 1),
+        ("buy", 94, 2),
+        ("buy", 86, 2),
     ]
     assert _orders("KORU", 12.5, 10.3)[0] == ("sell", 12.5, 1)
     assert bot._HARD_MAX == {"NAIL": 40, "KORU": 4, "SOXL": 4}
@@ -649,14 +649,17 @@ def test_reset_low_rung_sizes():
     assert ladders._price_at("KORU", 2) == 11.3
     assert ladders._level_of("KORU", 8.6) == ladders._level_of("NAIL", 8.6)
     assert ladders._level_of("NAIL", 8.5) is None
-    assert bot._buy_computed("SOXL", _level("SOXL", 72), []) == 4
-    assert bot._buy_computed("SOXL", _level("SOXL", 66), []) == 4
-    assert bot._buy_computed("SOXL", _level("SOXL", 60), []) == 4
-    assert bot._buy_computed("SOXL", _level("SOXL", 79), []) == 1
-    assert bot._buy_computed("SOXL", _level("SOXL", 66), [_level("SOXL", 66)]) == 1
-    assert bot._buy_computed("SOXL", _level("SOXL", 72), [_level("SOXL", 72)]) == 1
-    assert bot._buy_computed("KORU", _level("KORU", 8.6), []) == 2
-    assert bot._buy_computed("KORU", _level("KORU", 9.4), []) == 2
+    assert bot._buy_computed("SOXL", _level("SOXL", 72), []) == 2
+    assert bot._buy_computed("SOXL", _level("SOXL", 66), []) == 2
+    assert bot._buy_computed("SOXL", _level("SOXL", 42), []) == 2
+    assert bot._buy_computed("SOXL", _level("SOXL", 39), []) == 4
+    assert bot._buy_computed("SOXL", _level("SOXL", 39), [_level("SOXL", 39)]) == 2
+    assert bot._buy_computed("SOXL", _level("SOXL", 36), []) == 4
+    assert bot._buy_computed("SOXL", _level("SOXL", 36), [_level("SOXL", 36)]) == 2
+    assert bot._buy_computed("KORU", _level("KORU", 8.6), []) == 1
+    assert bot._buy_computed("KORU", _level("KORU", 6.6), []) == 1
+    assert bot._buy_computed("KORU", _level("KORU", 6.0), []) == 2
+    assert bot._buy_computed("KORU", _level("KORU", 6.0), [_level("KORU", 6.0)]) == 1
     assert bot._buy_computed("NAIL", _level("NAIL", 24), []) == 10
     assert bot._buy_computed("NAIL", _level("NAIL", 22), []) == 20
     assert bot._buy_computed("NAIL", _level("NAIL", 20), []) == 40
@@ -675,20 +678,20 @@ def test_reset_low_rung_sizes():
             [
                 ("sell", 79, 2),
                 ("sell", 86, 2),
-                ("buy", 66, 4),
-                ("buy", 60, 4),
+                ("buy", 66, 2),
+                ("buy", 60, 2),
             ],
         ),
         (
             "SOXL",
-            86,
-            72,
-            [_level("SOXL", 72), _level("SOXL", 66)],
+            46,
+            39,
+            [_level("SOXL", 39)],
             [
-                ("sell", 86, 2),
-                ("sell", 94, 2),
-                ("buy", 72, 1),
-                ("buy", 66, 1),
+                ("sell", 46, 2),
+                ("sell", 50, 2),
+                ("buy", 39, 2),
+                ("buy", 36, 4),
             ],
         ),
         (
@@ -699,8 +702,8 @@ def test_reset_low_rung_sizes():
             [
                 ("sell", 11.3, 1),
                 ("sell", 12.5, 1),
-                ("buy", 9.4, 2),
-                ("buy", 8.6, 2),
+                ("buy", 9.4, 1),
+                ("buy", 8.6, 1),
             ],
         ),
         (
@@ -772,10 +775,10 @@ def _book(orders):
 
 
 def test_soxl_sell_qty_and_buy_rules():
-    """SOXL sells are 2 everywhere. Buys stay on the existing rule."""
+    """SOXL sells are 2. Buys are 2, or 4 on an unused level at 39 or below."""
     cfg = ladders._CFG["SOXL"]
     ladder = cfg["ladder"]
-    assert cfg["base"] == 1
+    assert cfg["base"] == 2
     assert cfg["sell_qty"] == 2
     assert ladders._sell_shares(cfg) == 2
     assert ladders._sell_shares(ladders._CFG["NAIL"]) == 10
@@ -794,13 +797,13 @@ def test_soxl_sell_qty_and_buy_rules():
                 if item["side"] == "sell":
                     assert item["qty"] == 2, (label, item)
                     continue
-                boosted = abs(price - 72) < 0.051 or price <= 66
-                if boosted and item["idx"] in set(flags):
-                    assert item["qty"] == 1, (label, item)
-                elif boosted:
+                first = price <= 39
+                if first and item["idx"] in set(flags):
+                    assert item["qty"] == 2, (label, item)
+                elif first:
                     assert item["qty"] == 4, (label, item)
                 else:
-                    assert item["qty"] == 1, (label, item)
+                    assert item["qty"] == 2, (label, item)
 
     added = bot.intraday_adds(
         "SOXL",
@@ -813,7 +816,7 @@ def test_soxl_sell_qty_and_buy_rules():
         1.0,
     )
     assert [(item["side"], item["price"], item["qty"]) for item in added] == [
-        ("buy", 72, 4),
+        ("buy", 72, 2),
         ("sell", 86, 2),
     ]
     nail_added = bot.intraday_adds(
@@ -841,7 +844,7 @@ def test_soxl_sell_qty_and_buy_rules():
         1.0,
     )
     assert [(item["side"], item["price"], item["qty"]) for item in koru_added] == [
-        ("buy", 9.4, 2),
+        ("buy", 9.4, 1),
         ("sell", 11.3, 1),
     ]
 
@@ -851,8 +854,8 @@ def test_soxl_sell_qty_and_buy_rules():
             [
                 ("sell", 113, 2),
                 ("sell", 125, 2),
-                ("buy", 94, 1),
-                ("buy", 86, 1),
+                ("buy", 94, 2),
+                ("buy", 86, 2),
             ]
         ),
     )["ok"]
@@ -862,8 +865,8 @@ def test_soxl_sell_qty_and_buy_rules():
             [
                 ("sell", 113, 1),
                 ("sell", 125, 1),
-                ("buy", 94, 1),
-                ("buy", 86, 1),
+                ("buy", 94, 2),
+                ("buy", 86, 2),
             ]
         ),
     )
@@ -876,8 +879,8 @@ def test_soxl_sell_qty_and_buy_rules():
             [
                 ("sell", 86, 2),
                 ("sell", 94, 2),
-                ("buy", 72, 4),
-                ("buy", 66, 4),
+                ("buy", 72, 2),
+                ("buy", 66, 2),
             ]
         ),
     )["ok"]
@@ -931,8 +934,8 @@ def test_soxl_sell_qty_and_buy_rules():
             [
                 ("sell", 11.3, 1),
                 ("sell", 12.5, 1),
-                ("buy", 9.4, 2),
-                ("buy", 8.6, 2),
+                ("buy", 9.4, 1),
+                ("buy", 8.6, 1),
             ]
         ),
     )["ok"]
@@ -974,19 +977,19 @@ def test_shared_ladder():
     assert _level("SOXL", 46) == 18 and _level("SOXL", 39) == 16
     assert _level("KORU", 7.2) == -3 and _level("KORU", 6.0) == -5
     assert ladders._CFG["SOXL"]["sell_qty"] == 2
-    assert ladders._CFG["SOXL"]["base"] == 1
+    assert ladders._CFG["SOXL"]["base"] == 2
     assert "sell_qty" not in ladders._CFG["KORU"]
 
     for price in (6.6, 6.0, 5.5, 5.0, 4.6, 0.66):
         koru_idx = _level("KORU", price)
         nail_idx = _level("NAIL", price)
         soxl_idx = _level("SOXL", price)
-        assert bot._buy_computed("KORU", koru_idx, []) == 2
+        assert bot._buy_computed("KORU", koru_idx, []) == (2 if price <= 6 else 1)
         assert bot._buy_computed("KORU", koru_idx, [koru_idx]) == 1
         assert bot._buy_computed("NAIL", nail_idx, []) == 40
         assert bot._buy_computed("NAIL", nail_idx, [nail_idx]) == 10
         assert bot._buy_computed("SOXL", soxl_idx, []) == 4
-        assert bot._buy_computed("SOXL", soxl_idx, [soxl_idx]) == 1
+        assert bot._buy_computed("SOXL", soxl_idx, [soxl_idx]) == 2
 
     low_nail = bot._desired("NAIL", _level("NAIL", 11.3), _level("NAIL", 9.4), 1.0)
     assert [(item["side"], item["price"], item["qty"]) for item in low_nail] == [
@@ -1030,8 +1033,8 @@ def test_shared_ladder():
     assert [(item["side"], item["price"], item["qty"]) for item in high] == [
         ("sell", 220, 2),
         ("sell", 240, 2),
-        ("buy", 200, 1),
-        ("buy", 180, 1),
+        ("buy", 200, 2),
+        ("buy", 180, 2),
     ]
     high_nail = bot._desired("NAIL", _level("NAIL", 220), _level("NAIL", 200), 1.0)
     assert [(item["side"], item["price"], item["qty"]) for item in high_nail] == [
@@ -1045,10 +1048,10 @@ def test_shared_ladder():
     assert [(item["side"], item["price"], item["qty"]) for item in at_low] == [
         ("sell", 8.6, 1),
         ("sell", 9.4, 1),
-        ("buy", 7.2, 2),
-        ("buy", 6.6, 2),
+        ("buy", 7.2, 1),
+        ("buy", 6.6, 1),
     ]
-    # This saved pair buys 1 at 6.6. The pair above still buys 2 there.
+    # 6.6 is above 6, so it is 1. 6.0 is an unused first buy of 2.
     below = bot._desired(
         "KORU",
         _level("KORU", 7.9),
@@ -1095,7 +1098,7 @@ def test_shared_ladder():
         1.0,
     )
     assert [(item["side"], item["price"], item["qty"]) for item in added] == [
-        ("buy", 6.6, 2),
+        ("buy", 6.6, 1),
         ("sell", 7.9, 1),
     ]
     further = bot.intraday_adds(
@@ -1119,7 +1122,7 @@ def test_shared_ladder():
             [
                 ("sell", 8.6, 1),
                 ("sell", 9.4, 1),
-                ("buy", 7.2, 2),
+                ("buy", 7.2, 1),
             ]
         ),
     )
@@ -1132,8 +1135,8 @@ def test_shared_ladder():
             [
                 ("sell", 8.6, 1),
                 ("sell", 9.4, 1),
-                ("buy", 7.2, 2),
-                ("buy", 6.6, 2),
+                ("buy", 7.2, 1),
+                ("buy", 6.6, 1),
             ]
         ),
     )["ok"]
@@ -1143,7 +1146,7 @@ def test_shared_ladder():
             [
                 ("sell", 8.6, 1),
                 ("sell", 9.4, 1),
-                ("buy", 7.2, 2),
+                ("buy", 7.2, 1),
                 ("buy", 6.5, 2),
             ]
         ),
@@ -1178,8 +1181,8 @@ def test_shared_ladder():
             [
                 ("sell", 240, 2),
                 ("sell", 260, 2),
-                ("buy", 220, 1),
-                ("buy", 200, 1),
+                ("buy", 220, 2),
+                ("buy", 200, 2),
             ]
         ),
     )["ok"]
@@ -1235,8 +1238,8 @@ def test_shared_ladder():
     assert world["placed"] == [
         ("KORU", "sell", 8.6, 1),
         ("KORU", "sell", 9.4, 1),
-        ("KORU", "buy", 7.2, 2),
-        ("KORU", "buy", 6.6, 2),
+        ("KORU", "buy", 7.2, 1),
+        ("KORU", "buy", 6.6, 1),
     ]
     assert world["cancelled"] == []
     assert "NEEDS_REVIEW KORU" not in out
@@ -1660,10 +1663,9 @@ def test_soxl_exception_200_at_37_5():
 
 
 def test_saved_anchor_buy_sizes():
-    """SOXL 50/42 and KORU 7.9/6.6 keep the confirmed buy sizes.
+    """Current history stays. 39 used repeats at 2. An unused 39 is 4.
 
-    Other pairs, sells, and NAIL stay on the existing formula. The
-    override does not edit double_used.
+    42 is above 39, so it is 2 either way. KORU 6.6 is 1. 6.0 unused is 2.
     """
     soxl_used = [_level("SOXL", price) for price in (72, 66, 60, 55, 50, 46, 42, 39)]
     koru_used = [_level("KORU", price) for price in (9.4, 8.6, 7.9, 7.2)]
@@ -1678,20 +1680,25 @@ def test_saved_anchor_buy_sizes():
         ("sell", 50, 2),
         ("sell", 55, 2),
         ("buy", 42, 2),
+        ("buy", 39, 2),
+    ]
+    assert _rows("SOXL", 50, 42, []) == [
+        ("sell", 50, 2),
+        ("sell", 55, 2),
+        ("buy", 42, 2),
         ("buy", 39, 4),
     ]
-    assert _rows("SOXL", 50, 42, []) == _rows("SOXL", 50, 42, soxl_used)
     assert _rows("SOXL", 46, 42, []) == [
         ("sell", 46, 2),
         ("sell", 50, 2),
-        ("buy", 42, 4),
+        ("buy", 42, 2),
         ("buy", 39, 4),
     ]
     assert _rows("SOXL", 55, 46, soxl_used) == [
         ("sell", 55, 2),
         ("sell", 60, 2),
-        ("buy", 46, 1),
-        ("buy", 42, 1),
+        ("buy", 46, 2),
+        ("buy", 42, 2),
     ]
     stepped = bot._step_buy(
         "SOXL",
@@ -1705,7 +1712,7 @@ def test_saved_anchor_buy_sizes():
     assert _rows("SOXL", 46, 39, stepped["double_used"]) == [
         ("sell", 46, 2),
         ("sell", 50, 2),
-        ("buy", 39, 1),
+        ("buy", 39, 2),
         ("buy", 36, 4),
     ]
     assert _rows("KORU", 7.9, 6.6, koru_used) == [
@@ -1718,7 +1725,7 @@ def test_saved_anchor_buy_sizes():
         ("sell", 8.6, 1),
         ("sell", 9.4, 1),
         ("buy", 7.2, 1),
-        ("buy", 6.6, 2),
+        ("buy", 6.6, 1),
     ]
     assert _rows("NAIL", 39, 33, []) == [
         ("sell", 39, 10),
@@ -1733,7 +1740,7 @@ def test_saved_anchor_buy_sizes():
         ("buy", 20, 40),
     ]
     assert bot._EXCEPTION_QTY == 200 and bot._EXCEPTION_PRICE == 37.5
-    assert all(rung != 37.5 for _name, _sell, _buy, rung, _qty in ladders._ANCHOR_BUY)
+    assert not hasattr(ladders, "_ANCHOR_BUY")
 
     os.environ["LIVE_TRADING"] = "on"
     saved_rows = {}

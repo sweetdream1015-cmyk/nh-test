@@ -603,9 +603,9 @@ def test_day_session_fill_followup():
         ("NAIL", "sell", 39, 10),
         ("NAIL", "buy", 30, 10),
         ("KORU", "sell", 11.3, 1),
-        ("KORU", "buy", 9.4, 2),
+        ("KORU", "buy", 9.4, 1),
         ("SOXL", "sell", 86, 2),
-        ("SOXL", "buy", 72, 4),
+        ("SOXL", "buy", 72, 2),
     ]
     moments = (
         (_kst(2026, 10, 29, 12, 0), "63"),
@@ -805,7 +805,7 @@ def test_day_session_quantities():
         11.3,
         1,
     )
-    assert koru["placed"] == [("KORU", "sell", 11.3, 1), ("KORU", "buy", 9.4, 2)]
+    assert koru["placed"] == [("KORU", "sell", 11.3, 1), ("KORU", "buy", 9.4, 1)]
 
     soxl_at = _one(
         "SOXL",
@@ -821,7 +821,7 @@ def test_day_session_quantities():
         86,
         1,
     )
-    assert soxl_at["placed"] == [("SOXL", "sell", 86, 2), ("SOXL", "buy", 72, 4)]
+    assert soxl_at["placed"] == [("SOXL", "sell", 86, 2), ("SOXL", "buy", 72, 2)]
 
     soxl_below = _one(
         "SOXL",
@@ -831,15 +831,15 @@ def test_day_session_quantities():
         [
             {"ticker": "SOXL", "side": "sell", "price": 86, "qty": 1},
             {"ticker": "SOXL", "side": "sell", "price": 94, "qty": 1},
-            {"ticker": "SOXL", "side": "buy", "price": 72, "qty": 4},
+            {"ticker": "SOXL", "side": "buy", "price": 72, "qty": 2},
         ],
         "buy",
         79,
         1,
     )
-    assert soxl_below["placed"] == [("SOXL", "sell", 79, 2), ("SOXL", "buy", 66, 4)]
+    assert soxl_below["placed"] == [("SOXL", "sell", 79, 2), ("SOXL", "buy", 66, 2)]
 
-    # Above 72 the new buy stays 1. The new sell is 2.
+    # Above 39 the new buy is the base 2. The new sell is 2.
     soxl_above = _one(
         "SOXL",
         103,
@@ -854,9 +854,9 @@ def test_day_session_quantities():
         94,
         1,
     )
-    assert soxl_above["placed"] == [("SOXL", "sell", 94, 2), ("SOXL", "buy", 79, 1)]
+    assert soxl_above["placed"] == [("SOXL", "sell", 94, 2), ("SOXL", "buy", 79, 2)]
 
-    # A level already bought goes back to 1. The new sell is still 2.
+    # A used mark above 39 does not change the base 2.
     soxl_used = _one(
         "SOXL",
         94,
@@ -871,7 +871,7 @@ def test_day_session_quantities():
         86,
         1,
     )
-    assert soxl_used["placed"] == [("SOXL", "sell", 86, 2), ("SOXL", "buy", 72, 1)]
+    assert soxl_used["placed"] == [("SOXL", "sell", 86, 2), ("SOXL", "buy", 72, 2)]
 
     soxl_used_low = _one(
         "SOXL",
@@ -881,20 +881,17 @@ def test_day_session_quantities():
         [
             {"ticker": "SOXL", "side": "sell", "price": 86, "qty": 2},
             {"ticker": "SOXL", "side": "sell", "price": 94, "qty": 2},
-            {"ticker": "SOXL", "side": "buy", "price": 72, "qty": 4},
+            {"ticker": "SOXL", "side": "buy", "price": 72, "qty": 2},
         ],
         "buy",
         79,
         1,
     )
-    assert soxl_used_low["placed"] == [("SOXL", "sell", 79, 2), ("SOXL", "buy", 66, 1)]
+    assert soxl_used_low["placed"] == [("SOXL", "sell", 79, 2), ("SOXL", "buy", 66, 2)]
 
 
 def test_koru_buy_fill_steps_below_7_2():
-    """Filling 7.9 still places the first buy of 2 at 6.6.
-
-    Filling 7.2 lands on the saved 7.9/6.6 pair, whose buy at 6.6 is 1.
-    """
+    """6.6 is base 1. Filling down onto 6.0 places the first buy of 2."""
     _restore_guards()
     os.environ["LIVE_TRADING"] = "on"
     os.environ["LIVE_TICKERS"] = "KORU"
@@ -923,7 +920,7 @@ def test_koru_buy_fill_steps_below_7_2():
         assert key in world["saved"]["handled"]
         return world
 
-    # The 7.9 core buy fills while 7.2 is already open, so intraday places 2@6.6.
+    # The 7.9 core buy fills while 7.2 is already open, so intraday places 1@6.6.
     placed = _book(
         8.6,
         7.9,
@@ -934,7 +931,7 @@ def test_koru_buy_fill_steps_below_7_2():
         ],
         7.9,
     )
-    assert placed["placed"] == [("KORU", "sell", 7.9, 1), ("KORU", "buy", 6.6, 2)]
+    assert placed["placed"] == [("KORU", "sell", 7.9, 1), ("KORU", "buy", 6.6, 1)]
     assert placed["saved"]["tickers"]["KORU"]["sell"] == _idx("KORU", 7.9)
     assert placed["saved"]["tickers"]["KORU"]["buy"] == _idx("KORU", 7.2)
 
@@ -955,7 +952,7 @@ def test_koru_buy_fill_steps_below_7_2():
     assert saved["sell"] == _idx("KORU", 7.9)
     assert saved["buy"] == _idx("KORU", 6.6)
     assert saved["buy"] == -4
-    assert _idx("KORU", 7.2) in saved["double_used"]
+    assert _idx("KORU", 7.2) not in saved["double_used"]
     assert _idx("KORU", 6.6) not in saved["double_used"]
     desired = bot._desired(
         "KORU", saved["sell"], saved["buy"], 1.0, saved["double_used"]
@@ -1262,9 +1259,9 @@ def test_regular_reject_does_not_block_other_tickers():
     os.environ.pop("ORDER_TYPE", None)
     others = [
         ("KORU", "sell", 11.3, 1),
-        ("KORU", "buy", 9.4, 2),
+        ("KORU", "buy", 9.4, 1),
         ("SOXL", "sell", 86, 2),
-        ("SOXL", "buy", 72, 4),
+        ("SOXL", "buy", 72, 2),
     ]
     for moment in (
         _kst(2026, 10, 30, 1, 34),  # 12:34 EDT
