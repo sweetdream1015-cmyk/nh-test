@@ -17,6 +17,11 @@ The modify endpoint is never called. Prints counts, OK/ERROR codes, and
 on a broker reject the ticker, side, price, and redacted rsp_cd/rsp_msg.
 A reject stops the rest of that ticker only. Other tickers still run,
 then the process logs ERROR reject and exits non-zero.
+A stop that is not a broker reject logs ERROR unexpected, a fixed reason
+(remain, inquiry, cancel, place, exists, or select), and the ticker when that
+stop is inside one ticker. An uncaught exception logs only its type
+name. Those lines omit order ids, prices, quantities, accounts, and
+exception text.
 
 Spec fields used:
 - POST /oauth2/token
@@ -1363,6 +1368,31 @@ def _clocked(event):
     return event in ("schedule", "workflow_dispatch")
 
 
+_UNEXPECTED_REASONS = ("remain", "inquiry", "cancel", "place", "exists", "select")
+
+
+def _unexpected_line(reason, ticker=None):
+    """One stable stop line. Never includes an order, account, or message."""
+    if reason not in _UNEXPECTED_REASONS:
+        reason = "error"
+    if ticker in ("NAIL", "KORU", "SOXL"):
+        return "ERROR unexpected %s %s" % (reason, ticker)
+    return "ERROR unexpected %s" % (reason,)
+
+
+def _unexpected_type(exc):
+    """Type name only. Exception text can carry an account or token."""
+    name = type(exc).__name__
+    if (
+        isinstance(name, str)
+        and name.isascii()
+        and name.isidentifier()
+        and 1 <= len(name) <= 40
+    ):
+        return "ERROR unexpected %s" % (name,)
+    return "ERROR unexpected"
+
+
 def _may_trade(event, mode, now_kst, now_et, report_only):
     """Live orders are clocked runs only, inside the mode window, and past the KST guard."""
     return (
@@ -1570,8 +1600,8 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
         print("ERROR reject")
         return 1
 
-    def _abort_unexpected():
-        print("ERROR unexpected")
+    def _abort_unexpected(reason, ticker=None):
+        print(_unexpected_line(reason, ticker))
         if rejected:
             _save_progress()
             print("ERROR reject")
@@ -1617,18 +1647,18 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
                     if _note_reject():
                         ticker_failed = True
                         break
-                    return _abort_unexpected()
+                    return _abort_unexpected("cancel", plan["ticker"])
                 if result:
                     cancelled += 1
                     sent_any = True
             # Orders still open after the cancels are not a broker reject.
-            # Stop the run, as before.
-            if (
-                not ticker_failed
-                and plan["cancel"]
-                and not actions["confirm_clear"](plan["ticker"])
-            ):
-                return _abort_unexpected()
+            # Stop the run, as before. None means the fresh query failed.
+            if not ticker_failed and plan["cancel"]:
+                cleared = actions["confirm_clear"](plan["ticker"])
+                if cleared is None:
+                    return _abort_unexpected("inquiry", plan["ticker"])
+                if not cleared:
+                    return _abort_unexpected("remain", plan["ticker"])
         if touch and not ticker_failed:
             for item in plan["place"]:
                 stopped = _guard_stop()
@@ -1636,7 +1666,7 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
                     return stopped
                 exists = actions["exists"](plan["ticker"], item["side"], item["idx"])
                 if exists is None:
-                    return _abort_unexpected()
+                    return _abort_unexpected("exists", plan["ticker"])
                 if exists:
                     continue
                 result = actions["place"](plan["ticker"], item, counter)
@@ -1644,7 +1674,7 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
                     if _note_reject():
                         ticker_failed = True
                         break
-                    return _abort_unexpected()
+                    return _abort_unexpected("place", plan["ticker"])
                 if result:
                     placed += 1
                     sent_any = True
@@ -1693,7 +1723,7 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
             return stopped
         current = actions["exception_open"]()
         if current is None:
-            return _abort_unexpected()
+            return _abort_unexpected("inquiry")
         if current:
             settled_exception = True
         else:
@@ -1706,7 +1736,7 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
             result = actions["place_exception"](counter)
             if result is None:
                 if not _note_reject():
-                    return _abort_unexpected()
+                    return _abort_unexpected("place", "SOXL")
             elif result:
                 sent_any = True
                 print("exception placed 1")
@@ -1786,7 +1816,7 @@ def main():
         return _die_http()
     account = gb._select_account(payload)
     if not account:
-        print("ERROR unexpected")
+        print(_unexpected_line("select"))
         return 1
     if account not in gb._secrets:
         gb._secrets.append(account)
@@ -1823,7 +1853,7 @@ def main():
     def confirm_clear(ticker):
         fresh = _inquiry(account, now_kst, "open")
         if fresh is None:
-            return False
+            return None
         for order in fresh:
             if order.get("ticker") != ticker or order.get("idx") is None:
                 continue
@@ -1863,6 +1893,6 @@ def main():
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except Exception:
-        print("ERROR unexpected")
+    except Exception as exc:
+        print(_unexpected_type(exc))
         sys.exit(1)
