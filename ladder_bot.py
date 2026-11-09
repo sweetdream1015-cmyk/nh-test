@@ -16,6 +16,15 @@ SOXL buys and sells 2. A first SOXL buy at 39 or below is 4, then 2
 once that level is in double_used. KORU buys and sells 1. A first KORU
 buy at 6 or below is 2, then 1. NAIL is unchanged. Saved double_used
 is kept as written.
+A manual adjust sets one ticker's sell and buy anchors, or steps that
+ticker once, then cancels only that ticker's ladder orders that do not
+match and places the missing ones. Preview prints those prices and
+quantities and does not save state or send orders. The 200-share SOXL
+buy at 37.5 is left alone. Other tickers are left alone. Adjust may
+send orders in the same US and KST sessions as intraday.
+Reset applies an unhandled confirmed fill at the current anchor before
+it restores the book, so a fill during 16:00-17:10 is not quoted again
+after the wipe.
 Inquiry plus, when live and allowed, limit buy, limit sell, and full cancel.
 The modify endpoint is never called. Prints counts, OK/ERROR codes, and
 on a broker reject the ticker, side, price, and redacted rsp_cd/rsp_msg.
@@ -303,7 +312,7 @@ def _window_open(mode, now_kst, now_et):
     """
     if mode == "reset":
         return _in_reset_window(now_kst)
-    if mode == "intraday":
+    if mode in ("intraday", "adjust"):
         return _in_us_session(now_et) or _kst_day(now_kst)
     return False
 
@@ -1326,6 +1335,38 @@ def _step_plan(ticker, pair, sell_missing, buy_missing, mult):
     return current, desired
 
 
+def _anchor_fill_step(ticker, pair, fills, handled, mult):
+    """Step a reset pair when an unhandled fill is on the current anchor.
+
+    The 16:00-17:10 window does not poll, and the 17:00 wipe then leaves
+    an empty book. Restoring the saved pair would quote the filled rung
+    again. A fill the step rules accept moves the pair first. Anything
+    else leaves the saved pair, so an odd fill cannot block the reset.
+    """
+    core = (
+        ("sell", pair["sell"]),
+        ("sell", pair["sell"] + 1),
+        ("buy", pair["buy"]),
+        ("buy", pair["buy"] - 1),
+    )
+    hit = []
+    for side, index in core:
+        found = _confirmed_fills(
+            ticker, [{"side": side, "idx": index}], fills, handled
+        )
+        if not found:
+            continue
+        hit.append((side, index))
+    if not hit:
+        return pair
+    sell_missing = [index for side, index in hit if side == "sell"]
+    buy_missing = [index for side, index in hit if side == "buy"]
+    stepped = _step_plan(ticker, pair, sell_missing, buy_missing, mult)
+    if stepped is None:
+        return pair
+    return stepped[0]
+
+
 def _core_missing(anchors, orders):
     expected = [
         ("sell", anchors["sell"]),
@@ -1409,12 +1450,272 @@ def _may_trade(event, mode, now_kst, now_et, report_only):
     )
 
 
+def _rung_index(ticker, raw):
+    price = ladders._float(raw)
+    if price is None:
+        return None
+    return ladders._level_of(ticker, price)
+
+
+def _parse_adjust():
+    """One ticker and either both anchors or a single step. None is config."""
+    ticker = os.environ.get("ADJUST_TICKER", "").strip().upper()
+    sell_raw = os.environ.get("ADJUST_SELL", "").strip()
+    buy_raw = os.environ.get("ADJUST_BUY", "").strip()
+    step = os.environ.get("ADJUST_STEP", "").strip().lower()
+    preview_raw = os.environ.get("ADJUST_PREVIEW", "").strip().lower()
+    if ticker not in ("NAIL", "KORU", "SOXL"):
+        return None
+    if preview_raw not in ("true", "false"):
+        return None
+    if step == "none":
+        step = ""
+    if step == "step buy one":
+        step = "buy"
+    if step == "step sell one":
+        step = "sell"
+    if step not in ("", "buy", "sell"):
+        return None
+    if step and (sell_raw or buy_raw):
+        return None
+    spec = {"ticker": ticker, "step": step, "preview": preview_raw == "true"}
+    if step:
+        return spec
+    if not sell_raw or not buy_raw:
+        return None
+    sell = _rung_index(ticker, sell_raw)
+    buy = _rung_index(ticker, buy_raw)
+    if not _valid_pair(ticker, sell, buy):
+        return None
+    spec["sell"] = sell
+    spec["buy"] = buy
+    return spec
+
+
+def _adjust_pair(spec, stored):
+    """Target pair. Explicit anchors keep double_used. A step uses the step rules."""
+    if spec["step"] == "buy":
+        return _step_buy(spec["ticker"], stored)
+    if spec["step"] == "sell":
+        return _step_sell(spec["ticker"], stored)
+    return {
+        "sell": spec["sell"],
+        "buy": spec["buy"],
+        "double_used": list(stored.get("double_used") or []),
+    }
+
+
+def _same_qty(left, right):
+    if isinstance(left, bool) or isinstance(right, bool):
+        return False
+    if not isinstance(left, (int, float)) or not isinstance(right, (int, float)):
+        return False
+    return abs(float(left) - float(right)) < 1e-9
+
+
+def _px(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return ""
+    number = float(value)
+    if number.is_integer():
+        return str(int(number))
+    return "%s" % (value,)
+
+
+def _book_delta(ticker, desired, orders):
+    """Cancel ladder orders that are not in `desired`. Keep the exception buy."""
+    mine = [dict(order) for order in orders if order.get("ticker") == ticker]
+    buys, sells, _ignored = _split(ticker, mine)
+    pool = []
+    for order in buys + sells:
+        if _exception_order(order):
+            continue
+        pool.append(order)
+    used = set()
+    keep = []
+    place = []
+    for item in desired:
+        found = None
+        for index, order in enumerate(pool):
+            if index in used:
+                continue
+            if order.get("side") != item["side"] or order.get("idx") != item["idx"]:
+                continue
+            if not _same_qty(order.get("qty"), item["qty"]):
+                continue
+            found = index
+            break
+        if found is None:
+            place.append(item)
+        else:
+            used.add(found)
+            keep.append(pool[found])
+    cancel = [order for index, order in enumerate(pool) if index not in used]
+    pooled = {id(order) for order in pool}
+    ignored_orders = [order for order in mine if id(order) not in pooled]
+    return cancel, place, keep, ignored_orders
+
+
+def _print_adjust_plan(ticker, pair, cancel, place, keep, ignored_orders):
+    sell = ladders._price_at(ticker, pair["sell"])
+    buy = ladders._price_at(ticker, pair["buy"])
+    print("%s anchor sell %s buy %s" % (ticker, _px(sell), _px(buy)))
+
+    def _line(kind, side, price, qty):
+        print(
+            "%s plan %s %s %s qty %s"
+            % (ticker, kind, side, _px(price), _px(qty))
+        )
+
+    for order in cancel:
+        _line("cancel", order.get("side", ""), order.get("price"), order.get("qty"))
+    for item in place:
+        _line("place", item["side"], item["price"], item["qty"])
+    for order in keep:
+        _line("keep", order.get("side", ""), order.get("price"), order.get("qty"))
+    for order in ignored_orders:
+        _line("ignore", order.get("side", ""), order.get("price"), order.get("qty"))
+    for name in ("NAIL", "KORU", "SOXL"):
+        if name != ticker:
+            print("%s unchanged" % (name,))
+
+
+def _run_adjust(event, now_kst, now_et, opens, _fills, state, actions):
+    """Preview or sync one ticker. Fills are not applied; anchors are the input."""
+    mult = _mult()
+    spec = _parse_adjust()
+    if mult is None or spec is None or _order_type_override() is None:
+        print("ERROR config")
+        return 1
+    if state is None:
+        print("ERROR config")
+        return 1
+    working = _clean_state(state)
+    ticker = spec["ticker"]
+    stored = _stored_pair(working, ticker)
+    if stored is None:
+        print("NEEDS_REVIEW " + ticker)
+        print("OK dry")
+        return 0
+    pair = _adjust_pair(spec, stored)
+    if pair is None:
+        print("NEEDS_REVIEW " + ticker)
+        print("OK dry")
+        return 0
+    desired = _desired(
+        ticker, pair["sell"], pair["buy"], mult, pair["double_used"]
+    )
+    if not desired:
+        print("ERROR config")
+        return 1
+    cancel, place, keep, ignored_orders = _book_delta(ticker, desired, opens)
+    preview = spec["preview"]
+    if not preview:
+        if not _live_flag() or not _clocked(event):
+            _print_adjust_plan(ticker, pair, cancel, place, keep, ignored_orders)
+            print("OK dry")
+            return 0
+        if ticker not in _allow_set():
+            print("ERROR config")
+            return 1
+        if _orders_blocked(now_kst) or _orders_blocked(_now_kst()):
+            print("skip: time guard")
+            return 0
+        if not _window_open("adjust", now_kst, now_et):
+            print("OK skip")
+            return 0
+        kind, reason = _session(now_kst, now_et, "adjust")
+        wall = _now_kst()
+        wall_kind, wall_reason = _session(wall, wall.astimezone(ET), "adjust")
+        if reason == "ERROR config" or wall_reason == "ERROR config":
+            print("ERROR config")
+            return 1
+        if not kind or kind != wall_kind:
+            print(reason or wall_reason or "skip: session closed")
+            return 0
+        if len(place) > _MAX_NEW:
+            _print_adjust_plan(ticker, pair, cancel, place, keep, ignored_orders)
+            print("ERROR max_orders")
+            return 1
+        print("order type %s" % (kind,))
+    else:
+        kind, _reason = _session(now_kst, now_et, "adjust")
+        if kind:
+            print("order type %s" % (kind,))
+    _print_adjust_plan(ticker, pair, cancel, place, keep, ignored_orders)
+    if preview:
+        print("OK preview")
+        return 0
+
+    def _guard_stop():
+        if _orders_blocked(now_kst) or _orders_blocked(_now_kst()):
+            print("skip: time guard")
+            return True
+        return False
+
+    if _guard_stop():
+        return 0
+    for order in cancel:
+        if _guard_stop():
+            return 0
+        result = actions["cancel"](ticker, order)
+        if result is None:
+            if not _log_reject():
+                print(_unexpected_line("cancel", ticker))
+            else:
+                print("ERROR reject")
+            return 1
+        if not result:
+            print(_unexpected_line("cancel", ticker))
+            return 1
+    keep_levels = {(order.get("side"), order.get("idx")) for order in keep}
+    checked = set()
+    for order in cancel:
+        level = (order.get("side"), order.get("idx"))
+        if level in keep_levels or level in checked:
+            continue
+        checked.add(level)
+        still = actions["exists"](ticker, order.get("side"), order.get("idx"))
+        if still is None:
+            print(_unexpected_line("exists", ticker))
+            return 1
+        if still:
+            print(_unexpected_line("remain", ticker))
+            return 1
+    counter = [0]
+    for item in place:
+        if _guard_stop():
+            return 0
+        exists = actions["exists"](ticker, item["side"], item["idx"])
+        if exists is None:
+            print(_unexpected_line("exists", ticker))
+            return 1
+        if exists:
+            continue
+        result = actions["place"](ticker, item, counter)
+        if result is None:
+            if not _log_reject():
+                print(_unexpected_line("place", ticker))
+            else:
+                print("ERROR reject")
+            return 1
+        if not result:
+            print(_unexpected_line("place", ticker))
+            return 1
+    working["tickers"][ticker] = pair
+    actions["save_state"](_clean_state(working))
+    print("OK live")
+    return 0
+
+
 def run(mode, event, now_kst, now_et, opens, fills, state, actions):
     """Pure orchestration. `actions` performs live calls or records dry intent."""
     mult = _mult()
-    if mult is None or mode not in ("reset", "intraday") or _order_type_override() is None:
+    if mult is None or mode not in ("reset", "intraday", "adjust") or _order_type_override() is None:
         print("ERROR config")
         return 1
+    if mode == "adjust":
+        return _run_adjust(event, now_kst, now_et, opens, fills, state, actions)
 
     def _stop_for_guard():
         if _orders_blocked(now_kst) or _orders_blocked(_now_kst()):
@@ -1469,8 +1770,11 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
         if stored is None:
             review = True
         elif mode == "reset":
+            pair = _anchor_fill_step(
+                ticker, stored, fills, set(working["handled"]), mult
+            )
             place = _desired(
-                ticker, stored["sell"], stored["buy"], mult, stored["double_used"]
+                ticker, pair["sell"], pair["buy"], mult, pair["double_used"]
             ) or []
             if not place:
                 review = True
@@ -1479,7 +1783,7 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
                 cancel = [
                     order for order in buys + sells if not _exception_order(order)
                 ]
-                indexes = stored
+                indexes = pair
         else:
             missing = _core_missing(stored, buys + sells)
             if missing:
@@ -1780,10 +2084,14 @@ def main():
     event = os.environ.get("GITHUB_EVENT_NAME", "push")
     now_kst = _now_kst()
     now_et = datetime.now(ET)
-    if mode not in ("reset", "intraday") or _order_type_override() is None:
+    if mode not in ("reset", "intraday", "adjust") or _order_type_override() is None:
         print("ERROR config")
         return 1
-    if _orders_blocked(now_kst):
+    adjust = _parse_adjust() if mode == "adjust" else None
+    if mode == "adjust" and adjust is None:
+        print("ERROR config")
+        return 1
+    if _orders_blocked(now_kst) and not (adjust and adjust["preview"]):
         print("skip: time guard")
         return 0
     if _clocked(event) and mode == "reset":
@@ -1796,6 +2104,8 @@ def main():
         if _live_flag() and done.get(slot) == now_kst.strftime("%Y%m%d"):
             print("OK skip")
             return 0
+    elif _clocked(event) and adjust and adjust["preview"]:
+        pass
     elif _clocked(event) and not _window_open(mode, now_kst, now_et):
         print("OK skip")
         return 0

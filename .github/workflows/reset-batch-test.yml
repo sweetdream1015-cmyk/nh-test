@@ -7,6 +7,7 @@ on:
       - .github/workflows/reset-batch-test.yml
       - test_reset_batch.py
       - test_order_type.py
+      - test_adjust.py
       - ladder_bot.py
       - seed_state.py
 
@@ -22,4 +23,4 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Simulate reset batches
-        run: python3 test_reset_batch.py && python3 test_order_type.py
+        run: python3 test_reset_batch.py && python3 test_order_type.py && python3 test_adjust.py
