@@ -1,0 +1,104 @@
+name: ladder-adjust
+
+on:
+  workflow_dispatch:
+    inputs:
+      ticker:
+        description: "티커 하나. NAIL, KORU, SOXL 중 이 티커만 맞춘다."
+        required: true
+        type: choice
+        options:
+          - SOXL
+          - NAIL
+          - KORU
+      sell:
+        description: "목표 매도 앵커 가격. 예: 46. step을 쓰면 비운다."
+        required: false
+        default: ""
+        type: string
+      buy:
+        description: "목표 매수 앵커 가격. 예: 39. step을 쓰면 비운다."
+        required: false
+        default: ""
+        type: string
+      step:
+        description: "가격 대신 한 칸. buy 는 매수 한 칸(step buy one). sell 은 매도 한 칸. 가격을 넣으면 none."
+        required: true
+        default: "none"
+        type: choice
+        options:
+          - "none"
+          - buy
+          - sell
+      preview:
+        description: "true 면 취소·신규 가격과 수량만 출력한다. 주문과 저장 상태는 바꾸지 않는다."
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: ladder-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  ladder-adjust:
+    name: ladder-adjust
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Restore access token
+        uses: actions/cache@v4
+        with:
+          path: .nhplug-token
+          key: nhplug-token-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            nhplug-token-
+
+      - name: Restore ladder state
+        uses: actions/cache@v4
+        with:
+          path: .ladder-state
+          key: ladder-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ladder-state-
+
+      - name: Restore ladder state artifact
+        if: hashFiles('.ladder-state/state.json') == ''
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 restore_ladder_state.py
+
+      - name: Adjust one ladder
+        env:
+          LADDER_MODE: adjust
+          ADJUST_TICKER: ${{ inputs.ticker }}
+          ADJUST_SELL: ${{ inputs.sell }}
+          ADJUST_BUY: ${{ inputs.buy }}
+          ADJUST_STEP: ${{ inputs.step }}
+          ADJUST_PREVIEW: ${{ inputs.preview }}
+          LIVE_TRADING: ${{ vars.LIVE_TRADING }}
+          LIVE_TICKERS: ${{ vars.LIVE_TICKERS }}
+          MAX_QTY_MULT: ${{ vars.MAX_QTY_MULT }}
+          ORDER_TYPE: ${{ vars.ORDER_TYPE }}
+          NHPLUG_APP_KEY: ${{ secrets.NHPLUG_APP_KEY }}
+          NHPLUG_APP_SECRET: ${{ secrets.NHPLUG_APP_SECRET }}
+          NHPLUG_TOKEN_PATH: .nhplug-token/token.json
+          LADDER_STATE_PATH: .ladder-state/state.json
+        run: python3 ladder_bot.py
+
+      - name: Upload ladder state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ladder-state
+          path: .ladder-state/state.json
+          retention-days: 30
+          include-hidden-files: true
+          if-no-files-found: ignore
