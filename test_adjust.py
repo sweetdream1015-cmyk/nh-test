@@ -345,6 +345,150 @@ def test_reset_does_not_requote_unhandled_anchor_fill():
     assert again["saved"]["tickers"]["SOXL"]["buy"] == _level("SOXL", 42)
 
 
+def _without_exception(opens=None):
+    rows = _opens() if opens is None else opens
+    return [order for order in rows if order.get("price") != 37.5]
+
+
+def _run_free(state, opens, when, preview, ticker="SOXL", sell="46", buy="39", step="none", mutate=None):
+    _env(preview, sell, buy, step)
+    os.environ["ADJUST_TICKER"] = ticker
+    bot._now_kst = lambda: when
+    world = {"placed": [], "cancelled": [], "exceptions": []}
+    actions = sim._actions(world)
+    if mutate is not None:
+        mutate(actions, world)
+    code, out = sim._capture(
+        lambda: bot.run(
+            "adjust",
+            "workflow_dispatch",
+            when,
+            when.astimezone(bot.ET),
+            opens,
+            [],
+            state,
+            actions,
+        )
+    )
+    return code, out, world
+
+
+def test_adjust_places_missing_exception_once():
+    """A SOXL adjust sends 200@37.5 when it is missing, and not twice."""
+    when = _PREMARKET
+    assert bot._reset_slot(when) == "17"
+    missing = _without_exception()
+    code, out, world = _run_free(_state(), missing, when, preview=False)
+    assert code == 0, out
+    assert "exception plan place buy 37.5 qty 200" in out
+    assert "exception placed 1" in out
+    assert world["exceptions"] == [(200, 37.5)]
+    assert ("SOXL", "sell", 46, 2) in world["placed"]
+    assert ("SOXL", "buy", 36, 4) in world["placed"]
+    saved = world["saved"]
+    assert saved["exception_filled"] is False
+    assert saved["exception_id"] == ""
+    assert saved["exception_placed"]["17"] == "20261109"
+    assert saved["reset_tickers"]["17"]["SOXL"] == "20261109"
+    assert all(price != 37.5 for _ticker, price, _number in world["cancelled"])
+
+    rested = _without_exception()
+    rested = [order for order in rested if order.get("price") not in (42, 55)]
+    rested.extend(
+        (
+            {"ticker": "SOXL", "side": "sell", "price": 46, "qty": 2, "orr_no": 11},
+            {"ticker": "SOXL", "side": "buy", "price": 36, "qty": 4, "orr_no": 12},
+        )
+    )
+    code, out, again = _run_free(saved, rested, when, preview=False)
+    assert code == 0, out
+    assert again["exceptions"] == []
+    assert "exception placed" not in out
+    assert again["placed"] == []
+
+    def seen_open(actions, _world):
+        actions["exception_open"] = lambda: True
+
+    code, out, fresh = _run_free(_state(), missing, when, preview=False, mutate=seen_open)
+    assert code == 0, out
+    assert fresh["exceptions"] == []
+    assert "exception placed" not in out
+    assert fresh["saved"]["exception_placed"]["17"] == "20261109"
+
+    filled = _state()
+    filled["exception_filled"] = True
+    filled["exception_id"] = bot._EXCEPTION_ID
+    code, out, world = _run_free(filled, missing, when, preview=False)
+    assert code == 0, out
+    assert world["exceptions"] == []
+    assert "exception placed" not in out
+    assert world["saved"]["exception_filled"] is True
+    assert world["saved"]["exception_id"] == bot._EXCEPTION_ID
+
+    code, out, world = _run_free(_state(), missing, when, preview=True)
+    assert code == 0, out
+    assert "exception plan place buy 37.5 qty 200" in out
+    assert "OK preview" in out
+    assert world["exceptions"] == []
+    assert world["placed"] == []
+    assert "saved" not in world
+
+
+def test_adjust_other_ticker_leaves_exception():
+    missing = _without_exception()
+    code, out, world = _run_free(
+        _state(), missing, _PREMARKET, preview=False, ticker="NAIL", sell="42", buy="36"
+    )
+    assert code == 0, out
+    assert world["exceptions"] == []
+    assert "exception placed" not in out
+    assert "exception plan place" not in out
+    assert saved_ticker(world) == "NAIL"
+
+
+def saved_ticker(world):
+    changed = [
+        name
+        for name, pair in world["saved"]["tickers"].items()
+        if pair != _state()["tickers"][name]
+    ]
+    assert changed == ["NAIL"]
+    return "NAIL"
+
+
+def test_adjust_slot_mark_blocks_reset_replace():
+    """Orders written by adjust are not cancelled by a later reset the same slot."""
+    state = _state()
+    state["reset_done"] = {"09": "20261109", "17": ""}
+    state["reset_tickers"] = {
+        "09": {"NAIL": "20261109", "KORU": "20261109", "SOXL": "20261109"},
+        "17": {},
+    }
+    state = bot._clean_state(state)
+    code, out, world = _run_free(state, _opens(), _PREMARKET, preview=False)
+    assert code == 0, out
+    assert "exception placed" not in out
+    assert world["saved"]["reset_tickers"]["17"]["SOXL"] == "20261109"
+    assert "NAIL" not in world["saved"]["reset_tickers"]["17"]
+    kept = [
+        order
+        for order in _opens()
+        if not (order["ticker"] == "SOXL" and order["price"] in (42, 55))
+    ]
+    kept.extend(
+        (
+            {"ticker": "SOXL", "side": "sell", "price": 46, "qty": 2, "orr_no": 11},
+            {"ticker": "SOXL", "side": "buy", "price": 36, "qty": 4, "orr_no": 12},
+        )
+    )
+    os.environ["LADDER_MODE"] = "reset"
+    code, out, reset = sim._run(world["saved"], kept, {}, when=_PREMARKET)
+    assert code == 0, out
+    assert all(item[0] != "SOXL" for item in reset["cancelled"])
+    assert "SOXL skip done" in out
+    assert reset["exceptions"] == []
+
+
 def test_workflow_file():
     root = os.path.dirname(os.path.abspath(__file__))
     text = open(
@@ -378,7 +522,11 @@ def main():
         test_step_buy_one_matches_explicit_anchors()
         test_other_hours_and_bad_anchor()
         test_reset_does_not_requote_unhandled_anchor_fill()
+        test_adjust_places_missing_exception_once()
+        test_adjust_other_ticker_leaves_exception()
+        test_adjust_slot_mark_blocks_reset_replace()
         test_workflow_file()
+        print("passed 10 failed 0")
         print("OK adjust")
     finally:
         bot._now_kst = _ORIG_NOW

@@ -6,9 +6,15 @@ US session (20:00 ET). Sunday, and Monday before 09:10 KST, are closed.
 Those runs log "skip: time guard" and exit.
 Intraday follow-up runs in the US session and in the KST day session.
 A live reset places whole tickers only, at most 6 new orders. A ticker
-that does not fit is left uncancelled and logged DEFERRED for a later run.
+that does not fit is left uncancelled and logged DEFERRED. This process
+then waits about 2 minutes and runs the reset again, at most 4 inquiries,
+and stops if the next try would leave the slot or hit a wipe window.
+The GitHub crons stay as a backstop. They are not the only continuation.
 Reset also keeps one SOXL buy of 200 shares at 37.5 until that order fills
-once. The retired buys of 100 at 75 and 200 at 38 stay retired:
+once. A free slot places that buy in the same run even when SOXL's ladder
+is deferred. The same slot does not send it again when it is open, already
+filled, or this slot already sent it, because an open-order inquiry can lag.
+The retired buys of 100 at 75 and 200 at 38 stay retired:
 exception_filled counts only when exception_id is soxl-buy-200-37-5, so a
 saved true from either of those fills does not block 200 at 37.5 and must
 not be reseeded true.
@@ -19,9 +25,12 @@ is kept as written.
 A manual adjust sets one ticker's sell and buy anchors, or steps that
 ticker once, then cancels only that ticker's ladder orders that do not
 match and places the missing ones. Preview prints those prices and
-quantities and does not save state or send orders. The 200-share SOXL
-buy at 37.5 is left alone. Other tickers are left alone. Adjust may
-send orders in the same US and KST sessions as intraday.
+quantities and does not save state or send orders. A SOXL adjust places
+the 200-share buy at 37.5 when it is missing and still eligible, and
+leaves it alone when it is already open. Other tickers are left alone.
+A successful live adjust marks that ticker done for the current reset
+slot so a later reset does not cancel and replace the book it just wrote.
+Adjust may send orders in the same US and KST sessions as intraday.
 Reset applies an unhandled confirmed fill at the current anchor before
 it restores the book, so a fill during 16:00-17:10 is not quoted again
 after the wipe.
@@ -75,6 +84,12 @@ CANCEL_URL = gb.LIVE + "/gbstock/order/v1/cancel"
 _ORDER_URLS = {BUY_URL, SELL_URL, CANCEL_URL}
 _HARD_MAX = {"NAIL": 40, "KORU": 4, "SOXL": 4}
 _MAX_NEW = 6
+# Deferred tickers are retried in this process, about 2 minutes apart.
+# Four inquiries cover a wiped NAIL, then KORU, then SOXL, plus one spare.
+# The chain then stops. It does not dispatch another workflow.
+_FOLLOWUP_SECONDS = 120
+_FOLLOWUP_RUNS = 4
+_pending_followup = None
 # One-time reset buy. 100 at 75 filled on 2026-10-31. 200 at 38 was the
 # previous one-time order. Neither fill is this order.
 _EXCEPTION_PRICE = 37.5
@@ -721,18 +736,13 @@ def _all_reset_done(state, plans, allow, slot, today):
     return found
 
 
-def _exception_this_run(plans, allow, state, slot, today, selected):
-    for plan in plans:
-        if plan["ticker"] != "SOXL":
-            continue
-        if plan["review"] or "SOXL" not in allow:
-            return True
-        return "SOXL" in selected or _slot_done(state, slot, "SOXL", today)
-    return False
-
-
 def _reset_batch(plans, allow, state, slot, today, want_exception):
-    """Whole tickers only. A ticker that does not fit waits for a later run."""
+    """Whole tickers only. A ticker that does not fit waits for a later run.
+
+    The one-time buy uses a leftover slot in this same run. It does not
+    wait for SOXL's ladder, and it is not reserved ahead of a ticker that
+    still fits.
+    """
     remaining = _MAX_NEW
     selected = []
     deferred = []
@@ -755,16 +765,10 @@ def _reset_batch(plans, allow, state, slot, today, want_exception):
             continue
         selected.append(ticker)
         remaining -= cost
-    take_exception = False
-    if want_exception and "SOXL" not in deferred and remaining >= 1:
-        chosen = set(selected)
-        take_exception = _exception_this_run(
-            plans, allow, state, slot, today, chosen
-        )
     return {
         "selected": set(selected),
         "deferred": set(deferred),
-        "exception": take_exception,
+        "exception": bool(want_exception and remaining >= 1),
         "blocked": False,
     }
 
@@ -777,6 +781,7 @@ def _fresh_state():
         "handled": [],
         "exception_filled": False,
         "exception_id": "",
+        "exception_placed": {"09": "", "17": ""},
         "reset_done": {"09": "", "17": ""},
         "reset_tickers": {"09": {}, "17": {}},
     }
@@ -1084,6 +1089,43 @@ def _exception_done(state):
     )
 
 
+def _clean_exception_placed(raw):
+    cleaned = {"09": "", "17": ""}
+    if not isinstance(raw, dict):
+        return cleaned
+    for slot in ("09", "17"):
+        value = raw.get(slot, "")
+        if isinstance(value, str) and len(value) == 8 and value.isdigit():
+            cleaned[slot] = value
+    return cleaned
+
+
+def _exception_marked(state, slot, today):
+    """True when this slot already sent 200@37.5. The inquiry may still omit it."""
+    if slot not in ("09", "17") or not today:
+        return False
+    return _clean_exception_placed(state.get("exception_placed")).get(slot) == today
+
+
+def _mark_exception_placed(state, slot, today):
+    if slot not in ("09", "17") or not today:
+        return
+    placed = _clean_exception_placed(state.get("exception_placed"))
+    placed[slot] = today
+    state["exception_placed"] = placed
+
+
+def _exception_eligible(state, slot, today, orders):
+    """200@37.5 may be sent. Open, filled, or already sent this slot blocks it."""
+    if _exception_done(state):
+        return False
+    if _exception_open(orders):
+        return False
+    if _exception_marked(state, slot, today):
+        return False
+    return True
+
+
 def _place_exception(account, live, counter):
     global _last_reject
     _last_reject = None
@@ -1263,6 +1305,7 @@ def _clean_state(state):
         "handled": _pin_done_markers(handled, reset_tickers),
         "exception_filled": _exception_done(state),
         "exception_id": _EXCEPTION_ID if _exception_done(state) else "",
+        "exception_placed": _clean_exception_placed(state.get("exception_placed")),
         "reset_done": done,
         "reset_tickers": reset_tickers,
     }
@@ -1580,6 +1623,20 @@ def _print_adjust_plan(ticker, pair, cancel, place, keep, ignored_orders):
             print("%s unchanged" % (name,))
 
 
+def _print_exception_plan():
+    print(
+        "exception plan place buy %s qty %s"
+        % (_px(_EXCEPTION_PRICE), _px(_EXCEPTION_QTY))
+    )
+
+
+def _adjust_exception(ticker, state, slot, today, orders):
+    """A SOXL adjust may add the one-time buy. Other tickers stay untouched."""
+    if ticker != "SOXL":
+        return False
+    return _exception_eligible(state, slot, today, orders)
+
+
 def _run_adjust(event, now_kst, now_et, opens, _fills, state, actions):
     """Preview or sync one ticker. Fills are not applied; anchors are the input."""
     mult = _mult()
@@ -1633,8 +1690,13 @@ def _run_adjust(event, now_kst, now_et, opens, _fills, state, actions):
         if not kind or kind != wall_kind:
             print(reason or wall_reason or "skip: session closed")
             return 0
-        if len(place) > _MAX_NEW:
+        slot = _reset_slot(now_kst)
+        today = _as_kst(now_kst).strftime("%Y%m%d")
+        extra = 1 if _adjust_exception(ticker, working, slot, today, opens) else 0
+        if len(place) + extra > _MAX_NEW:
             _print_adjust_plan(ticker, pair, cancel, place, keep, ignored_orders)
+            if extra:
+                _print_exception_plan()
             print("ERROR max_orders")
             return 1
         print("order type %s" % (kind,))
@@ -1642,7 +1704,11 @@ def _run_adjust(event, now_kst, now_et, opens, _fills, state, actions):
         kind, _reason = _session(now_kst, now_et, "adjust")
         if kind:
             print("order type %s" % (kind,))
+        slot = _reset_slot(now_kst)
+        today = _as_kst(now_kst).strftime("%Y%m%d")
     _print_adjust_plan(ticker, pair, cancel, place, keep, ignored_orders)
+    if _adjust_exception(ticker, working, slot, today, opens):
+        _print_exception_plan()
     if preview:
         print("OK preview")
         return 0
@@ -1702,7 +1768,40 @@ def _run_adjust(event, now_kst, now_et, opens, _fills, state, actions):
         if not result:
             print(_unexpected_line("place", ticker))
             return 1
+    if _adjust_exception(ticker, working, slot, today, opens):
+        if _guard_stop():
+            return 0
+        if counter[0] >= _MAX_NEW:
+            print("ERROR max_orders")
+            return 1
+        current = actions["exception_open"]()
+        if current is None:
+            print(_unexpected_line("inquiry"))
+            return 1
+        if current:
+            _mark_exception_placed(working, slot, today)
+        else:
+            result = actions["place_exception"](counter)
+            if result is None:
+                if not _log_reject():
+                    print(_unexpected_line("place", "SOXL"))
+                else:
+                    print("ERROR reject")
+                return 1
+            if not result:
+                print(_unexpected_line("place", "SOXL"))
+                return 1
+            print("exception placed 1")
+            _mark_exception_placed(working, slot, today)
     working["tickers"][ticker] = pair
+    if slot:
+        _mark_slot_done(working, slot, ticker, today)
+        if (
+            ticker == "SOXL"
+            and _exception_open(opens)
+            and not _exception_done(working)
+        ):
+            _mark_exception_placed(working, slot, today)
     actions["save_state"](_clean_state(working))
     print("OK live")
     return 0
@@ -1710,6 +1809,8 @@ def _run_adjust(event, now_kst, now_et, opens, _fills, state, actions):
 
 def run(mode, event, now_kst, now_et, opens, fills, state, actions):
     """Pure orchestration. `actions` performs live calls or records dry intent."""
+    global _pending_followup
+    _pending_followup = None
     mult = _mult()
     if mult is None or mode not in ("reset", "intraday", "adjust") or _order_type_override() is None:
         print("ERROR config")
@@ -1850,12 +1951,19 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
         for item in plan["place"]:
             if (item["side"], item["idx"]) not in existing:
                 planned += 1
+    if (
+        live
+        and mode == "reset"
+        and slot
+        and not _exception_done(working)
+        and _exception_open(opens)
+    ):
+        _mark_exception_placed(working, slot, today)
     want_exception = (
         live
         and mode == "reset"
         and "SOXL" in allow
-        and not _exception_done(working)
-        and not _exception_open(opens)
+        and _exception_eligible(working, slot, today, opens)
     )
     if want_exception:
         planned += 1
@@ -2034,6 +2142,8 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
             return _abort_unexpected("inquiry")
         if current:
             settled_exception = True
+            if slot:
+                _mark_exception_placed(working, slot, today)
         else:
             if counter[0] >= _MAX_NEW:
                 print("ERROR max_orders")
@@ -2049,6 +2159,9 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
                 sent_any = True
                 print("exception placed 1")
                 settled_exception = True
+                if slot:
+                    _mark_exception_placed(working, slot, today)
+                _save_progress()
             else:
                 settled_exception = False
 
@@ -2071,6 +2184,17 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
             print("OK live")
         else:
             print("OK dry")
+    if (
+        live
+        and mode == "reset"
+        and slot
+        and batch is not None
+        and (
+            batch["deferred"]
+            or (want_exception and not settled_exception)
+        )
+    ):
+        _pending_followup = {"slot": slot, "continue": True}
     return 0
 
 
@@ -2079,62 +2203,67 @@ def _die_http():
     return 1
 
 
-def main():
-    mode = os.environ.get("LADDER_MODE", "")
-    event = os.environ.get("GITHUB_EVENT_NAME", "push")
+def _followup_block(now, slot):
+    """Why a retry two minutes later must not run. Empty means it may."""
+    if slot not in ("09", "17"):
+        return "guard"
+    now = _as_kst(now)
+    later = now + timedelta(seconds=_FOLLOWUP_SECONDS)
+    if later.date() != now.date() or later.weekday() >= 5:
+        return "guard"
+    if _orders_blocked(now) or _orders_blocked(later):
+        return "guard"
+    if _reset_slot(now) != slot or _reset_slot(later) != slot:
+        return "guard"
+    return ""
+
+
+def _sleep_followup(seconds):
+    time.sleep(seconds)
+
+
+def _drive_reset(run_once, sleep, clock, max_runs=None):
+    """Retry a reset that still owes a ticker. Bounded, and it stops at the wipe guard.
+
+    `run_once` does one inquiry and one reset and returns an exit code.
+    That reset sets `_pending_followup` when another pass is still owed.
+    This does not dispatch a workflow. The job keeps the ladder-bot lock.
+    """
+    global _pending_followup
+    if max_runs is None:
+        max_runs = _FOLLOWUP_RUNS
+    runs = 0
+    code = 0
+    while runs < max_runs:
+        _pending_followup = None
+        code = run_once()
+        runs += 1
+        follow = _pending_followup
+        _pending_followup = None
+        if code != 0:
+            return code
+        if not follow or not follow.get("continue"):
+            return code
+        if runs >= max_runs:
+            print("FOLLOWUP limit")
+            return code
+        if _followup_block(clock(), follow.get("slot")):
+            print("FOLLOWUP skip guard")
+            return code
+        print("FOLLOWUP reset")
+        sleep(_FOLLOWUP_SECONDS)
+        now = _as_kst(clock())
+        if _orders_blocked(now) or _reset_slot(now) != follow.get("slot"):
+            print("skip: time guard")
+            return code
+    print("FOLLOWUP limit")
+    return code
+
+
+def _trade_once(account, mode, event):
+    """One inquiry and one run, using the clock at the start of this pass."""
     now_kst = _now_kst()
-    now_et = datetime.now(ET)
-    if mode not in ("reset", "intraday", "adjust") or _order_type_override() is None:
-        print("ERROR config")
-        return 1
-    adjust = _parse_adjust() if mode == "adjust" else None
-    if mode == "adjust" and adjust is None:
-        print("ERROR config")
-        return 1
-    if _orders_blocked(now_kst) and not (adjust and adjust["preview"]):
-        print("skip: time guard")
-        return 0
-    if _clocked(event) and mode == "reset":
-        slot = _reset_slot(now_kst)
-        if slot is None:
-            print("OK skip")
-            return 0
-        loaded = _load_state()
-        done = (loaded or {}).get("reset_done") or {}
-        if _live_flag() and done.get(slot) == now_kst.strftime("%Y%m%d"):
-            print("OK skip")
-            return 0
-    elif _clocked(event) and adjust and adjust["preview"]:
-        pass
-    elif _clocked(event) and not _window_open(mode, now_kst, now_et):
-        print("OK skip")
-        return 0
-    key = os.environ.get("NHPLUG_APP_KEY", "")
-    secret = os.environ.get("NHPLUG_APP_SECRET", "")
-    if not key.strip() or not secret.strip() or _mult() is None:
-        print("ERROR config")
-        return 1
-    gb._key = key
-    gb._secret = secret
-    gb._secrets.extend((key, secret))
-    gb._issue_token = _quiet_issue
-    gb._emit = lambda name, status, payload: gb._rsp(payload)
-    token = _load_token() or _quiet_issue(key, secret)
-    if not token:
-        return _die_http()
-    gb._token = token
-    gb._secrets.append(token)
-
-    status, _headers, payload = gb._post_bearer(gb.ACCTINFO_URL, gb._json_body({}), {})
-    if status != 200:
-        return _die_http()
-    account = gb._select_account(payload)
-    if not account:
-        print(_unexpected_line("select"))
-        return 1
-    if account not in gb._secrets:
-        gb._secrets.append(account)
-
+    now_et = now_kst.astimezone(ET)
     opens = _inquiry(account, now_kst, "open")
     fills = _inquiry(account, now_kst, "fill")
     if opens is None or fills is None:
@@ -2202,6 +2331,71 @@ def main():
         "save_state": save_state,
     }
     return run(mode, event, now_kst, now_et, opens, fills, state, actions)
+
+
+def main():
+    mode = os.environ.get("LADDER_MODE", "")
+    event = os.environ.get("GITHUB_EVENT_NAME", "push")
+    now_kst = _now_kst()
+    now_et = datetime.now(ET)
+    if mode not in ("reset", "intraday", "adjust") or _order_type_override() is None:
+        print("ERROR config")
+        return 1
+    adjust = _parse_adjust() if mode == "adjust" else None
+    if mode == "adjust" and adjust is None:
+        print("ERROR config")
+        return 1
+    if _orders_blocked(now_kst) and not (adjust and adjust["preview"]):
+        print("skip: time guard")
+        return 0
+    if _clocked(event) and mode == "reset":
+        slot = _reset_slot(now_kst)
+        if slot is None:
+            print("OK skip")
+            return 0
+        loaded = _load_state()
+        done = (loaded or {}).get("reset_done") or {}
+        if _live_flag() and done.get(slot) == now_kst.strftime("%Y%m%d"):
+            print("OK skip")
+            return 0
+    elif _clocked(event) and adjust and adjust["preview"]:
+        pass
+    elif _clocked(event) and not _window_open(mode, now_kst, now_et):
+        print("OK skip")
+        return 0
+    key = os.environ.get("NHPLUG_APP_KEY", "")
+    secret = os.environ.get("NHPLUG_APP_SECRET", "")
+    if not key.strip() or not secret.strip() or _mult() is None:
+        print("ERROR config")
+        return 1
+    gb._key = key
+    gb._secret = secret
+    gb._secrets.extend((key, secret))
+    gb._issue_token = _quiet_issue
+    gb._emit = lambda name, status, payload: gb._rsp(payload)
+    token = _load_token() or _quiet_issue(key, secret)
+    if not token:
+        return _die_http()
+    gb._token = token
+    gb._secrets.append(token)
+
+    status, _headers, payload = gb._post_bearer(gb.ACCTINFO_URL, gb._json_body({}), {})
+    if status != 200:
+        return _die_http()
+    account = gb._select_account(payload)
+    if not account:
+        print(_unexpected_line("select"))
+        return 1
+    if account not in gb._secrets:
+        gb._secrets.append(account)
+
+    if mode == "reset":
+        return _drive_reset(
+            lambda: _trade_once(account, mode, event),
+            _sleep_followup,
+            _now_kst,
+        )
+    return _trade_once(account, mode, event)
 
 
 if __name__ == "__main__":
