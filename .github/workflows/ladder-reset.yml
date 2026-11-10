@@ -20,6 +20,10 @@ on:
     # (18:00 KST). These runs place that reset once premarket is open.
     # 18:00, 18:02, 18:04 KST = 09:00, 09:02, 09:04 UTC.
     # During daylight time the 17:10 reset already finished, so these skip.
+    # Deferred tickers are retried by ladder_bot.py in this job, about 2
+    # minutes apart, at most 3 extra passes, and not across the KST time
+    # guard. These crons stay as a backstop. The job does not start another
+    # workflow run.
     - cron: "0 9 * * 1-5"
     - cron: "2 9 * * 1-5"
     - cron: "4 9 * * 1-5"
@@ -46,7 +50,7 @@ jobs:
   ladder-reset:
     name: ladder-reset
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Check out repository
         uses: actions/checkout@v4

@@ -5,7 +5,7 @@ import json
 import os
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 import ladder_bot as bot
 import ladder_dryrun as ladders
 import seed_state
@@ -203,12 +203,13 @@ def test_batch_selector():
     first = bot._reset_batch(plans, allow, state, "17", _TODAY, True)
     assert first["selected"] == {"NAIL"}
     assert first["deferred"] == {"KORU", "SOXL"}
-    assert first["exception"] is False
+    assert first["exception"] is True
     assert first["blocked"] is False
     bot._mark_slot_done(state, "17", "NAIL", _TODAY)
     second = bot._reset_batch(plans, allow, state, "17", _TODAY, True)
     assert second["selected"] == {"KORU"}
-    assert second["exception"] is False
+    assert second["deferred"] == {"SOXL"}
+    assert second["exception"] is True
     bot._mark_slot_done(state, "17", "KORU", _TODAY)
     third = bot._reset_batch(plans, allow, state, "17", _TODAY, True)
     assert third["selected"] == {"SOXL"}
@@ -218,6 +219,16 @@ def test_batch_selector():
     huge[0] = {"ticker": "NAIL", "review": False, "place": [0] * 7}
     blocked = bot._reset_batch(huge, allow, bot._fresh_state(), "17", _TODAY, True)
     assert blocked["blocked"] is True
+    tight = [
+        {"ticker": "NAIL", "review": False, "place": [0] * 6},
+        {"ticker": "KORU", "review": False, "place": [0] * 4},
+        {"ticker": "SOXL", "review": False, "place": [0] * 4},
+    ]
+    full = bot._reset_batch(tight, allow, bot._fresh_state(), "17", _TODAY, True)
+    assert full["selected"] == {"NAIL"}
+    assert full["deferred"] == {"KORU", "SOXL"}
+    assert full["exception"] is False
+    assert full["blocked"] is False
 
 
 def test_three_resets():
@@ -243,16 +254,21 @@ def test_three_resets():
     assert code == 0, out
     assert world["placed"] == _tagged("NAIL", 33, 28)
     assert world["cancelled"] == []
-    assert world["exceptions"] == []
+    assert world["exceptions"] == [(200, 37.5)]
     assert "DEFERRED KORU" in out
     assert "DEFERRED SOXL" in out
-    assert "DEFERRED exception" in out
+    assert "DEFERRED exception" not in out
+    assert "exception placed 1" in out
+    assert "FOLLOWUP reset" in out
     assert "ERROR max_orders" not in out
     assert "OK live" in out
     saved = world["saved"]
     assert saved["reset_tickers"]["17"]["NAIL"] == _TODAY
     assert "KORU" not in saved["reset_tickers"]["17"]
     assert saved["reset_done"]["17"] == ""
+    assert saved["exception_resting"]["slot"] == "17"
+    assert saved["exception_resting"]["day"] == _TODAY
+    assert saved["exception_resting"]["id"] == bot._EXCEPTION_ID
     assert _HANDLED in saved["handled"]
     assert bot._done_marker("17", "NAIL", _TODAY) in saved["handled"]
 
@@ -272,8 +288,9 @@ def test_three_resets():
     code, out, world = _run(_strip_maps(saved), [], world)
     assert code == 0, out
     assert world["placed"] == _tagged("SOXL", 113, 94)
-    assert world["exceptions"] == [(200, 37.5)]
-    assert "exception placed 1" in out
+    assert world["exceptions"] == []
+    assert "exception placed" not in out
+    assert "FOLLOWUP reset" not in out
     assert "ERROR" not in out
     saved = world["saved"]
     assert saved["reset_done"]["17"] == _TODAY
@@ -1952,6 +1969,285 @@ def test_workflows():
     assert "seed_flags:" in seed
     assert "SEED_FLAGS:" in seed
     assert "exception_filled=true;SOXL.double_used=72" in seed
+    assert "dispatches" not in reset
+    assert "at most 3 extra passes" in reset
+
+
+def _live_book():
+    return bot._clean_state(
+        {
+            "version": 2,
+            "tickers": {
+                "NAIL": _pair("NAIL", 33, 28),
+                "KORU": _pair("KORU", 13.5, 11.3),
+                "SOXL": _pair("SOXL", 113, 94),
+            },
+            "handled": [_HANDLED],
+            "exception_filled": False,
+            "reset_done": {"09": "", "17": ""},
+        }
+    )
+
+
+def test_evening_followup_chain_places_exception_with_nail():
+    """18:11 KST places NAIL and the exception, then two passes finish the slot."""
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "NAIL,KORU,SOXL"
+    os.environ.pop("ORDER_TYPE", None)
+    os.environ.pop("MAX_QTY_MULT", None)
+    start = datetime(2026, 11, 10, 18, 11, tzinfo=bot.KST)
+    assert start.weekday() == 1
+    assert bot._reset_slot(start) == "17"
+    box = {"state": _live_book()}
+    clock = {"now": start}
+    sleeps = []
+    passes = []
+    sent_exceptions = []
+
+    def once():
+        moment = clock["now"]
+        world = {}
+        actions = _actions(world)
+
+        def exception_open():
+            return False
+
+        def place_exception(counter):
+            if counter[0] >= bot._MAX_NEW:
+                return None
+            counter[0] += 1
+            sent_exceptions.append((200, 37.5))
+            return True
+
+        actions["exception_open"] = exception_open
+        actions["place_exception"] = place_exception
+        code, out, world = _run(box["state"], [], world, when=moment, actions=actions)
+        box["state"] = world["saved"]
+        passes.append((code, out, list(world["placed"])))
+        return code, bot._wants_reset_followup
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] = clock["now"] + timedelta(seconds=seconds)
+
+    code, loop_out = _capture(
+        lambda: bot._bounded_reset_followups(once, sleep, lambda: clock["now"])
+    )
+    assert code == 0
+    assert sleeps == [bot._FOLLOWUP_GAP, bot._FOLLOWUP_GAP]
+    assert loop_out.count("follow-up reset") == 2
+    assert "follow-up limit reached" not in loop_out
+    assert len(passes) == 3
+    first_code, first_out, first_placed = passes[0]
+    assert first_code == 0, first_out
+    assert first_placed == _tagged("NAIL", 33, 28)
+    assert sent_exceptions == [(200, 37.5)]
+    assert "exception placed 1" in first_out
+    assert "DEFERRED KORU" in first_out
+    assert "DEFERRED SOXL" in first_out
+    assert "DEFERRED exception" not in first_out
+    assert "FOLLOWUP reset" in first_out
+    assert box["state"]["exception_resting"]["slot"] == "17"
+    assert box["state"]["exception_resting"]["day"] == "20261110"
+    second_code, second_out, second_placed = passes[1]
+    assert second_code == 0, second_out
+    assert second_placed == _tagged("KORU", 13.5, 11.3)
+    assert "NAIL skip done" in second_out
+    assert "DEFERRED SOXL" in second_out
+    assert "exception placed" not in second_out
+    assert "FOLLOWUP reset" in second_out
+    third_code, third_out, third_placed = passes[2]
+    assert third_code == 0, third_out
+    assert third_placed == _tagged("SOXL", 113, 94)
+    assert "KORU skip done" in third_out
+    assert "exception placed" not in third_out
+    assert "FOLLOWUP reset" not in third_out
+    assert box["state"]["reset_tickers"]["17"] == {
+        "NAIL": "20261110",
+        "KORU": "20261110",
+        "SOXL": "20261110",
+    }
+    assert box["state"]["reset_done"]["17"] == "20261110"
+    assert box["state"]["exception_filled"] is False
+    assert sent_exceptions == [(200, 37.5)]
+
+
+def test_exception_not_duplicated_when_open_filled_or_resting():
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "NAIL,KORU,SOXL"
+    os.environ.pop("ORDER_TYPE", None)
+    os.environ.pop("MAX_QTY_MULT", None)
+    evening = datetime(2026, 11, 10, 18, 11, tzinfo=bot.KST)
+    resting_order = {
+        "ticker": "SOXL",
+        "side": "buy",
+        "price": 37.5,
+        "qty": 200,
+        "orr_no": 375,
+    }
+    code, out, world = _run(_live_book(), [resting_order], {}, when=evening)
+    assert code == 0, out
+    assert world["exceptions"] == []
+    assert "exception placed" not in out
+    assert all(item[1] != 37.5 for item in world["cancelled"])
+    assert world["saved"]["exception_resting"] == {}
+
+    filled = _live_book()
+    filled["exception_filled"] = True
+    filled["exception_id"] = bot._EXCEPTION_ID
+    filled["exception_resting"] = {
+        "id": bot._EXCEPTION_ID,
+        "slot": "17",
+        "day": "20261110",
+        "at": int(evening.timestamp()),
+    }
+    code, out, world = _run(filled, [], {}, when=evening)
+    assert code == 0, out
+    assert world["exceptions"] == []
+    assert "exception placed" not in out
+    assert world["saved"]["exception_filled"] is True
+    assert world["saved"]["exception_id"] == bot._EXCEPTION_ID
+    assert world["saved"]["exception_resting"] == {}
+
+    resting = _live_book()
+    resting["exception_resting"] = {
+        "id": bot._EXCEPTION_ID,
+        "slot": "17",
+        "day": "20261110",
+        "at": int(evening.timestamp()),
+    }
+    code, out, world = _run(resting, [], {"exception_open": False}, when=evening)
+    assert code == 0, out
+    assert world["exceptions"] == []
+    assert "exception placed" not in out
+    assert "DEFERRED exception" not in out
+
+    code, out, world = _run(_live_book(), [], {"exception_open": True}, when=evening)
+    assert code == 0, out
+    assert world["exceptions"] == []
+    assert "exception placed" not in out
+
+    morning_mark = _live_book()
+    morning_mark["exception_resting"] = {
+        "id": bot._EXCEPTION_ID,
+        "slot": "09",
+        "day": "20261110",
+        "at": int(evening.timestamp()),
+    }
+    code, out, world = _run(morning_mark, [], {"exception_open": False}, when=evening)
+    assert code == 0, out
+    assert world["exceptions"] == [(200, 37.5)]
+    assert "exception placed 1" in out
+    assert world["saved"]["exception_resting"]["slot"] == "17"
+    assert world["saved"]["exception_filled"] is False
+    weekend = {
+        "exception_resting": {
+            "id": bot._EXCEPTION_ID,
+            "slot": "",
+            "day": "20261107",
+            "at": 1,
+        }
+    }
+    assert bot._exception_resting(weekend, None, "20261107")
+    assert not bot._exception_resting(weekend, "09", "20261109")
+    assert not bot._exception_resting(
+        {"exception_resting": {"id": "soxl-buy-200-38", "slot": "17", "day": "20261110"}},
+        "17",
+        "20261110",
+    )
+
+
+def test_followup_guard_and_loop_limit():
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "NAIL,KORU,SOXL"
+    os.environ.pop("ORDER_TYPE", None)
+    os.environ.pop("MAX_QTY_MULT", None)
+    evening = datetime(2026, 11, 10, 18, 11, tzinfo=bot.KST)
+    near_guard = datetime(2026, 11, 10, 15, 58, tzinfo=bot.KST)
+    assert bot._followup_allowed(evening)
+    assert bot._followup_allowed(datetime(2026, 11, 10, 17, 10, tzinfo=bot.KST))
+    assert not bot._followup_allowed(near_guard)
+    assert not bot._followup_allowed(datetime(2026, 11, 10, 16, 5, tzinfo=bot.KST))
+    assert not bot._followup_allowed(datetime(2026, 11, 10, 17, 9, tzinfo=bot.KST))
+    assert not bot._followup_allowed(datetime(2026, 11, 10, 8, 30, tzinfo=bot.KST))
+    assert not bot._followup_allowed(datetime(2026, 11, 10, 9, 9, tzinfo=bot.KST))
+    late = datetime(2026, 11, 10, 23, 59, tzinfo=bot.KST)
+    assert bot._reset_slot(late) == "17"
+    assert not bot._followup_allowed(late)
+    assert bot._MAX_FOLLOWUPS == 3
+    assert bot._FOLLOWUP_GAP == 120
+    assert bot._MAX_NEW == 6
+
+    sleeps = []
+    calls = {"n": 0}
+
+    def always():
+        calls["n"] += 1
+        return 0, True
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+
+    code, out = _capture(
+        lambda: bot._bounded_reset_followups(always, sleep, lambda: evening)
+    )
+    assert code == 0
+    assert calls["n"] == 1 + bot._MAX_FOLLOWUPS
+    assert sleeps == [bot._FOLLOWUP_GAP] * bot._MAX_FOLLOWUPS
+    assert "follow-up limit reached" in out
+    assert out.count("follow-up reset") == bot._MAX_FOLLOWUPS
+
+    sleeps.clear()
+    calls["n"] = 0
+    code, out = _capture(
+        lambda: bot._bounded_reset_followups(always, sleep, lambda: near_guard)
+    )
+    assert code == 0
+    assert calls["n"] == 1
+    assert sleeps == []
+    assert "follow-up stopped time guard" in out
+    assert "follow-up reset" not in out
+
+    calls["n"] = 0
+    sleeps.clear()
+
+    def fail():
+        calls["n"] += 1
+        return 1, True
+
+    code = bot._bounded_reset_followups(fail, sleep, lambda: evening)
+    assert code == 1
+    assert calls["n"] == 1
+    assert sleeps == []
+
+    clock = {"now": evening}
+
+    def jump(seconds):
+        sleeps.append(seconds)
+        clock["now"] = datetime(2026, 11, 10, 16, 5, tzinfo=bot.KST)
+
+    calls["n"] = 0
+    sleeps.clear()
+    code, out = _capture(
+        lambda: bot._bounded_reset_followups(always, jump, lambda: clock["now"])
+    )
+    assert code == 0
+    assert calls["n"] == 1
+    assert sleeps == [bot._FOLLOWUP_GAP]
+    assert "follow-up stopped time guard" in out
+
+    code, out, world = _run(_live_book(), [], {}, when=near_guard)
+    assert code == 0, out
+    assert world["placed"] == _tagged("NAIL", 33, 28)
+    assert world["exceptions"] == [(200, 37.5)]
+    assert "DEFERRED KORU" in out
+    assert "DEFERRED SOXL" in out
+    assert "DEFERRED exception" not in out
+    assert "follow-up stopped time guard" in out
+    assert "FOLLOWUP reset" not in out
+    assert bot._wants_reset_followup is False
+    assert world["saved"]["exception_resting"]["slot"] == "09"
+    assert world["saved"]["reset_tickers"]["09"]["NAIL"] == "20261110"
 
 
 def main():
@@ -1959,6 +2255,9 @@ def main():
         test_pairs_and_limits()
         test_batch_selector()
         test_three_resets()
+        test_evening_followup_chain_places_exception_with_nail()
+        test_exception_not_duplicated_when_open_filled_or_resting()
+        test_followup_guard_and_loop_limit()
         test_deferred_not_cancelled_and_exception_survives()
         test_exists_skips_duplicates()
         test_intraday_unchanged()

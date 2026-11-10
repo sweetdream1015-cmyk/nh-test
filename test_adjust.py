@@ -69,6 +69,35 @@ def _env(preview, sell="46", buy="39", step="none"):
     os.environ["ADJUST_PREVIEW"] = "true" if preview else "false"
 
 
+def _opens_without_exception():
+    return [
+        order
+        for order in _opens()
+        if not (order.get("ticker") == "SOXL" and order.get("price") == 37.5)
+    ]
+
+
+def _run_sending(state, opens, when, preview=False):
+    """Like _run, but the one-time buy is allowed to be sent."""
+    _env(preview)
+    bot._now_kst = lambda: when
+    world = {"placed": [], "cancelled": [], "exceptions": [], "exception_open": False}
+    actions = sim._actions(world)
+    code, out = sim._capture(
+        lambda: bot.run(
+            "adjust",
+            "workflow_dispatch",
+            when,
+            when.astimezone(bot.ET),
+            opens,
+            [],
+            state,
+            actions,
+        )
+    )
+    return code, out, world
+
+
 def _clear_env():
     for name in (
         "ADJUST_TICKER",
@@ -345,6 +374,190 @@ def test_reset_does_not_requote_unhandled_anchor_fill():
     assert again["saved"]["tickers"]["SOXL"]["buy"] == _level("SOXL", 42)
 
 
+def test_adjust_places_missing_exception_once():
+    when = _PREMARKET
+    opens = _opens_without_exception()
+    before = _state()
+    code, out, world = _run(before, opens, when, preview=True)
+    assert code == 0, out
+    assert "exception plan place buy 37.5 qty 200" in out
+    assert "OK preview" in out
+    assert "saved" not in world
+    assert world["placed"] == []
+    assert world["cancelled"] == []
+
+    code, out, world = _run_sending(before, opens, when)
+    assert code == 0, out
+    assert "exception plan place buy 37.5 qty 200" in out
+    assert "exception placed 1" in out
+    assert world["exceptions"] == [(200, 37.5)]
+    assert ("SOXL", "buy", 36, 4) in world["placed"]
+    assert ("SOXL", "sell", 46, 2) in world["placed"]
+    assert all(price != 37.5 for _ticker, price, _number in world["cancelled"])
+    saved = world["saved"]
+    assert saved["exception_filled"] is False
+    assert saved["exception_id"] == ""
+    assert saved["exception_resting"]["id"] == bot._EXCEPTION_ID
+    assert saved["exception_resting"]["slot"] == "17"
+    assert saved["exception_resting"]["day"] == "20261109"
+    assert saved["tickers"]["NAIL"] == before["tickers"]["NAIL"]
+    assert saved["tickers"]["KORU"] == before["tickers"]["KORU"]
+    assert saved["tickers"]["SOXL"]["sell"] == _level("SOXL", 46)
+    assert saved["tickers"]["SOXL"]["buy"] == _level("SOXL", 39)
+
+    code, out, again = _run_sending(saved, opens, when)
+    assert code == 0, out
+    assert again["exceptions"] == []
+    assert "exception placed" not in out
+    assert again["saved"]["exception_filled"] is False
+
+    morning_mark = _state()
+    morning_mark["exception_resting"] = {
+        "id": bot._EXCEPTION_ID,
+        "slot": "09",
+        "day": "20261109",
+        "at": int(when.timestamp()),
+    }
+    code, out, world = _run_sending(morning_mark, opens, when)
+    assert code == 0, out
+    assert world["exceptions"] == [(200, 37.5)]
+    assert world["saved"]["exception_resting"]["slot"] == "17"
+
+
+def test_koru_adjust_places_missing_exception():
+    """Moving KORU still sends the missing one-time SOXL buy, not KORU's ladder only."""
+    when = _PREMARKET
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "NAIL,KORU,SOXL"
+    os.environ.pop("ORDER_TYPE", None)
+    os.environ.pop("MAX_QTY_MULT", None)
+    os.environ["LADDER_MODE"] = "adjust"
+    os.environ["ADJUST_TICKER"] = "KORU"
+    os.environ["ADJUST_SELL"] = "7.2"
+    os.environ["ADJUST_BUY"] = "6"
+    os.environ["ADJUST_STEP"] = "none"
+    os.environ["ADJUST_PREVIEW"] = "true"
+    bot._now_kst = lambda: when
+    opens = _opens_without_exception()
+    before = _state()
+    world = {"placed": [], "cancelled": [], "exceptions": []}
+    actions = sim._actions(world)
+
+    def place_exception(_counter):
+        raise AssertionError("preview placed the 37.5 exception")
+
+    actions["place_exception"] = place_exception
+    code, out = sim._capture(
+        lambda: bot.run(
+            "adjust",
+            "workflow_dispatch",
+            when,
+            when.astimezone(bot.ET),
+            opens,
+            [],
+            before,
+            actions,
+        )
+    )
+    assert code == 0, out
+    assert "OK preview" in out
+    assert "exception plan place buy 37.5 qty 200" in out
+    assert "NAIL unchanged" in out
+    assert "SOXL unchanged" not in out
+    assert "saved" not in world
+
+    os.environ["ADJUST_PREVIEW"] = "false"
+    world = {"placed": [], "cancelled": [], "exceptions": [], "exception_open": False}
+    actions = sim._actions(world)
+    code, out = sim._capture(
+        lambda: bot.run(
+            "adjust",
+            "workflow_dispatch",
+            when,
+            when.astimezone(bot.ET),
+            opens,
+            [],
+            before,
+            actions,
+        )
+    )
+    assert code == 0, out
+    assert world["exceptions"] == [(200, 37.5)]
+    assert "exception placed 1" in out
+    assert ("KORU", "sell", 7.9, 1) in world["placed"]
+    assert ("KORU", "buy", 5.5, 2) in world["placed"]
+    assert world["cancelled"] == []
+    assert ("SOXL", "buy", 36, 4) not in world["placed"]
+    saved = world["saved"]
+    assert saved["tickers"]["SOXL"] == before["tickers"]["SOXL"]
+    assert saved["tickers"]["NAIL"] == before["tickers"]["NAIL"]
+    assert saved["exception_filled"] is False
+    assert saved["exception_resting"]["slot"] == "17"
+    assert saved["exception_resting"]["day"] == "20261109"
+
+
+def test_adjust_skips_ineligible_exception():
+    when = _PREMARKET
+    opens = _opens_without_exception()
+    filled = _state()
+    filled["exception_filled"] = True
+    filled["exception_id"] = bot._EXCEPTION_ID
+    filled["exception_resting"] = {
+        "id": bot._EXCEPTION_ID,
+        "slot": "17",
+        "day": "20261109",
+        "at": int(when.timestamp()),
+    }
+    code, out, world = _run(filled, opens, when, preview=False)
+    assert code == 0, out
+    assert "exception placed" not in out
+    assert "exception plan place" not in out
+    assert world["saved"]["exception_filled"] is True
+    assert world["saved"]["exception_resting"] == {}
+
+    resting = _state()
+    resting["exception_resting"] = {
+        "id": bot._EXCEPTION_ID,
+        "slot": "17",
+        "day": "20261109",
+        "at": int(when.timestamp()),
+    }
+    code, out, world = _run(resting, opens, when, preview=False)
+    assert code == 0, out
+    assert "exception placed" not in out
+    assert "exception plan place" not in out
+    assert ("SOXL", "buy", 36, 4) in world["placed"]
+
+    _env(False)
+    bot._now_kst = lambda: when
+    world = {"placed": [], "cancelled": [], "exceptions": []}
+    actions = sim._actions(world)
+
+    def place_exception(_counter):
+        raise AssertionError("adjust placed the 37.5 exception")
+
+    def exception_open():
+        return True
+
+    actions["place_exception"] = place_exception
+    actions["exception_open"] = exception_open
+    code, out = sim._capture(
+        lambda: bot.run(
+            "adjust",
+            "workflow_dispatch",
+            when,
+            when.astimezone(bot.ET),
+            opens,
+            [],
+            _state(),
+            actions,
+        )
+    )
+    assert code == 0, out
+    assert "exception placed" not in out
+    assert world["exceptions"] == []
+
+
 def test_workflow_file():
     root = os.path.dirname(os.path.abspath(__file__))
     text = open(
@@ -378,6 +591,9 @@ def main():
         test_step_buy_one_matches_explicit_anchors()
         test_other_hours_and_bad_anchor()
         test_reset_does_not_requote_unhandled_anchor_fill()
+        test_adjust_places_missing_exception_once()
+        test_koru_adjust_places_missing_exception()
+        test_adjust_skips_ineligible_exception()
         test_workflow_file()
         print("OK adjust")
     finally:
