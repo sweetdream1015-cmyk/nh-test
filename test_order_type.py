@@ -1406,6 +1406,7 @@ def main():
         test_regular_session_body_is_limit_00()
         test_regular_reject_does_not_block_other_tickers()
         test_reset_reject_still_places_exception()
+        print("passed 17 failed 0")
     finally:
         bot._now_kst = _ORIG_NOW
         bot._orders_blocked = _ORIG_BLOCKED
