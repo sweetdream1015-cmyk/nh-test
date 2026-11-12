@@ -158,10 +158,20 @@ def _auth_headers(token, extra):
     return headers
 
 
+def _token_rejected(status, payload):
+    """401, or 400 IGW40043 (유효하지 않은 token). A new issue revokes the old one."""
+    if status == 401:
+        return True
+    if not isinstance(payload, dict):
+        return False
+    rsp_cd, _rsp_msg = _rsp(payload)
+    return rsp_cd == "IGW40043"
+
+
 def _post_bearer(url, body, extra):
     global _token
     status, headers, payload = _post(url, body, _auth_headers(_token, extra))
-    if status != 401:
+    if not _token_rejected(status, payload):
         return status, headers, payload
     refreshed = _issue_token(_key, _secret)
     if not refreshed:

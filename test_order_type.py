@@ -1892,6 +1892,7 @@ def test_prefer_newer_state_and_cancel_workflow():
         os.path.join(root, ".github/workflows/ladder-cancel-dup.yml"), encoding="utf-8"
     ).read()
     assert "startsWith(github.event.comment.body, 'kick')" in intra
+    assert "ladder-skip-" in intra
     assert "branches:" in intra
     assert "- main" in intra
     assert "branches:" in reset
@@ -1903,7 +1904,9 @@ def test_prefer_newer_state_and_cancel_workflow():
     assert "startsWith(github.event.comment.body, 'cancel-dup')" in cancel
     assert "pull_request" in cancel
     assert "LADDER_MODE: cancel-dup" in cancel
-    assert "group: ladder-bot" in cancel
+    assert "ladder-bot" in cancel
+    assert "ladder-skip-" in cancel
+    assert "startsWith(github.event.comment.body, 'cancel-dup')" in cancel
     assert "workflow_dispatch:" not in cancel
     assert "cron:" not in cancel
     assert "on:\n  push:" not in cancel
@@ -1991,6 +1994,61 @@ def test_http_error_names_the_endpoint():
     assert "rsp_msg down" in out
 
 
+def test_invalid_cached_token_is_replaced():
+    """400 IGW40043 is an invalid token. Issue a new one and retry once."""
+    calls = []
+
+    def fake_post(_url, _body, headers):
+        auth = headers.get("Authorization", "")
+        calls.append(auth)
+        if auth == "Bearer stale":
+            return 400, {}, {
+                "rsp_cd": "IGW40043",
+                "rsp_msg": "유효하지 않은 token 입니다.",
+            }
+        return 200, {}, {"rsp_cd": "00000", "rsp_msg": "ok"}
+
+    issued = {"n": 0}
+
+    def fake_issue(_key, _secret):
+        issued["n"] += 1
+        return "fresh"
+
+    old_post = gb._post
+    old_issue = gb._issue_token
+    old_token = gb._token
+    gb._post = fake_post
+    gb._issue_token = fake_issue
+    gb._token = "stale"
+    try:
+        status, _headers, payload = gb._post_bearer(
+            "https://api.nhplug.com:8443/n2/acctinfo", b"{}", {}
+        )
+        assert status == 200, payload
+        assert calls == ["Bearer stale", "Bearer fresh"]
+        assert issued["n"] == 1
+        assert gb._token == "fresh"
+        calls.clear()
+        issued["n"] = 0
+        gb._token = "stale"
+
+        def other_error(_url, _body, headers):
+            calls.append(headers.get("Authorization", ""))
+            return 500, {}, {"rsp_cd": "E500", "rsp_msg": "down"}
+
+        gb._post = other_error
+        status, _headers, payload = gb._post_bearer(
+            "https://api.nhplug.com:8443/n2/acctinfo", b"{}", {}
+        )
+        assert status == 500
+        assert calls == ["Bearer stale"]
+        assert issued["n"] == 0
+    finally:
+        gb._post = old_post
+        gb._issue_token = old_issue
+        gb._token = old_token
+
+
 def main():
     try:
         test_session_table()
@@ -2015,6 +2073,7 @@ def main():
         test_cancel_dup_cancels_only_the_newest_extra()
         test_prefer_newer_state_and_cancel_workflow()
         test_http_error_names_the_endpoint()
+        test_invalid_cached_token_is_replaced()
     finally:
         bot._now_kst = _ORIG_NOW
         bot._orders_blocked = _ORIG_BLOCKED

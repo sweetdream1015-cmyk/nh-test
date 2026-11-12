@@ -5,7 +5,14 @@ on:
     types: [created]
 
 concurrency:
-  group: ladder-bot
+  # A kick comment also starts this workflow, then the job is skipped.
+  # That run must not take ladder-bot or it cancels the queued kick.
+  group: >-
+    ${{
+      startsWith(github.event.comment.body, 'cancel-dup')
+      && 'ladder-bot'
+      || format('ladder-skip-{0}', github.run_id)
+    }}
   cancel-in-progress: false
 
 permissions:
