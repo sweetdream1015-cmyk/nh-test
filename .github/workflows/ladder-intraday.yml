@@ -32,7 +32,16 @@ on:
     types: [created]
 
 concurrency:
-  group: ladder-bot
+  # Only a real kick joins the trading lock. Any other comment still
+  # creates this run, and joining ladder-bot would cancel a queued
+  # cancel-dup. Push, schedule, and dispatch keep the lock.
+  group: >-
+    ${{
+      (github.event_name != 'issue_comment'
+        || startsWith(github.event.comment.body, 'kick'))
+      && 'ladder-bot'
+      || format('ladder-skip-{0}', github.run_id)
+    }}
   cancel-in-progress: false
 
 permissions:
