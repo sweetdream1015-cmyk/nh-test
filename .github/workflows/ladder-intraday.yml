@@ -25,6 +25,8 @@ on:
       - .github/workflows/ladder-intraday.yml
       - ladder_bot.py
       - restore_ladder_state.py
+  issue_comment:
+    types: [created]
 
 concurrency:
   group: ladder-bot
@@ -37,6 +39,16 @@ permissions:
 jobs:
   ladder-intraday:
     name: ladder-intraday
+    # schedule, workflow_dispatch, and push run as they do today. A comment
+    # runs only for the owner, on a non-PR issue labeled ladder-kick, when
+    # the new comment starts with kick. Any other comment skips this job
+    # before checkout, so no secret is read and no broker call is made.
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (!github.event.issue.pull_request &&
+      contains(github.event.issue.labels.*.name, 'ladder-kick') &&
+      github.event.comment.user.login == github.repository_owner &&
+      startsWith(github.event.comment.body, 'kick'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -76,7 +88,17 @@ jobs:
           NHPLUG_APP_SECRET: ${{ secrets.NHPLUG_APP_SECRET }}
           NHPLUG_TOKEN_PATH: .nhplug-token/token.json
           LADDER_STATE_PATH: .ladder-state/state.json
-        run: python3 ladder_bot.py
+        # ladder_bot places orders only when GITHUB_EVENT_NAME is schedule
+        # or workflow_dispatch. GitHub ignores a workflow env override of
+        # GITHUB_*, so a kick sets it on the process. That is the scheduled
+        # intraday path, including the KST time guards. schedule,
+        # workflow_dispatch, and push keep the event name GitHub set.
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "issue_comment" ]; then
+            GITHUB_EVENT_NAME=schedule python3 ladder_bot.py
+          else
+            python3 ladder_bot.py
+          fi
 
       - name: Upload ladder state
         if: always()
