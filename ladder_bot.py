@@ -948,6 +948,7 @@ def _quiet_issue(key, secret):
         {"Content-Type": "application/x-www-form-urlencoded"},
     )
     if status != 200 or not isinstance(payload, dict):
+        _note_http("token", status, payload)
         return ""
     token = payload.get("access_token")
     if not isinstance(token, str) or not token.strip():
@@ -961,10 +962,12 @@ def _quiet_issue(key, secret):
 
 
 def _pages(url, body, block):
+    global _last_http
     rows = []
     prev = None
     cts = ""
     flag = ""
+    _last_http = ""
     for _ in range(30):
         extra = {}
         if cts:
@@ -973,9 +976,11 @@ def _pages(url, body, block):
                 extra["cts_flag"] = flag
         status, headers, payload = gb._post_bearer(url, gb._json_body(body), extra)
         if status != 200 or not isinstance(payload, dict):
+            _note_http("unexecuted", status, payload, _http_date(body))
             return None
         page, state = gb._list_rows(payload, block)
         if page is None or state == "badtype":
+            _note_http("unexecuted", status, payload, _http_date(body))
             return None
         new_cts = headers.get("cts", "").strip()
         new_flag = headers.get("cts_flag", "").strip()
@@ -985,8 +990,10 @@ def _pages(url, body, block):
         rsp_cd, rsp_msg = gb._rsp(payload)
         if not gb._needs_next(new_flag, new_cts, rsp_cd, prev):
             if new_flag.upper() == "Y" and not new_cts:
+                _note_http("unexecuted", status, payload, _http_date(body))
                 return None
             if rsp_cd in gb._CONTINUE and not new_cts and new_flag.upper() != "N":
+                _note_http("unexecuted", status, payload, _http_date(body))
                 return None
             if state == "absent" and not rows and not gb._empty_ok(rsp_msg):
                 return None
@@ -1041,6 +1048,13 @@ def _dates(now_kst):
     return [day.strftime("%Y%m%d") for day in found]
 
 
+def _required_open_dates(now_kst):
+    """The Korea date and the US date. An older weekday may fail without stopping the run."""
+    kst_day = _as_kst(now_kst).date()
+    et_day = _as_kst(now_kst).astimezone(ET).date()
+    return {kst_day.strftime("%Y%m%d"), et_day.strftime("%Y%m%d")}
+
+
 def _fill_dates(now_kst):
     """Today, yesterday, and the previous weekday. Not the open-order window.
 
@@ -1065,6 +1079,7 @@ def _inquiry(account, now_kst, kind):
     drops = []
     queried = []
     dates = _dates(now_kst) if kind == "open" else _fill_dates(now_kst)
+    required = _required_open_dates(now_kst) if kind == "open" else set(dates)
     for orr_dt in dates:
         rows = _pages(
             gb.UNEXECUTED_URL,
@@ -1078,6 +1093,12 @@ def _inquiry(account, now_kst, kind):
             "Output_0",
         )
         if rows is None:
+            if orr_dt not in required:
+                line = _last_http or ("unexecuted date %s status none" % (orr_dt,))
+                if line.startswith("ERROR http "):
+                    line = "inquiry skip " + line[len("ERROR http "):]
+                print(line)
+                continue
             return None
         queried.append((orr_dt, len(rows)))
         for row in rows:
@@ -2815,8 +2836,41 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
     return 0
 
 
+_last_http = ""
+
+
+def _http_date(body):
+    raw = body.get("orr_dt") if isinstance(body, dict) else ""
+    if isinstance(raw, str) and len(raw) == 8 and raw.isdigit():
+        return "date " + raw
+    return ""
+
+
+def _endpoint_name(kind):
+    return {
+        "token": "/oauth2/token",
+        "acctinfo": "/n2/acctinfo",
+        "unexecuted": "/gbstock/inquiry/v1/unexecuted",
+    }.get(kind, "http")
+
+
+def _note_http(kind, status, payload, detail=""):
+    """Remember one broker failure. The line has no token, key, or account."""
+    global _last_http
+    rsp_cd, rsp_msg = gb._rsp(payload if isinstance(payload, dict) else {})
+    status_text = "none" if status is None else str(status)
+    extra = (" " + detail) if detail else ""
+    _last_http = "ERROR http %s%s status %s rsp_cd %s rsp_msg %s" % (
+        _endpoint_name(kind),
+        extra,
+        status_text,
+        rsp_cd or "none",
+        rsp_msg or "none",
+    )
+
+
 def _die_http():
-    print("ERROR http")
+    print(_last_http or "ERROR http")
     return 1
 
 
@@ -2877,6 +2931,7 @@ def _main_once():
 
     status, _headers, payload = gb._post_bearer(gb.ACCTINFO_URL, gb._json_body({}), {})
     if status != 200:
+        _note_http("acctinfo", status, payload)
         return _die_http(), False
     account = gb._select_account(payload)
     if not account:

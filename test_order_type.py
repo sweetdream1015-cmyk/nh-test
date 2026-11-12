@@ -1909,6 +1909,88 @@ def test_prefer_newer_state_and_cancel_workflow():
     assert "on:\n  push:" not in cancel
 
 
+def test_http_error_names_the_endpoint():
+    """A broker failure names the endpoint. An old date does not stop today."""
+    _restore_guards()
+    account = "00112233445566"
+    secret = "supersecret-token-value"
+    gb._secrets.extend((account, secret))
+    bot._note_http(
+        "acctinfo",
+        401,
+        {"rsp_cd": "IGW00121", "rsp_msg": "rejected " + account + " " + secret},
+    )
+    code, out = _capture(bot._die_http)
+    assert code == 1
+    assert "ERROR http /n2/acctinfo status 401 rsp_cd IGW00121" in out
+    assert "rsp_msg rejected" in out
+    assert account not in out
+    assert secret not in out
+
+    moment = _kst(2026, 11, 13, 5, 49)
+    assert bot._required_open_dates(moment) == {"20261113", "20261112"}
+    nail = {
+        "iem_cd": "NAIL",
+        "fc_sec_trd_nat_cd": "200",
+        "oss_sby_dit_cd": "2",
+        "fc_orr_uit_pr": "28.0000",
+        "orr_qty": "10",
+        "ny_cns_orr_qty": "",
+        "oss_ato_orr_sts_cd": "3",
+        "orr_no": "77",
+        "orr_dt": "20261113",
+    }
+
+    def pages(_url, body, _block):
+        day = body["orr_dt"]
+        if day == "20261109":
+            bot._note_http(
+                "unexecuted",
+                400,
+                {"rsp_cd": "EOLD", "rsp_msg": "none " + account},
+                "date " + day,
+            )
+            return None
+        if day == "20261113":
+            return [dict(nail)]
+        return []
+
+    saved = bot._pages
+    bot._pages = pages
+    try:
+        rows, out = _capture(lambda: bot._inquiry(account, moment, "open"))
+    finally:
+        bot._pages = saved
+    assert rows is not None and len(rows) == 1, rows
+    assert rows[0]["qty"] == 10
+    assert "inquiry skip /gbstock/inquiry/v1/unexecuted date 20261109 status 400" in out
+    assert account not in out
+    assert "ERROR http" not in out
+
+    def today_fails(_url, body, _block):
+        if body["orr_dt"] == "20261113":
+            bot._note_http(
+                "unexecuted",
+                500,
+                {"rsp_cd": "E500", "rsp_msg": "down " + secret},
+                "date 20261113",
+            )
+            return None
+        return []
+
+    bot._pages = today_fails
+    try:
+        rows, _out = _capture(lambda: bot._inquiry(account, moment, "open"))
+        code, out = _capture(bot._die_http)
+    finally:
+        bot._pages = saved
+    assert rows is None
+    assert code == 1
+    assert "ERROR http /gbstock/inquiry/v1/unexecuted date 20261113 status 500 rsp_cd E500" in out
+    assert secret not in out
+    assert "rsp_msg down" in out
+
+
 def main():
     try:
         test_session_table()
@@ -1932,6 +2014,7 @@ def main():
         test_reset_keeps_same_slot_recent_orders()
         test_cancel_dup_cancels_only_the_newest_extra()
         test_prefer_newer_state_and_cancel_workflow()
+        test_http_error_names_the_endpoint()
     finally:
         bot._now_kst = _ORIG_NOW
         bot._orders_blocked = _ORIG_BLOCKED
