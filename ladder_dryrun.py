@@ -230,7 +230,10 @@ def _identify(row):
 
 
 def _side(row):
-    code = _text(row.get("oss_sby_dit_cd"))
+    raw = row.get("oss_sby_dit_cd")
+    if isinstance(raw, float) and raw.is_integer():
+        raw = int(raw)
+    code = _text(raw).lstrip("0")
     if code == "1":
         return "sell"
     if code == "2":
@@ -238,16 +241,41 @@ def _side(row):
     return ""
 
 
+def _blank_number(value):
+    """None when the field is missing or blank. Zero stays zero."""
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    return _float(value)
+
+
 def _open_qty(row):
-    if row.get("ny_cns_orr_qty") is not None:
-        remaining = _float(row.get("ny_cns_orr_qty"))
-        if remaining is None or remaining <= 0:
-            return 0
+    """Shares still working.
+
+    Prefer the remaining field when it is a positive number. A blank
+    remaining is missing, not zero: new orders have come back with
+    orr_qty set and ny_cns_orr_qty empty, and treating that as zero
+    dropped them from the open count. A reported zero falls back to
+    ordered minus filled minus cancelled when that difference is still
+    positive.
+    """
+    remaining = _blank_number(row.get("ny_cns_orr_qty"))
+    ordered = _blank_number(row.get("orr_qty"))
+    filled = _blank_number(row.get("cns_qty")) or 0
+    cancelled = _blank_number(row.get("can_qty")) or 0
+    if filled < 0:
+        filled = 0
+    if cancelled < 0:
+        cancelled = 0
+    left = None
+    if ordered is not None and ordered > 0:
+        left = ordered - filled - cancelled
+    if remaining is not None and remaining > 0:
         return int(round(remaining))
-    ordered = _float(row.get("orr_qty"))
-    if ordered is None or ordered <= 0:
-        return 0
-    return int(round(ordered))
+    if left is not None and left > 0:
+        return int(round(left))
+    return 0
 
 
 def _quiet_emit(name, status, payload):

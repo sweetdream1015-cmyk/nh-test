@@ -61,6 +61,8 @@ Spec fields used:
   open rows: ost_cns_dit 2; executions: ost_cns_dit 1
   oss_sby_dit_cd 1 sell / 2 buy, fc_orr_uit_pr, orr_qty, ny_cns_orr_qty,
   cns_qty, orr_no, orr_dt, fc_sec_trd_nat_cd
+  Open orders are read for KST today, the US Eastern date, and the
+  previous four weekdays. A blank remaining quantity is not zero.
 - POST /gbstock/order/v1/buy and /sell
   fc_sec_trd_nat_cd 200, iem_cd ticker, orr_qty, fc_orr_uit_pr,
   ahi_nmn_pr_tp_cd from the US Eastern clock: premarket 61, regular
@@ -529,8 +531,6 @@ def _parse_row(row):
     price = ladders._float(row.get("fc_orr_uit_pr"))
     qty = ladders._open_qty(row)
     status = ladders._text(row.get("oss_ato_orr_sts_cd"))
-    if status == "2":
-        return None
     filled = ladders._float(row.get("cns_qty"))
     cancelled = ladders._float(row.get("can_qty"))
     return {
@@ -544,6 +544,7 @@ def _parse_row(row):
         "key": _fill_key(ticker, row),
         "orr_no": row.get("orr_no"),
         "orr_dt": _order_day(row.get("orr_dt")),
+        "status": status,
     }
 
 
@@ -1004,25 +1005,67 @@ def _previous_trading_day(day):
     return cursor
 
 
-def _dates(now_kst):
-    """KST order dates to query: today, yesterday, and the previous weekday.
+def _push_day(found, day):
+    if day not in found:
+        found.append(day)
 
-    On Monday, yesterday is Sunday, so Friday is included as well.
-    Callers dedupe rows by fill key, and a key already in `handled`
-    is not stepped again.
+
+def _weekdays_before(day, count):
+    found = []
+    cursor = day
+    while len(found) < count:
+        cursor -= timedelta(days=1)
+        if cursor.weekday() < 5:
+            found.append(cursor)
+    return found
+
+
+def _dates(now_kst):
+    """Dates for open orders.
+
+    The US session crosses midnight in Korea, so an order placed at
+    04:05 KST on the 13th is still the 12th in New York. Query both
+    calendars, plus the previous four weekdays, so a Friday order is
+    still visible after a holiday weekend. Callers dedupe by order
+    number. Fills stay on the short window in `_fill_dates`.
+    """
+    kst_day = _as_kst(now_kst).date()
+    et_day = _as_kst(now_kst).astimezone(ET).date()
+    found = []
+    _push_day(found, kst_day)
+    _push_day(found, et_day)
+    for day in _weekdays_before(kst_day, 4):
+        _push_day(found, day)
+    for day in _weekdays_before(et_day, 1):
+        _push_day(found, day)
+    return [day.strftime("%Y%m%d") for day in found]
+
+
+def _fill_dates(now_kst):
+    """Today, yesterday, and the previous weekday. Not the open-order window.
+
+    An older fill must not step a ladder the later reset already moved.
     """
     today = _as_kst(now_kst).date()
     found = []
     for day in (today, today - timedelta(days=1), _previous_trading_day(today)):
-        if day not in found:
-            found.append(day)
+        _push_day(found, day)
     return [day.strftime("%Y%m%d") for day in found]
 
 
+# Last open inquiry, for the cancel-dup log. Dates are YYYYMMDD and a
+# row count. Drops are parsed ladder rows that were not treated as open.
+_last_open_inquiry = {"dates": [], "drops": []}
+
+
 def _inquiry(account, now_kst, kind):
+    global _last_open_inquiry
     merged = []
     seen = set()
-    for orr_dt in _dates(now_kst):
+    drops = []
+    queried = []
+    dates = _dates(now_kst) if kind == "open" else _fill_dates(now_kst)
+    for orr_dt in dates:
         rows = _pages(
             gb.UNEXECUTED_URL,
             {
@@ -1036,23 +1079,38 @@ def _inquiry(account, now_kst, kind):
         )
         if rows is None:
             return None
+        queried.append((orr_dt, len(rows)))
         for row in rows:
             if not isinstance(row, dict):
                 continue
             parsed = _parse_row(row)
             if not parsed:
                 continue
-            identity = parsed["key"]
+            if kind == "open":
+                number = _order_number(parsed.get("orr_no"))
+                if number is not None:
+                    identity = (parsed["ticker"], parsed["side"], number)
+                else:
+                    identity = parsed["key"]
+            else:
+                identity = parsed["key"]
             if identity in seen:
                 continue
             seen.add(identity)
+            if parsed.get("status") == "2":
+                if kind == "open":
+                    drops.append(parsed)
+                continue
             if kind == "open" and parsed["qty"] <= 0:
+                drops.append(parsed)
                 continue
             if kind == "fill" and (
                 parsed["filled_qty"] <= 0 or parsed["cancelled_qty"] > 0
             ):
                 continue
             merged.append(parsed)
+    if kind == "open":
+        _last_open_inquiry = {"dates": queried, "drops": drops}
     return merged
 
 
@@ -1367,9 +1425,19 @@ def _next_pair(ticker, buys, sells, adds):
 
 
 def _order_day(value):
-    text = ladders._text(value)
-    if len(text) == 8 and text.isdigit():
-        return text
+    """YYYYMMDD from a date, a dashed date, or a date with a time suffix."""
+    if isinstance(value, float) and not isinstance(value, bool) and value.is_integer():
+        text = str(int(value))
+    else:
+        text = ladders._text(value)
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) < 8:
+        return ""
+    year = int(digits[:4])
+    month = int(digits[4:6])
+    day = int(digits[6:8])
+    if 2020 <= year <= 2100 and 1 <= month <= 12 and 1 <= day <= 31:
+        return digits[:8]
     return ""
 
 
@@ -2221,6 +2289,57 @@ def _pick_duplicate(matches):
     return ranked[-1][2]
 
 
+def _log_cancel_book(ticker, opens):
+    """Every open row for this ticker, then rows the book did not keep.
+
+    Side, price, remaining qty, order number, and order date only.
+    """
+    meta = _last_open_inquiry if isinstance(_last_open_inquiry, dict) else {}
+    dates = meta.get("dates") or []
+    if dates:
+        print(
+            "cancel-dup inquiry "
+            + " ".join("%s %s" % (day, count) for day, count in dates)
+        )
+    shown = []
+    for order in opens:
+        if isinstance(order, dict) and order.get("ticker") == ticker:
+            shown.append(("open", order))
+    for order in meta.get("drops") or []:
+        if isinstance(order, dict) and order.get("ticker") == ticker:
+            shown.append(("drop", order))
+    if not shown:
+        print("cancel-dup open %s none" % (ticker,))
+        return
+
+    def _key(item):
+        order = item[1]
+        return (
+            order.get("orr_dt") or "",
+            _order_number(order.get("orr_no")) or -1,
+            item[0],
+        )
+
+    for kind, order in sorted(shown, key=_key):
+        number = _order_number(order.get("orr_no"))
+        side = order.get("side") if order.get("side") in ("buy", "sell") else "?"
+        day = order.get("orr_dt")
+        if not isinstance(day, str) or len(day) != 8 or not day.isdigit():
+            day = "none"
+        print(
+            "cancel-dup %s %s %s %s qty %s orr_no %s orr_dt %s"
+            % (
+                kind,
+                ticker,
+                side,
+                _px(order.get("price")),
+                _px(order.get("qty")),
+                number if number is not None else "none",
+                day,
+            )
+        )
+
+
 def _run_cancel_dup(event, now_kst, now_et, opens, state, actions):
     """Cancel one duplicate. Leave every other order alone."""
     spec = _parse_cancel_dup()
@@ -2242,6 +2361,7 @@ def _run_cancel_dup(event, now_kst, now_et, opens, state, actions):
     if spec["ticker"] not in _allow_set():
         print("cancel-dup skip ticker")
         return 0
+    _log_cancel_book(spec["ticker"], opens)
     matches = [
         order
         for order in opens

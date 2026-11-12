@@ -17,4 +17,4 @@ On issue **#18** (the `ladder-kick` issue), from the repository owner account, p
 cancel-dup NAIL BUY 28 10
 ```
 
-Ticker, side, price, and quantity, in that order. The run cancels one matching open order only when the broker inquiry shows two or more identical orders. Fewer than two cancels nothing. It uses the same KST time guards and the same full cancel as `ladder-adjust`, and it cancels nothing else. The order it cancels is the newest match (later order date, then higher order number).
+Ticker, side, price, and quantity, in that order. The run cancels one matching open order only when the broker inquiry shows two or more identical orders. Fewer than two cancels nothing. The log lists every open order for that ticker (side, price, quantity, order number, order date) before it decides. It uses the same KST time guards and the same full cancel as `ladder-adjust`, and it cancels nothing else. The order it cancels is the newest match (later order date, then higher order number).
