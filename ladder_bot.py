@@ -11,6 +11,16 @@ The one-time SOXL buy uses a free slot in that same run when one remains,
 even if SOXL's ladder is deferred. A successful place is remembered for
 that reset slot, so a later pass does not send it again while the broker
 inquiry still omits it. Open-order and already-filled checks still apply.
+A ladder order this bot just placed is stored on its state for 3 hours:
+ticker, side, price, quantity, time, and the order number when the broker
+returns one. Intraday, adjust, and reset treat that order as still open
+until the inquiry shows it, the 3 hours pass, or the next reset slot
+starts. A late inquiry cannot send a second copy. The one-time SOXL buy
+keeps its own slot mark. Saved double_used is not cleared.
+An owner comment on issue #18 whose body is
+`cancel-dup NAIL BUY 28 10` cancels one matching open order, and only
+when the inquiry shows two or more identical orders. It uses the same
+time guards and the same full-cancel call as adjust.
 Deferred work is retried in this process about 2 minutes later, at most
 3 extra passes, and not into a blocked window or out of the slot.
 Reset also keeps one SOXL buy of 200 shares at 37.5 until that order fills
@@ -87,6 +97,10 @@ _MAX_NEW = 6
 # the bound stops a stuck deferral from chaining.
 _MAX_FOLLOWUPS = 3
 _FOLLOWUP_GAP = 120
+# Broker open-order inquiry can omit a new order for more than an hour.
+# Remember our own places for this long, then trust the inquiry again.
+_RECENT_GRACE = 3 * 60 * 60
+_RECENT_MAX = 40
 _wants_reset_followup = False
 # One-time reset buy. 100 at 75 filled on 2026-10-31. 200 at 38 was the
 # previous one-time order. Neither fill is this order.
@@ -325,7 +339,7 @@ def _window_open(mode, now_kst, now_et):
     """
     if mode == "reset":
         return _in_reset_window(now_kst)
-    if mode in ("intraday", "adjust"):
+    if mode in ("intraday", "adjust", "cancel-dup"):
         return _in_us_session(now_et) or _kst_day(now_kst)
     return False
 
@@ -529,6 +543,7 @@ def _parse_row(row):
         "idx": _level_of(ticker, price),
         "key": _fill_key(ticker, row),
         "orr_no": row.get("orr_no"),
+        "orr_dt": _order_day(row.get("orr_dt")),
     }
 
 
@@ -891,6 +906,7 @@ def _fresh_state():
         "exception_filled": False,
         "exception_id": "",
         "exception_resting": {},
+        "recent_orders": [],
         "reset_done": {"09": "", "17": ""},
         "reset_tickers": {"09": {}, "17": {}},
     }
@@ -1055,6 +1071,7 @@ def _order_ok(status, payload):
 
 
 _last_reject = None
+_last_order_no = None
 
 
 def _capture_reject(url, body, status, payload):
@@ -1102,14 +1119,18 @@ def _log_reject():
 
 
 def _post_order(url, body):
-    global _last_reject
+    global _last_reject, _last_order_no
     _last_reject = None
+    _last_order_no = None
     if url not in _ORDER_URLS or _orders_blocked(_now_kst()):
         return None
     status, _headers, payload = gb._post_bearer(url, gb._json_body(body), {})
     if status == 401 or not _order_ok(status, payload):
         _capture_reject(url, body, status, payload)
         return None
+    block = payload.get("Output_0") if isinstance(payload, dict) else None
+    if isinstance(block, dict):
+        _last_order_no = _order_number(block.get("orr_no"))
     return True
 
 
@@ -1345,6 +1366,101 @@ def _next_pair(ticker, buys, sells, adds):
     return pair
 
 
+def _order_day(value):
+    text = ladders._text(value)
+    if len(text) == 8 and text.isdigit():
+        return text
+    return ""
+
+
+def _order_number(value):
+    """Broker order number, when the value is a non-negative integer."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        if value.is_integer() and value >= 0:
+            return int(value)
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            return int(text)
+    elif isinstance(value, dict):
+        return _order_number(value.get("orr_no"))
+    return None
+
+
+def _price_key(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if number <= 0 or number != number or number == float("inf"):
+        return None
+    return round(number, 2)
+
+
+def _clean_recent(raw):
+    """Keep only ladder places this bot recorded. Drop anything else."""
+    if not isinstance(raw, list):
+        return []
+    found = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        ticker = item.get("ticker")
+        side = item.get("side")
+        if ticker not in ("NAIL", "KORU", "SOXL") or side not in ("buy", "sell"):
+            continue
+        price = _price_key(item.get("price"))
+        qty = item.get("qty")
+        at = item.get("at")
+        if price is None:
+            continue
+        if isinstance(qty, bool) or not isinstance(qty, (int, float)):
+            continue
+        if abs(float(qty) - round(float(qty))) > 1e-9:
+            continue
+        qty_i = int(round(float(qty)))
+        if qty_i < 1 or qty_i > _HARD_MAX[ticker]:
+            continue
+        if isinstance(at, bool) or not isinstance(at, int) or at < 0:
+            continue
+        slot = item.get("slot") or ""
+        if not isinstance(slot, str) or slot not in ("", "09", "17"):
+            slot = ""
+        day = item.get("day") or ""
+        if not isinstance(day, str) or not (
+            day == "" or (len(day) == 8 and day.isdigit())
+        ):
+            day = ""
+        idx = _level_of(ticker, price)
+        if idx is None:
+            continue
+        cleaned = {
+            "ticker": ticker,
+            "side": side,
+            "price": price,
+            "qty": qty_i,
+            "idx": idx,
+            "at": at,
+            "slot": slot,
+            "day": day,
+        }
+        number = _order_number(item.get("orr_no"))
+        if number is not None:
+            cleaned["orr_no"] = number
+        found.append(cleaned)
+    return found[-_RECENT_MAX:]
+
+
+def _clean_saved_at(raw):
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return 0
+    return raw
+
+
 def _clean_state(state):
     tickers = {}
     raw = state.get("tickers", {})
@@ -1382,6 +1498,8 @@ def _clean_state(state):
         "exception_filled": done_exception,
         "exception_id": _EXCEPTION_ID if done_exception else "",
         "exception_resting": resting,
+        "recent_orders": _clean_recent(state.get("recent_orders")),
+        "saved_at": _clean_saved_at(state.get("saved_at")),
         "reset_done": done,
         "reset_tickers": reset_tickers,
     }
@@ -1641,6 +1759,157 @@ def _px(value):
     return "%s" % (value,)
 
 
+def _recent_alive(orders, now):
+    cutoff = int(now.timestamp()) - _RECENT_GRACE
+    return [item for item in orders if item.get("at", 0) >= cutoff]
+
+
+def _same_placed(item, order):
+    """True when inquiry row `order` is the remembered place `item`."""
+    if item.get("ticker") != order.get("ticker") or item.get("side") != order.get("side"):
+        return False
+    if not _same_qty(item.get("qty"), order.get("qty")):
+        return False
+    left = _price_key(item.get("price"))
+    right = _price_key(order.get("price"))
+    if left is not None and right is not None and abs(left - right) < 0.001:
+        return True
+    return (
+        isinstance(item.get("idx"), int)
+        and not isinstance(item.get("idx"), bool)
+        and item.get("idx") == order.get("idx")
+    )
+
+
+def _unseen_recent(recent, opens, now):
+    """Remembered places the inquiry does not already show.
+
+    One visible order consumes one memory. A second memory stays, so a
+    lagging inquiry cannot hide a copy this bot already sent.
+    """
+    alive = _recent_alive(_clean_recent(recent), now)
+    pool = [order for order in opens if isinstance(order, dict)]
+    used = set()
+    unseen = []
+    ordered = sorted(alive, key=lambda row: (row.get("at", 0), row.get("orr_no", 0)))
+    for item in ordered:
+        match = None
+        for index, order in enumerate(pool):
+            if index in used or not _same_placed(item, order):
+                continue
+            match = index
+            break
+        if match is None:
+            unseen.append(item)
+        else:
+            used.add(match)
+    return unseen
+
+
+def _filled_recent(fills, item):
+    """True when a fill at this rung means the place is no longer resting."""
+    for row in fills or []:
+        if not isinstance(row, dict):
+            continue
+        if row.get("ticker") != item.get("ticker") or row.get("side") != item.get("side"):
+            continue
+        if row.get("cancelled_qty", 0) > 0 or row.get("filled_qty", 0) <= 0:
+            continue
+        idx = row.get("idx")
+        if not isinstance(idx, int) or isinstance(idx, bool):
+            idx = _level_of(item.get("ticker"), row.get("price"))
+        if idx == item.get("idx"):
+            return True
+    return False
+
+
+def _prepare_recent(state, opens, now, mode, slot, today, fills=()):
+    """Orders still hidden from the inquiry.
+
+    A reset drops places from any earlier slot. The broker wipe removed
+    those, so they must not block the new book. Places from this slot
+    stay until the inquiry shows them, a fill shows the rung is done,
+    or the grace window ends.
+    """
+    recent = _recent_alive(_clean_recent(state.get("recent_orders")), now)
+    if mode == "reset" and slot in ("09", "17"):
+        recent = [
+            item
+            for item in recent
+            if item.get("slot") == slot and item.get("day") == today
+        ]
+    hidden = _unseen_recent(recent, opens, now)
+    return [item for item in hidden if not _filled_recent(fills, item)]
+
+
+def _recent_levels(recent, ticker):
+    found = set()
+    for item in recent or []:
+        if item.get("ticker") != ticker or item.get("side") not in ("buy", "sell"):
+            continue
+        idx = item.get("idx")
+        if not isinstance(idx, int) or isinstance(idx, bool):
+            continue
+        found.add((item["side"], idx))
+    return found
+
+
+def _recent_has(recent, ticker, side, index):
+    return (side, index) in _recent_levels(recent, ticker)
+
+
+def _log_resting(ticker, side, price, qty):
+    print("%s resting %s %s qty %s" % (ticker, side, _px(price), _px(qty)))
+
+
+def _remember_placed(state, ticker, item, result, now):
+    """Record one successful ladder place. The exception buy is not a rung."""
+    price = _price_key(item.get("price"))
+    side = item.get("side")
+    qty = item.get("qty")
+    if price is None or ticker not in ("NAIL", "KORU", "SOXL") or side not in ("buy", "sell"):
+        return
+    if isinstance(qty, bool) or not isinstance(qty, (int, float)):
+        return
+    mark = {
+        "ticker": ticker,
+        "side": side,
+        "price": price,
+        "qty": qty,
+        "at": int(now.timestamp()),
+        "slot": _reset_slot(now) or "",
+        "day": now.strftime("%Y%m%d"),
+    }
+    number = _order_number(result)
+    if number is not None:
+        mark["orr_no"] = number
+    idx = item.get("idx")
+    if not isinstance(idx, int) or isinstance(idx, bool):
+        idx = _level_of(ticker, price)
+    if isinstance(idx, int) and not isinstance(idx, bool):
+        mark["idx"] = idx
+    current = list(state.get("recent_orders") or [])
+    current.append(mark)
+    state["recent_orders"] = _clean_recent(current)
+
+
+def _forget_recent(state, ticker, order):
+    """Drop the memory for the order number just cancelled.
+
+    Another memory at the same rung stays. That is the copy the inquiry
+    has not shown yet, and removing it would let the bot send a third.
+    """
+    number = _order_number(order.get("orr_no"))
+    if number is None:
+        return
+    recent = list(state.get("recent_orders") or [])
+    for index, item in enumerate(recent):
+        if item.get("ticker") == ticker and item.get("orr_no") == number:
+            del recent[index]
+            state["recent_orders"] = recent
+            return
+
+
 def _book_delta(ticker, desired, orders):
     """Cancel ladder orders that are not in `desired`. Keep the exception buy."""
     mine = [dict(order) for order in orders if order.get("ticker") == ticker]
@@ -1736,6 +2005,27 @@ def _run_adjust(event, now_kst, now_et, opens, _fills, state, actions):
     preview = spec["preview"]
     today = now_kst.strftime("%Y%m%d")
     slot = _reset_slot(now_kst)
+    working["recent_orders"] = _prepare_recent(
+        working, opens, now_kst, "adjust", slot, today, _fills
+    )
+    covered = _recent_levels(working["recent_orders"], ticker)
+    visible = set()
+    for order in opens:
+        if order.get("ticker") != ticker:
+            continue
+        idx = order.get("idx")
+        if not isinstance(idx, int) or isinstance(idx, bool):
+            idx = _level_of(ticker, order.get("price"))
+        if isinstance(idx, int) and not isinstance(idx, bool):
+            visible.add((order.get("side"), idx))
+    kept_place = []
+    for item in place:
+        level = (item["side"], item["idx"])
+        if level in covered and level not in visible:
+            _log_resting(ticker, item["side"], item["price"], item["qty"])
+            continue
+        kept_place.append(item)
+    place = kept_place
     exception_due = _exception_due(working, opens, slot, today)
     if not preview:
         if not _live_flag() or not _clocked(event):
@@ -1799,6 +2089,7 @@ def _run_adjust(event, now_kst, now_et, opens, _fills, state, actions):
         if not result:
             print(_unexpected_line("cancel", ticker))
             return 1
+        _forget_recent(working, ticker, order)
     keep_levels = {(order.get("side"), order.get("idx")) for order in keep}
     checked = set()
     for order in cancel:
@@ -1817,6 +2108,8 @@ def _run_adjust(event, now_kst, now_et, opens, _fills, state, actions):
     for item in place:
         if _guard_stop():
             return 0
+        if _recent_has(working.get("recent_orders"), ticker, item["side"], item["idx"]):
+            continue
         exists = actions["exists"](ticker, item["side"], item["idx"])
         if exists is None:
             print(_unexpected_line("exists", ticker))
@@ -1833,6 +2126,8 @@ def _run_adjust(event, now_kst, now_et, opens, _fills, state, actions):
         if not result:
             print(_unexpected_line("place", ticker))
             return 1
+        _remember_placed(working, ticker, item, result, now_kst)
+        actions["save_state"](_clean_state(working))
     if exception_due:
         if _guard_stop():
             return 0
@@ -1862,10 +2157,141 @@ def _run_adjust(event, now_kst, now_et, opens, _fills, state, actions):
     return 0
 
 
+def _parse_cancel_dup(raw=None):
+    """`cancel-dup NAIL BUY 28 10`. None when that is not the whole text."""
+    if raw is None:
+        raw = os.environ.get("CANCEL_DUP", "")
+    if not isinstance(raw, str):
+        return None
+    text = raw.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text or "\n" in text:
+        return None
+    parts = text.split()
+    if len(parts) != 5 or parts[0].lower() != "cancel-dup":
+        return None
+    ticker = parts[1].upper()
+    side = parts[2].lower()
+    if ticker not in ("NAIL", "KORU", "SOXL") or side not in ("buy", "sell"):
+        return None
+    token = parts[3]
+    if token.startswith(("+", "-")) or token.count(".") > 1:
+        return None
+    if not token or token == "." or not all(ch.isdigit() or ch == "." for ch in token):
+        return None
+    if not parts[4].isdigit():
+        return None
+    qty = int(parts[4])
+    if qty < 1 or qty > _HARD_MAX[ticker]:
+        return None
+    price = _price_key(ladders._float(token))
+    if price is None:
+        return None
+    return {"ticker": ticker, "side": side, "price": price, "qty": qty}
+
+
+def _dup_match(order, spec):
+    if order.get("ticker") != spec["ticker"] or order.get("side") != spec["side"]:
+        return False
+    if not _same_qty(order.get("qty"), spec["qty"]):
+        return False
+    px = _price_key(order.get("price"))
+    if px is None:
+        return False
+    return abs(px - float(spec["price"])) < 0.001
+
+
+def _pick_duplicate(matches):
+    """Newest identical order that has an order number.
+
+    Later `orr_dt` wins. On the same day the higher `orr_no` is the one
+    the broker assigned last.
+    """
+    ranked = []
+    for order in matches:
+        number = _order_number(order.get("orr_no"))
+        if number is None:
+            continue
+        day = order.get("orr_dt")
+        if not isinstance(day, str):
+            day = ""
+        ranked.append((day, number, order))
+    if not ranked:
+        return None
+    ranked.sort()
+    return ranked[-1][2]
+
+
+def _run_cancel_dup(event, now_kst, now_et, opens, state, actions):
+    """Cancel one duplicate. Leave every other order alone."""
+    spec = _parse_cancel_dup()
+    if spec is None:
+        print("cancel-dup skip parse")
+        return 0
+    if event not in ("schedule", "workflow_dispatch", "issue_comment"):
+        print("OK dry")
+        return 0
+    if _orders_blocked(now_kst) or _orders_blocked(_now_kst()):
+        print("skip: time guard")
+        return 0
+    if not _window_open("cancel-dup", now_kst, now_et):
+        print("OK skip")
+        return 0
+    if not _live_flag():
+        print("OK dry")
+        return 0
+    if spec["ticker"] not in _allow_set():
+        print("cancel-dup skip ticker")
+        return 0
+    matches = [
+        order
+        for order in opens
+        if isinstance(order, dict) and _dup_match(order, spec)
+    ]
+    label = "%s %s %s qty %s" % (
+        spec["ticker"],
+        spec["side"],
+        _px(spec["price"]),
+        _px(spec["qty"]),
+    )
+    if len(matches) < 2:
+        print("cancel-dup skip %s matches %s" % (label, len(matches)))
+        return 0
+    chosen = _pick_duplicate(matches)
+    number = None if chosen is None else _order_number(chosen.get("orr_no"))
+    if chosen is None or number is None:
+        print("cancel-dup skip %s no order number" % (label,))
+        return 0
+    order = dict(chosen)
+    if not isinstance(order.get("idx"), int) or isinstance(order.get("idx"), bool):
+        order["idx"] = _level_of(spec["ticker"], order.get("price"))
+    if order.get("idx") is None:
+        print("cancel-dup skip %s not a rung" % (label,))
+        return 0
+    result = actions["cancel"](spec["ticker"], order)
+    if result is None:
+        if not _log_reject():
+            print(_unexpected_line("cancel", spec["ticker"]))
+        else:
+            print("ERROR reject")
+        return 1
+    if not result:
+        print(_unexpected_line("cancel", spec["ticker"]))
+        return 1
+    if state is not None:
+        working = _clean_state(state)
+        _forget_recent(working, spec["ticker"], order)
+        actions["save_state"](_clean_state(working))
+    print("cancel-dup cancelled %s orr_no %s" % (label, number))
+    print("OK cancel-dup")
+    return 0
+
+
 def run(mode, event, now_kst, now_et, opens, fills, state, actions):
     """Pure orchestration. `actions` performs live calls or records dry intent."""
     global _wants_reset_followup
     _wants_reset_followup = False
+    if mode == "cancel-dup":
+        return _run_cancel_dup(event, now_kst, now_et, opens, state, actions)
     mult = _mult()
     if mult is None or mode not in ("reset", "intraday", "adjust") or _order_type_override() is None:
         print("ERROR config")
@@ -1912,11 +2338,18 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
     if _exception_filled(fills, set(working["handled"])):
         working["exception_filled"] = True
         working["exception_id"] = _EXCEPTION_ID
+    working["recent_orders"] = _prepare_recent(
+        working, opens, now_kst, mode, slot, today, fills
+    )
 
     plans = []
     for ticker in ("NAIL", "KORU", "SOXL"):
         mine = [order for order in opens if order.get("ticker") == ticker]
         buys, sells, ignored = _split(ticker, [dict(order) for order in mine])
+        recent_levels = _recent_levels(working.get("recent_orders"), ticker)
+        covered_orders = list(buys + sells) + [
+            {"side": side, "idx": idx} for side, idx in recent_levels
+        ]
         review = False
         place = []
         cancel = []
@@ -1941,7 +2374,7 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
                 ]
                 indexes = pair
         else:
-            missing = _core_missing(stored, buys + sells)
+            missing = _core_missing(stored, covered_orders)
             if missing:
                 found = _confirmed_fills(
                     ticker, missing, fills, set(working["handled"])
@@ -1962,12 +2395,20 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
                         review = True
                     else:
                         new_pair, desired = stepped
-                        open_levels = {(order["side"], order["idx"]) for order in buys + sells}
-                        place = [
-                            item
-                            for item in desired
-                            if (item["side"], item["idx"]) not in open_levels
-                        ]
+                        inquiry_levels = {
+                            (order["side"], order["idx"]) for order in buys + sells
+                        }
+                        open_levels = inquiry_levels | recent_levels
+                        place = []
+                        for item in desired:
+                            level = (item["side"], item["idx"])
+                            if level not in open_levels:
+                                place.append(item)
+                                continue
+                            if level in recent_levels and level not in inquiry_levels:
+                                _log_resting(
+                                    ticker, item["side"], item["price"], item["qty"]
+                                )
                         indexes = new_pair
                         remember = [item["key"] for item in found]
         if not review and mode == "reset" and indexes is not None:
@@ -2114,6 +2555,7 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
                 if result:
                     cancelled += 1
                     sent_any = True
+                    _forget_recent(working, plan["ticker"], order)
             # Orders still open after the cancels are not a broker reject.
             # Stop the run, as before. None means the fresh query failed.
             if not ticker_failed and plan["cancel"]:
@@ -2127,6 +2569,17 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
                 stopped = _guard_stop()
                 if stopped is not None:
                     return stopped
+                if _recent_has(
+                    working.get("recent_orders"),
+                    plan["ticker"],
+                    item["side"],
+                    item["idx"],
+                ):
+                    if mode == "reset":
+                        _log_resting(
+                            plan["ticker"], item["side"], item["price"], item["qty"]
+                        )
+                    continue
                 exists = actions["exists"](plan["ticker"], item["side"], item["idx"])
                 if exists is None:
                     return _abort_unexpected("exists", plan["ticker"])
@@ -2141,6 +2594,11 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
                 if result:
                     placed += 1
                     sent_any = True
+                    _remember_placed(
+                        working, plan["ticker"], item, result, now_kst
+                    )
+                    if live:
+                        actions["save_state"](_clean_state(working))
             # A partial ladder must not advance. The next run retries it.
             if not ticker_failed and mode == "intraday" and plan["remember"]:
                 _remember(working, plan["remember"])
@@ -2247,7 +2705,14 @@ def _main_once():
     event = os.environ.get("GITHUB_EVENT_NAME", "push")
     now_kst = _now_kst()
     now_et = datetime.now(ET)
-    if mode not in ("reset", "intraday", "adjust") or _order_type_override() is None:
+    if mode == "cancel-dup":
+        if _parse_cancel_dup() is None:
+            print("cancel-dup skip parse")
+            return 0, False
+        if event not in ("schedule", "workflow_dispatch", "issue_comment"):
+            print("OK dry")
+            return 0, False
+    elif mode not in ("reset", "intraday", "adjust") or _order_type_override() is None:
         print("ERROR config")
         return 1, False
     adjust = _parse_adjust() if mode == "adjust" else None
@@ -2274,7 +2739,9 @@ def _main_once():
         return 0, False
     key = os.environ.get("NHPLUG_APP_KEY", "")
     secret = os.environ.get("NHPLUG_APP_SECRET", "")
-    if not key.strip() or not secret.strip() or _mult() is None:
+    if not key.strip() or not secret.strip() or (
+        mode != "cancel-dup" and _mult() is None
+    ):
         print("ERROR config")
         return 1, False
     gb._key = key
@@ -2304,12 +2771,24 @@ def _main_once():
         return _die_http(), False
 
     state = _load_state()
-    live = _may_trade(event, mode, now_kst, now_et, state is None)
+    if mode == "cancel-dup":
+        live = (
+            _live_flag()
+            and event in ("schedule", "workflow_dispatch", "issue_comment")
+            and _window_open("cancel-dup", now_kst, now_et)
+            and not _orders_blocked(now_kst)
+            and not _orders_blocked(_now_kst())
+        )
+    else:
+        live = _may_trade(event, mode, now_kst, now_et, state is None)
 
     def place(ticker, item, count):
-        return _place(
+        result = _place(
             account, ticker, item["side"], item["price"], item["qty"], live, count
         )
+        if result is True and isinstance(_last_order_no, int):
+            return {"ok": True, "orr_no": _last_order_no}
+        return result
 
     def cancel(ticker, order):
         return _cancel(account, ticker, order, live)
@@ -2353,7 +2832,11 @@ def _main_once():
     def save_state(data):
         if state is not None and not live:
             return
-        _save_json(_STATE_PATH, _clean_state(data))
+        if state is None and mode == "cancel-dup":
+            return
+        cleaned = _clean_state(data)
+        cleaned["saved_at"] = int(time.time())
+        _save_json(_STATE_PATH, cleaned)
 
     actions = {
         "place": place,

@@ -70,7 +70,6 @@ jobs:
             ladder-state-
 
       - name: Restore ladder state artifact
-        if: hashFiles('.ladder-state/state.json') == ''
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 restore_ladder_state.py

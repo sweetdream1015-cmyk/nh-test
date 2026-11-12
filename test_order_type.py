@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import gb_readonly_check as gb
 import ladder_bot as bot
 import ladder_dryrun as ladders
+import restore_ladder_state as restore
 
 _ORIG_NOW = bot._now_kst
 _ORIG_BLOCKED = bot._orders_blocked
@@ -1223,6 +1224,7 @@ def test_regular_session_body_is_limit_00():
             gb._post_bearer = fake_post
             result = bot._place("TEST", "NAIL", side, 42.0, 10, True, [0])
             assert result is True, (moment.isoformat(), mode, side)
+            assert bot._last_order_no == 1
             body = captured["body"]
             assert body["ahi_nmn_pr_tp_cd"] == "00", (
                 moment.isoformat(),
@@ -1387,6 +1389,448 @@ def test_reset_reject_still_places_exception():
         assert saved["reset_done"]["17"] == ""
 
 
+def _record(bucket, number=None):
+    def place(ticker, item, _counter):
+        bucket.append((ticker, item["side"], item["price"], item["qty"]))
+        if number is None:
+            return True
+        return {"ok": True, "orr_no": number}
+
+    return place
+
+
+def _nail_before_fill():
+    """Anchors before buy 10@33 filled: sells 39/42, buys 33/30."""
+    state = bot._fresh_state()
+    state["tickers"]["NAIL"] = {
+        "sell": _idx("NAIL", 39),
+        "buy": _idx("NAIL", 33),
+        "double_used": [_idx("NAIL", 20)],
+    }
+    return bot._clean_state(state)
+
+
+def _nail_lag_book():
+    """Inquiry after the kick: the new sell is visible, the new buy is not."""
+    return [
+        {"ticker": "NAIL", "side": "sell", "price": 42, "qty": 10},
+        {"ticker": "NAIL", "side": "sell", "price": 39, "qty": 10},
+        {"ticker": "NAIL", "side": "sell", "price": 36, "qty": 10},
+        {"ticker": "NAIL", "side": "buy", "price": 30, "qty": 10},
+    ]
+
+
+def _nail_fill():
+    return [
+        {
+            "ticker": "NAIL",
+            "side": "buy",
+            "idx": _idx("NAIL", 33),
+            "price": 33,
+            "key": "cd" * 32,
+            "filled_qty": 10,
+            "cancelled_qty": 0,
+        }
+    ]
+
+
+def _recent_buy(moment, price=28, qty=10, orr_no=None, slot="", day=None):
+    mark = {
+        "ticker": "NAIL",
+        "side": "buy",
+        "price": price,
+        "qty": qty,
+        "at": int(moment.timestamp()),
+        "slot": slot,
+        "day": day if day is not None else moment.strftime("%Y%m%d"),
+    }
+    if orr_no is not None:
+        mark["orr_no"] = orr_no
+    return mark
+
+
+def test_lagging_inquiry_does_not_duplicate_recent_place():
+    """The 2026-11-13 NAIL buy 10@28. A late inquiry must not send it again."""
+    _restore_guards()
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "NAIL"
+    os.environ.pop("ORDER_TYPE", None)
+    os.environ.pop("MAX_QTY_MULT", None)
+    moment = _kst(2026, 11, 13, 4, 26)
+    assert not bot._orders_blocked(moment)
+    state = _nail_before_fill()
+    used = list(state["tickers"]["NAIL"]["double_used"])
+    opens = _nail_lag_book()
+    fills = _nail_fill()
+    placed = []
+    code, out, world = _run(
+        "intraday", moment, state, opens, fills, _record(placed)
+    )
+    assert code == 0, out
+    assert "order type 00" in out
+    assert placed == [("NAIL", "buy", 28, 10)], placed
+    assert "NEEDS_REVIEW NAIL" not in out
+    remembered = world["saved"]["recent_orders"]
+    assert len(remembered) == 1
+    assert remembered[0]["ticker"] == "NAIL"
+    assert remembered[0]["side"] == "buy"
+    assert remembered[0]["price"] == 28
+    assert remembered[0]["qty"] == 10
+    assert remembered[0]["at"] == int(moment.timestamp())
+    assert world["saved"]["tickers"]["NAIL"]["double_used"] == used
+
+    stale = _nail_before_fill()
+    stale["recent_orders"] = [
+        _recent_buy(moment, orr_no=4328),
+        {
+            "ticker": "NAIL",
+            "side": "sell",
+            "price": 36,
+            "qty": 10,
+            "at": int(moment.timestamp()),
+            "slot": "",
+            "day": "20261113",
+            "orr_no": 4327,
+        },
+    ]
+    again = []
+    code, out, world = _run(
+        "intraday", moment, bot._clean_state(stale), opens, fills, _record(again)
+    )
+    assert code == 0, out
+    assert again == [], (again, out)
+    assert "NAIL resting buy 28 qty 10" in out
+    assert "would_place 0" in out or "NAIL would_place 0" in out
+    assert world["saved"]["tickers"]["NAIL"]["sell"] == _idx("NAIL", 36)
+    assert world["saved"]["tickers"]["NAIL"]["buy"] == _idx("NAIL", 30)
+    assert world["saved"]["tickers"]["NAIL"]["double_used"] == used
+    assert "cd" * 32 in world["saved"]["handled"]
+
+    fresh = bot._clean_state(stale)
+    fresh["tickers"]["NAIL"] = {
+        "sell": _idx("NAIL", 36),
+        "buy": _idx("NAIL", 30),
+        "double_used": used,
+    }
+    fresh["handled"] = ["cd" * 32]
+    held = []
+    code, out, world = _run(
+        "intraday", moment, bot._clean_state(fresh), opens, fills, _record(held)
+    )
+    assert code == 0, out
+    assert held == [], (held, out)
+    assert "NEEDS_REVIEW NAIL" not in out
+    assert world["saved"]["tickers"]["NAIL"]["double_used"] == used
+
+    expired = _nail_before_fill()
+    old = _recent_buy(moment)
+    old["at"] = int(moment.timestamp()) - bot._RECENT_GRACE - 1
+    expired["recent_orders"] = [old]
+    late = []
+    code, out, _world = _run(
+        "intraday", moment, bot._clean_state(expired), opens, fills, _record(late)
+    )
+    assert code == 0, out
+    assert late == [("NAIL", "buy", 28, 10)], late
+
+    shown = list(opens) + [
+        {"ticker": "NAIL", "side": "buy", "price": 28, "qty": 10, "orr_no": 4328}
+    ]
+    seen = []
+    code, out, world = _run(
+        "intraday",
+        moment,
+        bot._clean_state(stale),
+        shown,
+        fills,
+        _record(seen),
+    )
+    assert code == 0, out
+    assert seen == [], seen
+    assert world["saved"]["recent_orders"] == []
+
+
+def test_reset_keeps_same_slot_recent_orders():
+    """A reset rebuilds the book, except orders this slot already sent."""
+    _restore_guards()
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "NAIL"
+    os.environ.pop("ORDER_TYPE", None)
+    moment = _kst(2026, 11, 12, 10, 0)
+    assert bot._reset_slot(moment) == "09"
+    assert not bot._orders_blocked(moment)
+    state = bot._fresh_state()
+    state["tickers"]["NAIL"] = {
+        "sell": _idx("NAIL", 33),
+        "buy": _idx("NAIL", 28),
+        "double_used": [_idx("NAIL", 20)],
+    }
+    used = [_idx("NAIL", 20)]
+    state["recent_orders"] = [
+        _recent_buy(moment, slot="09", day="20261112", orr_no=77)
+    ]
+    placed = []
+    code, out, world = _run(
+        "reset", moment, bot._clean_state(state), [], [], _record(placed)
+    )
+    assert code == 0, out
+    assert ("NAIL", "buy", 28, 10) not in placed, placed
+    assert ("NAIL", "sell", 33, 10) in placed
+    assert ("NAIL", "sell", 36, 10) in placed
+    assert ("NAIL", "buy", 26, 10) in placed
+    assert "NAIL resting buy 28 qty 10" in out
+    assert world["saved"]["tickers"]["NAIL"]["double_used"] == used
+    assert any(item.get("orr_no") == 77 for item in world["saved"]["recent_orders"])
+
+    other = bot._clean_state(state)
+    other["recent_orders"] = [
+        _recent_buy(moment, slot="17", day="20261112", orr_no=77)
+    ]
+    placed = []
+    code, out, world = _run(
+        "reset", moment, other, [], [], _record(placed)
+    )
+    assert code == 0, out
+    assert ("NAIL", "buy", 28, 10) in placed, placed
+    assert world["saved"]["tickers"]["NAIL"]["double_used"] == used
+
+    stale = bot._clean_state(state)
+    aged = _recent_buy(moment, slot="09", day="20261112")
+    aged["at"] = int(moment.timestamp()) - bot._RECENT_GRACE - 1
+    stale["recent_orders"] = [aged]
+    placed = []
+    code, out, _world = _run("reset", moment, stale, [], [], _record(placed))
+    assert code == 0, out
+    assert ("NAIL", "buy", 28, 10) in placed, placed
+
+
+def test_cancel_dup_cancels_only_the_newest_extra():
+    _restore_guards()
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "NAIL,KORU,SOXL"
+    os.environ["CANCEL_DUP"] = "cancel-dup NAIL BUY 28 10"
+    os.environ.pop("ORDER_TYPE", None)
+    moment = _kst(2026, 11, 13, 4, 26)
+    state = _nail_before_fill()
+    state["recent_orders"] = [
+        _recent_buy(moment, orr_no=10),
+        _recent_buy(moment, orr_no=5),
+    ]
+    state = bot._clean_state(state)
+    used = list(state["tickers"]["NAIL"]["double_used"])
+    opens = [
+        {
+            "ticker": "NAIL",
+            "side": "buy",
+            "price": 28,
+            "qty": 10,
+            "orr_no": 10,
+            "orr_dt": "20261112",
+        },
+        {
+            "ticker": "NAIL",
+            "side": "buy",
+            "price": 28.0,
+            "qty": 10,
+            "orr_no": "5",
+            "orr_dt": "20261113",
+        },
+        {
+            "ticker": "NAIL",
+            "side": "buy",
+            "price": 28,
+            "qty": 10,
+            "orr_no": 4,
+            "orr_dt": "20261113",
+        },
+        {"ticker": "NAIL", "side": "sell", "price": 36, "qty": 10, "orr_no": 99},
+        {"ticker": "KORU", "side": "buy", "price": 28, "qty": 10, "orr_no": 100},
+        {"ticker": "NAIL", "side": "buy", "price": 30, "qty": 10, "orr_no": 101},
+        {"ticker": "NAIL", "side": "buy", "price": 28, "qty": 20, "orr_no": 102},
+    ]
+    cancelled = []
+
+    def cancel(ticker, order):
+        cancelled.append(
+            (
+                ticker,
+                order.get("side"),
+                order.get("price"),
+                order.get("qty"),
+                order.get("orr_no"),
+            )
+        )
+        return True
+
+    def save_state(data):
+        world["saved"] = json.loads(json.dumps(data))
+
+    world = {"saved": None}
+    actions = {
+        "place": lambda *_args: (_ for _ in ()).throw(AssertionError("placed")),
+        "cancel": cancel,
+        "exists": lambda *_args: False,
+        "confirm_clear": lambda *_args: True,
+        "exception_open": lambda: False,
+        "place_exception": lambda *_args: False,
+        "save_state": save_state,
+    }
+    bot._now_kst = lambda: moment
+    code, out = _capture(
+        lambda: bot.run(
+            "cancel-dup",
+            "workflow_dispatch",
+            moment,
+            _et_of(moment),
+            opens,
+            [],
+            state,
+            actions,
+        )
+    )
+    assert code == 0, out
+    assert cancelled == [("NAIL", "buy", 28.0, 10, "5")], cancelled
+    assert "cancel-dup cancelled NAIL buy 28 qty 10 orr_no 5" in out
+    assert "OK cancel-dup" in out
+    assert world["saved"]["tickers"]["NAIL"]["double_used"] == used
+    assert all(item.get("orr_no") != 5 for item in world["saved"]["recent_orders"])
+    assert any(item.get("orr_no") == 10 for item in world["saved"]["recent_orders"])
+
+    cancelled.clear()
+    one = [opens[0], opens[3]]
+    code, out = _capture(
+        lambda: bot.run(
+            "cancel-dup",
+            "workflow_dispatch",
+            moment,
+            _et_of(moment),
+            one,
+            [],
+            state,
+            actions,
+        )
+    )
+    assert code == 0, out
+    assert cancelled == []
+    assert "cancel-dup skip NAIL buy 28 qty 10 matches 1" in out
+
+    code, out = _capture(
+        lambda: bot.run(
+            "cancel-dup",
+            "workflow_dispatch",
+            moment,
+            _et_of(moment),
+            [opens[3]],
+            [],
+            state,
+            actions,
+        )
+    )
+    assert code == 0, out
+    assert cancelled == []
+    assert "matches 0" in out
+
+    guard = _kst(2026, 11, 13, 16, 30)
+    bot._now_kst = lambda: guard
+    code, out = _capture(
+        lambda: bot.run(
+            "cancel-dup",
+            "workflow_dispatch",
+            guard,
+            _et_of(guard),
+            opens,
+            [],
+            state,
+            actions,
+        )
+    )
+    assert code == 0, out
+    assert cancelled == []
+    assert "skip: time guard" in out
+
+    os.environ["CANCEL_DUP"] = "cancel-dup NAIL BUY 28"
+    bot._now_kst = lambda: moment
+    code, out = _capture(
+        lambda: bot.run(
+            "cancel-dup",
+            "workflow_dispatch",
+            moment,
+            _et_of(moment),
+            opens,
+            [],
+            state,
+            actions,
+        )
+    )
+    assert code == 0, out
+    assert cancelled == []
+    assert "cancel-dup skip parse" in out
+
+    os.environ["CANCEL_DUP"] = "cancel-dup NAIL BUY 28 10"
+    code, out = _capture(
+        lambda: bot.run(
+            "cancel-dup", "push", moment, _et_of(moment), opens, [], state, actions
+        )
+    )
+    assert code == 0, out
+    assert cancelled == []
+    assert "OK dry" in out
+
+    os.environ.pop("LIVE_TRADING", None)
+    code, out = _capture(
+        lambda: bot.run(
+            "cancel-dup",
+            "schedule",
+            moment,
+            _et_of(moment),
+            opens,
+            [],
+            state,
+            actions,
+        )
+    )
+    assert code == 0, out
+    assert cancelled == []
+    assert "OK dry" in out
+
+
+def test_prefer_newer_state_and_cancel_workflow():
+    assert restore.prefer_newer(None, None) == "none"
+    assert restore.prefer_newer({"saved_at": 1}, None) == "cache"
+    assert restore.prefer_newer(None, {"saved_at": 0}) == "artifact"
+    assert restore.prefer_newer({"saved_at": 0}, {"saved_at": 0}) == "cache"
+    assert restore.prefer_newer({"saved_at": 5}, {"saved_at": 9}) == "artifact"
+    assert restore.prefer_newer({"saved_at": 9}, {"saved_at": 5}) == "cache"
+    assert restore.prefer_newer({}, {"saved_at": 1}) == "artifact"
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    intra = open(
+        os.path.join(root, ".github/workflows/ladder-intraday.yml"), encoding="utf-8"
+    ).read()
+    reset = open(
+        os.path.join(root, ".github/workflows/ladder-reset.yml"), encoding="utf-8"
+    ).read()
+    cancel = open(
+        os.path.join(root, ".github/workflows/ladder-cancel-dup.yml"), encoding="utf-8"
+    ).read()
+    assert "startsWith(github.event.comment.body, 'kick')" in intra
+    assert "branches:" in intra
+    assert "- main" in intra
+    assert "branches:" in reset
+    assert "- main" in reset
+    assert "hashFiles('.ladder-state/state.json')" not in intra
+    assert "github.event.issue.number == 18" in cancel
+    assert "ladder-kick" in cancel
+    assert "github.repository_owner" in cancel
+    assert "startsWith(github.event.comment.body, 'cancel-dup')" in cancel
+    assert "pull_request" in cancel
+    assert "LADDER_MODE: cancel-dup" in cancel
+    assert "group: ladder-bot" in cancel
+    assert "workflow_dispatch:" not in cancel
+    assert "cron:" not in cancel
+    assert "on:\n  push:" not in cancel
+
+
 def main():
     try:
         test_session_table()
@@ -1406,12 +1850,17 @@ def main():
         test_regular_session_body_is_limit_00()
         test_regular_reject_does_not_block_other_tickers()
         test_reset_reject_still_places_exception()
+        test_lagging_inquiry_does_not_duplicate_recent_place()
+        test_reset_keeps_same_slot_recent_orders()
+        test_cancel_dup_cancels_only_the_newest_extra()
+        test_prefer_newer_state_and_cancel_workflow()
     finally:
         bot._now_kst = _ORIG_NOW
         bot._orders_blocked = _ORIG_BLOCKED
         gb._post_bearer = _ORIG_POST
         os.environ.pop("ORDER_TYPE", None)
         os.environ.pop("LADDER_MODE", None)
+        os.environ.pop("CANCEL_DUP", None)
     print("OK order type")
     return 0
 

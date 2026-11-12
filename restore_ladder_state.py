@@ -1,4 +1,8 @@
-"""Restore ladder state from the newest workflow artifact when cache missed.
+"""Restore ladder state from the newest workflow artifact when it is newer.
+
+Issue-comment runs cannot write the Actions cache, so a kick saves state
+only as an artifact. The next run may restore an older cache. This script
+keeps whichever copy has the later saved_at.
 
 Prints only OK cache, OK restore, or OK none. Does not print the file.
 """
@@ -14,6 +18,39 @@ _PATH = os.environ.get("LADDER_STATE_PATH", ".ladder-state/state.json")
 _NAME = "ladder-state"
 
 
+def _saved_at(data):
+    if not isinstance(data, dict):
+        return 0
+    raw = data.get("saved_at")
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return 0
+    return raw
+
+
+def prefer_newer(cache, artifact):
+    """Which copy to keep. The artifact wins only when it is strictly newer.
+
+    A missing saved_at is older than any positive one. Two copies with no
+    timestamp keep the cache, which is what a cache hit already restored.
+    """
+    if artifact is None:
+        return "cache" if cache is not None else "none"
+    if cache is None:
+        return "artifact"
+    if _saved_at(artifact) > _saved_at(cache):
+        return "artifact"
+    return "cache"
+
+
+def _read_state(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _get(url, token):
     request = Request(
         url,
@@ -27,16 +64,7 @@ def _get(url, token):
         return response.read()
 
 
-def main():
-    if os.path.isfile(_PATH):
-        print("OK cache")
-        return 0
-    token = os.environ.get("GITHUB_TOKEN", "")
-    repo = os.environ.get("GITHUB_REPOSITORY", "")
-    api = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
-    if not token or repo.count("/") != 1:
-        print("OK none")
-        return 0
+def _download(token, repo, api):
     try:
         payload = json.loads(
             _get(
@@ -45,8 +73,7 @@ def main():
             ).decode("utf-8")
         )
     except (HTTPError, URLError, ValueError, TimeoutError, OSError):
-        print("OK none")
-        return 0
+        return None
     chosen = None
     for artifact in payload.get("artifacts") or []:
         if not isinstance(artifact, dict):
@@ -57,8 +84,7 @@ def main():
         break
     download = chosen.get("archive_download_url") if chosen else ""
     if not isinstance(download, str) or not download:
-        print("OK none")
-        return 0
+        return None
     try:
         blob = _get(download, token)
         with zipfile.ZipFile(io.BytesIO(blob)) as archive:
@@ -68,13 +94,17 @@ def main():
                 if name.endswith("state.json") and not name.endswith("/")
             ]
             if not names:
-                print("OK none")
-                return 0
+                return None
             raw = archive.read(names[0])
-        json.loads(raw.decode("utf-8"))
+        data = json.loads(raw.decode("utf-8"))
     except (HTTPError, URLError, ValueError, TimeoutError, OSError, zipfile.BadZipFile):
-        print("OK none")
-        return 0
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data, raw
+
+
+def _write(raw):
     directory = os.path.dirname(_PATH)
     if directory:
         os.makedirs(directory, mode=0o700, exist_ok=True)
@@ -83,7 +113,26 @@ def main():
     with os.fdopen(fd, "wb") as handle:
         handle.write(raw)
     os.chmod(_PATH, 0o600)
-    print("OK restore")
+
+
+def main():
+    cache = _read_state(_PATH) if os.path.isfile(_PATH) else None
+    token = os.environ.get("GITHUB_TOKEN", "")
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    api = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
+    downloaded = None
+    if token and repo.count("/") == 1:
+        downloaded = _download(token, repo, api)
+    artifact = downloaded[0] if downloaded else None
+    choice = prefer_newer(cache, artifact)
+    if choice == "artifact" and downloaded is not None:
+        _write(downloaded[1])
+        print("OK restore")
+        return 0
+    if os.path.isfile(_PATH):
+        print("OK cache")
+        return 0
+    print("OK none")
     return 0
 
 
