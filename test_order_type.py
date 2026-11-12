@@ -1160,12 +1160,83 @@ def test_weekend_guard_follows_us_session():
 def test_dates_cover_previous_trading_day():
     _restore_guards()
     monday = _kst(2026, 10, 26, 12, 0)
-    assert bot._dates(monday) == ["20261026", "20261025", "20261023"]
-    assert bot._dates(_kst(2026, 11, 2, 10, 0)) == ["20261102", "20261101", "20261030"]
-    assert bot._dates(_kst(2026, 10, 27, 12, 0)) == ["20261027", "20261026"]
-    assert bot._dates(_kst(2026, 10, 31, 3, 0)) == ["20261031", "20261030"]
-    assert bot._dates(_kst(2026, 11, 1, 12, 0)) == ["20261101", "20261031", "20261030"]
+    # Monday still includes Friday. The open window is wider than that.
+    assert set(["20261026", "20261025", "20261023"]) <= set(bot._dates(monday))
+    assert set(["20261102", "20261101", "20261030"]) <= set(bot._dates(_kst(2026, 11, 2, 10, 0)))
+    assert set(["20261027", "20261026"]) <= set(bot._dates(_kst(2026, 10, 27, 12, 0)))
+    assert set(["20261031", "20261030"]) <= set(bot._dates(_kst(2026, 10, 31, 3, 0)))
+    assert set(["20261101", "20261031", "20261030"]) <= set(bot._dates(_kst(2026, 11, 1, 12, 0)))
     assert len(bot._dates(monday)) == len(set(bot._dates(monday)))
+    # 05:40 KST Friday is still Thursday in New York. Both dates are queried.
+    friday = _kst(2026, 11, 13, 5, 40)
+    both = set(bot._dates(friday))
+    assert "20261113" in both
+    assert "20261112" in both
+    fills = set(bot._fill_dates(friday))
+    assert fills == {"20261113", "20261112"}
+
+    nail = {
+        "iem_cd": "NAIL",
+        "fc_sec_trd_nat_cd": "200",
+        "oss_sby_dit_cd": "02",
+        "fc_orr_uit_pr": "28.0000",
+        "orr_qty": "10.0000",
+        "ny_cns_orr_qty": "",
+        "cns_qty": "0",
+        "can_qty": "0",
+        "oss_ato_orr_sts_cd": "3",
+        "orr_no": "55",
+        "orr_dt": "2026-11-13",
+    }
+    parsed = bot._parse_row(nail)
+    assert parsed["side"] == "buy"
+    assert parsed["qty"] == 10
+    assert abs(parsed["price"] - 28) < 0.001
+    assert parsed["orr_dt"] == "20261113"
+    assert bot._dup_match(
+        parsed, {"ticker": "NAIL", "side": "buy", "price": 28, "qty": 10}
+    )
+    zero_remaining = dict(nail)
+    zero_remaining["ny_cns_orr_qty"] = "0"
+    zero_remaining["orr_no"] = "56"
+    assert bot._parse_row(zero_remaining)["qty"] == 10
+    filled = dict(nail)
+    filled["ny_cns_orr_qty"] = "0"
+    filled["cns_qty"] = "10"
+    filled["orr_no"] = "57"
+    assert bot._parse_row(filled)["qty"] == 0
+    assert ladders._side({"oss_sby_dit_cd": "2"}) == "buy"
+    assert ladders._open_qty({"ny_cns_orr_qty": "10", "orr_qty": "10"}) == 10
+
+    calls = []
+
+    def pages(_url, body, _block):
+        calls.append(body["orr_dt"])
+        if body["orr_dt"] != "20261113":
+            return []
+        first = dict(nail)
+        second = dict(nail)
+        second["orr_no"] = "58"
+        second["fc_orr_uit_pr"] = 28
+        # The same order number on a second date must not become a second order.
+        echo = dict(nail)
+        echo["orr_dt"] = "20261112"
+        return [first, second, echo]
+
+    old_pages = bot._pages
+    bot._pages = pages
+    try:
+        rows = bot._inquiry("ACCT", friday, "open")
+    finally:
+        bot._pages = old_pages
+    assert "20261113" in calls
+    assert "20261112" in calls
+    assert len(rows) == 2, rows
+    assert {row["orr_no"] for row in rows} == {"55", "58"}
+    assert all(row["qty"] == 10 and row["side"] == "buy" for row in rows)
+    assert "ACCT" not in "".join(
+        "%s %s" % (day, count) for day, count in bot._last_open_inquiry["dates"]
+    )
 
     os.environ["LIVE_TRADING"] = "on"
     os.environ["LIVE_TICKERS"] = "NAIL"
@@ -1690,6 +1761,13 @@ def test_cancel_dup_cancels_only_the_newest_extra():
     )
     assert code == 0, out
     assert cancelled == [("NAIL", "buy", 28.0, 10, "5")], cancelled
+    assert "cancel-dup open NAIL buy 28 qty 10 orr_no 5 orr_dt 20261113" in out
+    assert "cancel-dup open NAIL buy 28 qty 10 orr_no 10 orr_dt 20261112" in out
+    assert "cancel-dup open NAIL buy 28 qty 10 orr_no 4 orr_dt 20261113" in out
+    assert "cancel-dup open NAIL buy 30 qty 10 orr_no 101" in out
+    assert "cancel-dup open NAIL sell 36 qty 10 orr_no 99" in out
+    assert "cancel-dup open KORU" not in out
+    assert out.count("cancel-dup cancelled") == 1
     assert "cancel-dup cancelled NAIL buy 28 qty 10 orr_no 5" in out
     assert "OK cancel-dup" in out
     assert world["saved"]["tickers"]["NAIL"]["double_used"] == used
