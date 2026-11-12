@@ -1971,6 +1971,9 @@ def test_workflows():
     assert "exception_filled=true;SOXL.double_used=72" in seed
     assert "dispatches" not in reset
     assert "at most 3 extra passes" in reset
+    assert "branches:" in reset
+    assert "- main" in intra
+    assert "startsWith(github.event.comment.body, 'kick')" in intra
 
 
 def _live_book():

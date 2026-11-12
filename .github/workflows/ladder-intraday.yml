@@ -21,6 +21,9 @@ on:
     # so those runs hit the time guard and exit.
     - cron: "*/5 0 * * 6"
   push:
+    # Feature-branch pushes must not place orders. main still does.
+    branches:
+      - main
     paths:
       - .github/workflows/ladder-intraday.yml
       - ladder_bot.py
@@ -71,8 +74,10 @@ jobs:
           restore-keys: |
             ladder-state-
 
+      # issue_comment runs cannot write the Actions cache (Cache mode: read).
+      # A kick's state is in the artifact. Prefer that file when it is newer
+      # than the cache, so the next schedule does not reload the pre-kick book.
       - name: Restore ladder state artifact
-        if: hashFiles('.ladder-state/state.json') == ''
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 restore_ladder_state.py

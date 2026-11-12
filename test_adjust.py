@@ -558,6 +558,41 @@ def test_adjust_skips_ineligible_exception():
     assert world["exceptions"] == []
 
 
+def test_adjust_does_not_replace_recent_order():
+    """A rung placed moments ago stays put when the inquiry omits it."""
+    before = _state()
+    used = list(before["tickers"]["SOXL"]["double_used"])
+    before["recent_orders"] = [
+        {
+            "ticker": "SOXL",
+            "side": "sell",
+            "price": 46,
+            "qty": 2,
+            "at": int(_PREMARKET.timestamp()),
+            "slot": "17",
+            "day": "20261109",
+            "orr_no": 46,
+        }
+    ]
+    code, out, world = _run(
+        bot._clean_state(before), _opens(), _PREMARKET, preview=False
+    )
+    assert code == 0, out
+    assert ("SOXL", "sell", 46, 2) not in world["placed"], world["placed"]
+    assert ("SOXL", "buy", 36, 4) in world["placed"]
+    assert "SOXL resting sell 46 qty 2" in out
+    assert sorted((ticker, price) for ticker, price, _number in world["cancelled"]) == [
+        ("SOXL", 42),
+        ("SOXL", 55),
+    ]
+    assert world["saved"]["tickers"]["SOXL"]["double_used"] == used
+    assert world["saved"]["tickers"]["NAIL"]["double_used"] == []
+    assert any(
+        item.get("ticker") == "SOXL" and item.get("side") == "buy" and item.get("price") == 36
+        for item in world["saved"]["recent_orders"]
+    )
+
+
 def test_workflow_file():
     root = os.path.dirname(os.path.abspath(__file__))
     text = open(
@@ -594,6 +629,7 @@ def main():
         test_adjust_places_missing_exception_once()
         test_koru_adjust_places_missing_exception()
         test_adjust_skips_ineligible_exception()
+        test_adjust_does_not_replace_recent_order()
         test_workflow_file()
         print("OK adjust")
     finally:

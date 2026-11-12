@@ -1,0 +1,80 @@
+name: ladder-cancel-dup
+
+on:
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: ladder-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  ladder-cancel-dup:
+    name: ladder-cancel-dup
+    # One owner comment on issue #18, which carries ladder-kick.
+    # The whole body is `cancel-dup NAIL BUY 28 10`. Any other comment
+    # skips this job before checkout, so no secret is read and no broker
+    # call is made. Editing a comment does not start a run.
+    if: >-
+      github.event_name == 'issue_comment' &&
+      !github.event.issue.pull_request &&
+      github.event.issue.number == 18 &&
+      contains(github.event.issue.labels.*.name, 'ladder-kick') &&
+      github.event.comment.user.login == github.repository_owner &&
+      startsWith(github.event.comment.body, 'cancel-dup')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Restore access token
+        uses: actions/cache@v4
+        with:
+          path: .nhplug-token
+          key: nhplug-token-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            nhplug-token-
+
+      - name: Restore ladder state
+        uses: actions/cache@v4
+        with:
+          path: .ladder-state
+          key: ladder-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ladder-state-
+
+      - name: Restore ladder state artifact
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 restore_ladder_state.py
+
+      - name: Cancel one duplicate order
+        env:
+          LADDER_MODE: cancel-dup
+          CANCEL_DUP: ${{ github.event.comment.body }}
+          LIVE_TRADING: ${{ vars.LIVE_TRADING }}
+          LIVE_TICKERS: ${{ vars.LIVE_TICKERS }}
+          MAX_QTY_MULT: ${{ vars.MAX_QTY_MULT }}
+          ORDER_TYPE: ${{ vars.ORDER_TYPE }}
+          NHPLUG_APP_KEY: ${{ secrets.NHPLUG_APP_KEY }}
+          NHPLUG_APP_SECRET: ${{ secrets.NHPLUG_APP_SECRET }}
+          NHPLUG_TOKEN_PATH: .nhplug-token/token.json
+          LADDER_STATE_PATH: .ladder-state/state.json
+        # Same clock as a scheduled intraday run, including the KST guards.
+        # The comment body is only the CANCEL_DUP env value, not shell text.
+        run: GITHUB_EVENT_NAME=schedule python3 ladder_bot.py
+
+      - name: Upload ladder state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ladder-state
+          path: .ladder-state/state.json
+          retention-days: 30
+          include-hidden-files: true
+          if-no-files-found: ignore
