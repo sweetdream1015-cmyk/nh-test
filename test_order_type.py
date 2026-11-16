@@ -1872,6 +1872,240 @@ def test_cancel_dup_cancels_only_the_newest_extra():
     assert "OK dry" in out
 
 
+def test_missed_reset_heals_and_comment_is_idempotent():
+    """A missed 10:00 KST cron is placed by the next intraday, once.
+
+    An owner comment runs that same reset. A second one, or the wrong
+    slot, sends nothing. A book that already has ladder orders is not
+    cancelled by the intraday heal.
+    """
+    _restore_guards()
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "NAIL"
+    os.environ.pop("ORDER_TYPE", None)
+    os.environ.pop("MAX_QTY_MULT", None)
+    os.environ.pop("RESET_COMMENT", None)
+    moment = _kst(2026, 11, 16, 10, 11)
+    today = "20261116"
+    sell = _idx("NAIL", 33)
+    buy = _idx("NAIL", 28)
+    wanted = bot._desired("NAIL", sell, buy, 1.0, [])
+    assert wanted
+
+    def _state():
+        state = bot._fresh_state()
+        state["tickers"]["NAIL"] = {"sell": sell, "buy": buy, "double_used": []}
+        state["exception_filled"] = True
+        state["exception_id"] = bot._EXCEPTION_ID
+        return bot._clean_state(state)
+
+    placed = []
+    cancelled = []
+
+    def place(ticker, item, _counter):
+        placed.append((ticker, item["side"], item["price"], item["qty"]))
+        return True
+
+    def cancel(ticker, order):
+        cancelled.append((ticker, order.get("side"), order.get("price")))
+        return True
+
+    def _go(mode, state, opens, event="workflow_dispatch"):
+        saved = {}
+
+        def save_state(data):
+            saved["data"] = json.loads(json.dumps(data))
+
+        actions = {
+            "place": place,
+            "cancel": cancel,
+            "exists": lambda *_args: False,
+            "confirm_clear": lambda *_args: True,
+            "exception_open": lambda: False,
+            "place_exception": lambda *_args: (_ for _ in ()).throw(
+                AssertionError("exception")
+            ),
+            "save_state": save_state,
+        }
+        bot._now_kst = lambda: moment
+        code, out = _capture(
+            lambda: bot.run(
+                mode, event, moment, _et_of(moment), opens, [], state, actions
+            )
+        )
+        return code, out, saved.get("data")
+
+    placed.clear()
+    code, out, saved = _go("intraday", _state(), [])
+    assert code == 0, out
+    assert "reset heal" in out
+    assert "order type 63" in out
+    assert len(placed) == len(wanted)
+    assert cancelled == []
+    assert saved["reset_done"]["09"] == today
+    assert saved["reset_tickers"]["09"]["NAIL"] == today
+
+    placed.clear()
+    code, out, _again = _go("intraday", saved, [])
+    assert code == 0, out
+    assert placed == []
+    assert "reset heal" not in out
+
+    placed.clear()
+    code, out, _skipped = _go("reset", saved, [])
+    assert code == 0, out
+    assert placed == []
+    assert "OK skip" in out
+
+    booked = [
+        {
+            "ticker": "NAIL",
+            "side": item["side"],
+            "price": item["price"],
+            "qty": item["qty"],
+        }
+        for item in wanted
+    ]
+    fresh = _state()
+    placed.clear()
+    cancelled.clear()
+    code, out, _kept = _go("intraday", fresh, booked)
+    assert code == 0, out
+    assert "reset heal" not in out
+    assert placed == []
+    assert cancelled == []
+
+    early = _kst(2026, 11, 3, 9, 30)
+    bot._now_kst = lambda: early
+    placed.clear()
+    code, out = _capture(
+        lambda: bot.run(
+            "intraday",
+            "workflow_dispatch",
+            early,
+            _et_of(early),
+            [],
+            [],
+            _state(),
+            {
+                "place": place,
+                "cancel": cancel,
+                "exists": lambda *_args: False,
+                "confirm_clear": lambda *_args: True,
+                "exception_open": lambda: False,
+                "place_exception": lambda *_args: False,
+                "save_state": lambda data: saved.update(data=data),
+            },
+        )
+    )
+    assert code == 0, out
+    assert "reset heal" in out
+    assert "skip: day session not open" in out
+    assert "order type" not in out
+    assert placed == []
+
+    os.environ["LIVE_TICKERS"] = "NAIL,KORU"
+    cont = _state()
+    cont["tickers"]["KORU"] = {
+        "sell": _idx("KORU", 7.9),
+        "buy": _idx("KORU", 6.6),
+        "double_used": [],
+    }
+    cont = bot._clean_state(cont)
+    cont["reset_tickers"]["09"]["NAIL"] = today
+    placed.clear()
+    cancelled.clear()
+    code, out, saved = _go(
+        "intraday",
+        cont,
+        [{"ticker": "NAIL", "side": "buy", "price": 28, "qty": 10, "orr_no": 1}],
+    )
+    assert code == 0, out
+    assert "reset heal" in out
+    assert placed
+    assert all(ticker == "KORU" for ticker, _side, _price, _qty in placed)
+    assert cancelled == []
+    assert saved["reset_tickers"]["09"]["NAIL"] == today
+    assert saved["reset_tickers"]["09"]["KORU"] == today
+
+    os.environ["LIVE_TICKERS"] = "NAIL"
+    os.environ["RESET_COMMENT"] = "reset day"
+    placed.clear()
+    cancelled.clear()
+    code, out, saved = _go("reset", _state(), [])
+    assert code == 0, out
+    assert "reset skip" not in out
+    assert "order type 63" in out
+    assert len(placed) == len(wanted)
+    assert cancelled == []
+    assert saved["reset_done"]["09"] == today
+    placed.clear()
+    code, out, _second = _go("reset", saved, [])
+    assert code == 0, out
+    assert placed == []
+    assert "OK skip" in out
+
+    os.environ["RESET_COMMENT"] = "reset day"
+    placed.clear()
+    evening = _kst(2026, 11, 2, 18, 0)
+    bot._now_kst = lambda: evening
+    code, out = _capture(
+        lambda: bot.run(
+            "reset",
+            "schedule",
+            evening,
+            _et_of(evening),
+            [],
+            [],
+            _state(),
+            {
+                "place": place,
+                "cancel": cancel,
+                "exists": lambda *_args: False,
+                "confirm_clear": lambda *_args: True,
+                "exception_open": lambda: False,
+                "place_exception": lambda *_args: False,
+                "save_state": lambda _data: None,
+            },
+        )
+    )
+    assert code == 0, out
+    assert "reset skip slot" in out
+    assert placed == []
+    assert "order type" not in out
+
+    os.environ["RESET_COMMENT"] = "reset the book"
+    code, out = _capture(
+        lambda: bot.run(
+            "reset",
+            "schedule",
+            moment,
+            _et_of(moment),
+            [],
+            [],
+            _state(),
+            {
+                "place": place,
+                "cancel": cancel,
+                "exists": lambda *_args: False,
+                "confirm_clear": lambda *_args: True,
+                "exception_open": lambda: False,
+                "place_exception": lambda *_args: False,
+                "save_state": lambda _data: None,
+            },
+        )
+    )
+    assert code == 0, out
+    assert "reset skip parse" in out
+    assert placed == []
+    assert bot._parse_reset_comment("reset") == ""
+    assert bot._parse_reset_comment("reset day\n") == "09"
+    assert bot._parse_reset_comment("reset premarket") == "17"
+    assert bot._parse_reset_comment("reset day extra") is None
+    os.environ.pop("RESET_COMMENT", None)
+    assert not bot._should_heal("push", moment, [], _state())
+
+
 def test_prefer_newer_state_and_cancel_workflow():
     assert restore.prefer_newer(None, None) == "none"
     assert restore.prefer_newer({"saved_at": 1}, None) == "cache"
@@ -1897,6 +2131,14 @@ def test_prefer_newer_state_and_cancel_workflow():
     assert "- main" in intra
     assert "branches:" in reset
     assert "- main" in reset
+    assert "issue_comment:" in reset
+    assert "github.event.issue.number == 18" in reset
+    assert "startsWith(github.event.comment.body, 'reset')" in reset
+    assert "ladder-skip-" in reset
+    assert "restore_ladder_state.py" in reset
+    assert "upload-artifact" in reset
+    assert "RESET_COMMENT:" in reset
+    assert "GITHUB_EVENT_NAME=schedule python3 ladder_bot.py" in reset
     assert "hashFiles('.ladder-state/state.json')" not in intra
     assert "github.event.issue.number == 18" in cancel
     assert "ladder-kick" in cancel
@@ -2071,6 +2313,7 @@ def main():
         test_lagging_inquiry_does_not_duplicate_recent_place()
         test_reset_keeps_same_slot_recent_orders()
         test_cancel_dup_cancels_only_the_newest_extra()
+        test_missed_reset_heals_and_comment_is_idempotent()
         test_prefer_newer_state_and_cancel_workflow()
         test_http_error_names_the_endpoint()
         test_invalid_cached_token_is_replaced()
@@ -2081,6 +2324,7 @@ def main():
         os.environ.pop("ORDER_TYPE", None)
         os.environ.pop("LADDER_MODE", None)
         os.environ.pop("CANCEL_DUP", None)
+        os.environ.pop("RESET_COMMENT", None)
     print("OK order type")
     return 0
 

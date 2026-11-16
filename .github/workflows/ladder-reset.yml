@@ -32,6 +32,8 @@ on:
     - cron: "0 1 * * 1-5"
     - cron: "2 1 * * 1-5"
     - cron: "4 1 * * 1-5"
+  issue_comment:
+    types: [created]
   push:
     # Feature-branch pushes must not place orders. main still does.
     branches:
@@ -42,7 +44,17 @@ on:
       - restore_ladder_state.py
 
 concurrency:
-  group: ladder-bot
+  # Schedule, dispatch, and push keep the trading lock. A comment joins
+  # it only when the body starts with reset. Any other comment still
+  # creates this run, and joining ladder-bot would cancel a queued
+  # ladder job. Those runs take a private group instead.
+  group: >-
+    ${{
+      (github.event_name != 'issue_comment'
+        || startsWith(github.event.comment.body, 'reset'))
+      && 'ladder-bot'
+      || format('ladder-skip-{0}', github.run_id)
+    }}
   cancel-in-progress: false
 
 permissions:
@@ -52,6 +64,17 @@ permissions:
 jobs:
   ladder-reset:
     name: ladder-reset
+    # schedule, workflow_dispatch, and push run as they do today. A comment
+    # runs only for the owner, on issue #18 (non-PR, label ladder-kick),
+    # when the new comment starts with reset. Any other comment skips this
+    # job before checkout, so no secret is read and no broker call is made.
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (!github.event.issue.pull_request &&
+      github.event.issue.number == 18 &&
+      contains(github.event.issue.labels.*.name, 'ladder-kick') &&
+      github.event.comment.user.login == github.repository_owner &&
+      startsWith(github.event.comment.body, 'reset'))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -74,6 +97,9 @@ jobs:
           restore-keys: |
             ladder-state-
 
+      # issue_comment runs cannot write the Actions cache (Cache mode: read).
+      # The reset's state is in the artifact. Prefer that file when it is
+      # newer than the cache, so the next run does not reload the pre-reset book.
       - name: Restore ladder state artifact
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -82,6 +108,7 @@ jobs:
       - name: Run ladder reset
         env:
           LADDER_MODE: reset
+          RESET_COMMENT: ${{ github.event_name == 'issue_comment' && github.event.comment.body || '' }}
           LIVE_TRADING: ${{ vars.LIVE_TRADING }}
           LIVE_TICKERS: ${{ vars.LIVE_TICKERS }}
           MAX_QTY_MULT: ${{ vars.MAX_QTY_MULT }}
@@ -90,7 +117,17 @@ jobs:
           NHPLUG_APP_SECRET: ${{ secrets.NHPLUG_APP_SECRET }}
           NHPLUG_TOKEN_PATH: .nhplug-token/token.json
           LADDER_STATE_PATH: .ladder-state/state.json
-        run: python3 ladder_bot.py
+        # ladder_bot places orders only when GITHUB_EVENT_NAME is schedule
+        # or workflow_dispatch. GitHub ignores a workflow env override of
+        # GITHUB_*, so a reset comment sets it on the process. That is the
+        # scheduled reset path, including the KST time guards and reset_done.
+        # The comment body is only the RESET_COMMENT env value, not shell text.
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "issue_comment" ]; then
+            GITHUB_EVENT_NAME=schedule python3 ladder_bot.py
+          else
+            python3 ladder_bot.py
+          fi
 
       - name: Upload ladder state
         if: always()
