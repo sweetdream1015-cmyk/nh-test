@@ -21,6 +21,18 @@ An owner comment on issue #18 whose body is
 `cancel-dup NAIL BUY 28 10` cancels one matching open order, and only
 when the inquiry shows two or more identical orders. It uses the same
 time guards and the same full-cancel call as adjust.
+An owner comment on that same issue whose body is `reset`, `reset day`,
+or `reset premarket` runs this reset for the slot the clock is in.
+`day` is the 09:10 slot and `premarket` is the 17:10 slot. A bare
+`reset` uses whichever of those is open. The slot's reset_done mark
+makes a second run the same day log OK skip and send nothing. The
+comment run saves state in the ladder-state artifact, because an
+issue comment cannot write the Actions cache.
+A scheduled intraday run whose slot is already open, outside the time
+guards, and not marked done places that reset itself when the ladder
+book is empty or an earlier pass of the slot already finished a ticker.
+That covers a cron GitHub never started. It does not cancel a book
+that already has ladder orders; those stay on the intraday path.
 Deferred work is retried in this process about 2 minutes later, at most
 3 extra passes, and not into a blocked window or out of the slot.
 Reset also keeps one SOXL buy of 200 shares at 37.5 until that order fills
@@ -1734,6 +1746,100 @@ def _remember(state, keys):
     state["handled"] = handled[-200:]
 
 
+def _ladder_book_empty(opens):
+    """True when no ladder order is open. The one-time SOXL buy does not count."""
+    if not isinstance(opens, list):
+        return True
+    for order in opens:
+        if not isinstance(order, dict):
+            continue
+        if order.get("ticker") not in ("NAIL", "KORU", "SOXL"):
+            continue
+        if order.get("side") not in ("buy", "sell"):
+            continue
+        if _exception_order(order):
+            continue
+        qty = order.get("qty", 0)
+        if isinstance(qty, bool) or not isinstance(qty, (int, float)):
+            continue
+        if qty > 0:
+            return False
+    return True
+
+
+def _parse_reset_comment(raw=None):
+    """`reset`, `reset day`, or `reset premarket`.
+
+    None when that is not the whole comment. An empty string means this
+    run is not a comment, so the clock picks the slot. `day` is slot 09
+    and `premarket` is slot 17.
+    """
+    if raw is None:
+        raw = os.environ.get("RESET_COMMENT", "")
+    if not isinstance(raw, str):
+        return None
+    text = raw.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return ""
+    if "\n" in text:
+        return None
+    parts = text.split()
+    if parts == ["reset"]:
+        return ""
+    if parts == ["reset", "day"]:
+        return "09"
+    if parts == ["reset", "premarket"]:
+        return "17"
+    return None
+
+
+def _reset_comment_block(now_kst):
+    """A skip line when this reset comment must not trade. Empty means go on."""
+    parsed = _parse_reset_comment()
+    if parsed is None:
+        return "reset skip parse"
+    if parsed == "":
+        return ""
+    if parsed != _reset_slot(now_kst):
+        return "reset skip slot"
+    return ""
+
+
+def _should_heal(event, now_kst, opens, state):
+    """True when intraday should run the reset for the open slot.
+
+    The cron for that slot did not mark reset_done. An empty ladder book
+    is the missed reset after the broker wipe. A ticker already marked
+    done today means an earlier pass still has deferred work, so this
+    pass continues as reset and does not cancel the finished ticker.
+    A book that already has ladder orders, with nothing done today, stays
+    on the intraday path.
+    """
+    if not _clocked(event) or not _live_flag() or not isinstance(state, dict):
+        return False
+    now_kst = _as_kst(now_kst)
+    # Stay out of an intraday run that was going to log OK skip. The 17:10
+    # slot cannot place until premarket, which is also when intraday opens.
+    if not _window_open("intraday", now_kst, now_kst.astimezone(ET)):
+        return False
+    slot = _reset_slot(now_kst)
+    if slot is None:
+        return False
+    today = now_kst.strftime("%Y%m%d")
+    done = state.get("reset_done")
+    if isinstance(done, dict) and done.get(slot) == today:
+        return False
+    if _ladder_book_empty(opens):
+        return True
+    raw = state.get("reset_tickers")
+    if not isinstance(raw, dict):
+        return False
+    slot_raw = raw.get(slot)
+    if not isinstance(slot_raw, dict):
+        return False
+    return today in slot_raw.values()
+
+
 def _clocked(event):
     """Cron and manual dispatch share the trading gates. Push never trades."""
     return event in ("schedule", "workflow_dispatch")
@@ -2448,6 +2554,14 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
 
     if _stop_for_guard():
         return 0
+    if mode == "intraday" and _should_heal(event, now_kst, opens, state):
+        print("reset heal")
+        mode = "reset"
+    if mode == "reset":
+        blocked = _reset_comment_block(now_kst)
+        if blocked:
+            print(blocked)
+            return 0
     if _clocked(event) and not _window_open(mode, now_kst, now_et):
         print("OK skip")
         return 0
@@ -2896,6 +3010,13 @@ def _main_once():
     if _orders_blocked(now_kst) and not (adjust and adjust["preview"]):
         print("skip: time guard")
         return 0, False
+    if mode == "reset":
+        # A comment that is not exactly reset / reset day / reset premarket,
+        # or that names the other slot, stops before any broker call.
+        blocked = _reset_comment_block(now_kst)
+        if blocked:
+            print(blocked)
+            return 0, False
     if _clocked(event) and mode == "reset":
         slot = _reset_slot(now_kst)
         if slot is None:

@@ -1963,7 +1963,9 @@ def test_workflows():
     assert '- cron: "*/5 8-22 * * 1-5"' in intra
     assert '- cron: "*/5 0 * * 6"' in intra
     assert '- cron: "*/5 * * * 1-5"' not in intra
-    assert "group: ladder-bot" in reset
+    assert "'ladder-bot'" in reset
+    assert "ladder-skip-" in reset
+    assert "startsWith(github.event.comment.body, 'reset')" in reset
     assert "group: ladder-bot" in seed
     assert "SEED_FORCE:" in seed
     assert "seed_flags:" in seed

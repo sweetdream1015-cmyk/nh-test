@@ -18,3 +18,23 @@ cancel-dup NAIL BUY 28 10
 ```
 
 Ticker, side, price, and quantity, in that order. The run cancels one matching open order only when the broker inquiry shows two or more identical orders. Fewer than two cancels nothing. The log lists every open order for that ticker (side, price, quantity, order number, order date) before it decides. It uses the same KST time guards and the same full cancel as `ladder-adjust`, and it cancels nothing else. The order it cancels is the newest match (later order date, then higher order number).
+
+## Reset the current slot
+
+On issue **#18**, from the repository owner account, post a new comment whose whole body is one of:
+
+```
+reset
+```
+
+```
+reset day
+```
+
+```
+reset premarket
+```
+
+`reset` runs `ladder-reset` for whichever slot the clock is in. `reset day` is the 09:10 KST slot (order type 63 once the US after-hours book has closed). `reset premarket` is the 17:10 KST slot (order type 61 once US premarket is open). The other slot logs `reset skip slot` and places nothing. A slot already marked done today logs `OK skip` and places nothing. The KST time guards still apply. The run queues behind any ladder job already in progress. Editing an existing comment does not start a run.
+
+If the scheduled reset never starts, the next `ladder-intraday` run after the slot opens places that same reset when the ladder book is empty. It does not cancel orders that are already open.
