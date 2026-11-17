@@ -1675,6 +1675,82 @@ def test_reset_keeps_same_slot_recent_orders():
     assert ("NAIL", "buy", 28, 10) in placed, placed
 
 
+def test_last_wipe_follows_us_eastern_close():
+    """The broker cancel-all is 20:00 ET: 10:00 KST in winter, 09:00 in DST."""
+    winter = _kst(2026, 11, 17, 10, 8)
+    assert bot._last_wipe(winter) == int(_kst(2026, 11, 17, 10, 0).timestamp())
+    before = _kst(2026, 11, 17, 9, 59)
+    assert bot._last_wipe(before) == int(_kst(2026, 11, 16, 10, 0).timestamp())
+    summer = _kst(2026, 7, 15, 9, 30)
+    assert bot._last_wipe(summer) == int(_kst(2026, 7, 15, 9, 0).timestamp())
+    early = _kst(2026, 7, 15, 8, 59)
+    assert bot._last_wipe(early) == int(_kst(2026, 7, 14, 9, 0).timestamp())
+
+
+def test_reset_drops_places_from_before_the_wipe():
+    """2026-11-17: a 09:34 KST place was wiped at 10:00. The 10:08 reset
+    must place that rung again instead of logging it as resting."""
+    _restore_guards()
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "NAIL"
+    os.environ.pop("ORDER_TYPE", None)
+    moment = _kst(2026, 11, 17, 10, 8)
+    assert bot._reset_slot(moment) == "09"
+    assert not bot._orders_blocked(moment)
+    state = bot._fresh_state()
+    state["tickers"]["NAIL"] = {
+        "sell": _idx("NAIL", 33),
+        "buy": _idx("NAIL", 28),
+        "double_used": [_idx("NAIL", 20)],
+    }
+    used = [_idx("NAIL", 20)]
+    wiped = _recent_buy(
+        _kst(2026, 11, 17, 9, 34), slot="09", day="20261117", orr_no=91
+    )
+    state["recent_orders"] = [wiped]
+    placed = []
+    code, out, world = _run(
+        "reset", moment, bot._clean_state(state), [], [], _record(placed)
+    )
+    assert code == 0, out
+    assert ("NAIL", "buy", 28, 10) in placed, (placed, out)
+    assert placed.count(("NAIL", "buy", 28, 10)) == 1, placed
+    assert "resting" not in out, out
+    assert world["saved"]["tickers"]["NAIL"]["double_used"] == used
+    assert not any(
+        item.get("orr_no") == 91 for item in world["saved"]["recent_orders"]
+    )
+
+    fresh = bot._clean_state(state)
+    fresh["recent_orders"] = [
+        _recent_buy(_kst(2026, 11, 17, 10, 2), slot="09", day="20261117", orr_no=92)
+    ]
+    placed = []
+    code, out, _world = _run("reset", moment, fresh, [], [], _record(placed))
+    assert code == 0, out
+    assert ("NAIL", "buy", 28, 10) not in placed, placed
+    assert "NAIL resting buy 28 qty 10" in out
+
+    summer = _kst(2026, 7, 15, 10, 8)
+    kept = bot._clean_state(state)
+    kept["recent_orders"] = [
+        _recent_buy(_kst(2026, 7, 15, 9, 34), slot="09", day="20260715", orr_no=93)
+    ]
+    placed = []
+    code, out, _world = _run("reset", summer, kept, [], [], _record(placed))
+    assert code == 0, out
+    assert ("NAIL", "buy", 28, 10) not in placed, placed
+
+
+def test_intraday_ignores_places_from_before_the_wipe():
+    old = _recent_buy(_kst(2026, 11, 17, 9, 34), slot="09", day="20261117")
+    new = _recent_buy(_kst(2026, 11, 17, 10, 5), price=26, slot="09", day="20261117")
+    state = {"recent_orders": [old, new]}
+    moment = _kst(2026, 11, 17, 10, 30)
+    hidden = bot._prepare_recent(state, [], moment, "intraday", "09", "20261117")
+    assert [item["price"] for item in hidden] == [26], hidden
+
+
 def test_cancel_dup_cancels_only_the_newest_extra():
     _restore_guards()
     os.environ["LIVE_TRADING"] = "on"
@@ -2312,6 +2388,9 @@ def main():
         test_reset_reject_still_places_exception()
         test_lagging_inquiry_does_not_duplicate_recent_place()
         test_reset_keeps_same_slot_recent_orders()
+        test_last_wipe_follows_us_eastern_close()
+        test_reset_drops_places_from_before_the_wipe()
+        test_intraday_ignores_places_from_before_the_wipe()
         test_cancel_dup_cancels_only_the_newest_extra()
         test_missed_reset_heals_and_comment_is_idempotent()
         test_prefer_newer_state_and_cancel_workflow()

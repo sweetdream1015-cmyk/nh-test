@@ -1954,8 +1954,26 @@ def _px(value):
     return "%s" % (value,)
 
 
+def _last_wipe(now):
+    """Latest broker cancel-all at or before `now`, as a Unix time.
+
+    The broker drops every open order when the US session closes at
+    20:00 US Eastern. That is 10:00 KST in US standard time and 09:00 KST
+    in US daylight time, so it follows the ET clock, not a fixed KST hour.
+    """
+    et = now.astimezone(ET)
+    day = et.date() if et.hour >= 20 else et.date() - timedelta(days=1)
+    edge = datetime(day.year, day.month, day.day, 20, 0, tzinfo=ET)
+    return int(edge.timestamp())
+
+
 def _recent_alive(orders, now):
-    cutoff = int(now.timestamp()) - _RECENT_GRACE
+    """Places still inside the grace window and placed after the last wipe.
+
+    A place from before the broker's cancel-all is gone, whatever the
+    grace window says, so it must never count as resting.
+    """
+    cutoff = max(int(now.timestamp()) - _RECENT_GRACE, _last_wipe(now))
     return [item for item in orders if item.get("at", 0) >= cutoff]
 
 
