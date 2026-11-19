@@ -21,7 +21,7 @@ on:
     # 18:00, 18:02, 18:04 KST = 09:00, 09:02, 09:04 UTC.
     # During daylight time the 17:10 reset already finished, so these skip.
     # Deferred tickers are retried by ladder_bot.py in this job, about 2
-    # minutes apart, at most 3 extra passes, and not across the KST time
+    # minutes apart, at most 3 extra passes, and not across the time
     # guard. These crons stay as a backstop. The job does not start another
     # workflow run.
     - cron: "0 9 * * 1-5"
@@ -120,7 +120,7 @@ jobs:
         # ladder_bot places orders only when GITHUB_EVENT_NAME is schedule
         # or workflow_dispatch. GitHub ignores a workflow env override of
         # GITHUB_*, so a reset comment sets it on the process. That is the
-        # scheduled reset path, including the KST time guards and reset_done.
+        # scheduled reset path, including the time guards and reset_done.
         # The comment body is only the RESET_COMMENT env value, not shell text.
         run: |
           if [ "$GITHUB_EVENT_NAME" = "issue_comment" ]; then

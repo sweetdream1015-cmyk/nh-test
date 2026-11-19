@@ -7,7 +7,7 @@ The schedule trigger can lag by about an hour. An owner comment starts one `ladd
 1. Create one issue titled `ladder-kick` and add the label `ladder-kick`. The workflow does not create the issue or the label.
 2. On that issue, from the repository owner account, post a new comment whose body starts with `kick`.
 
-That comment starts `ladder-intraday` once, on the same intraday path as the schedule (`LADDER_MODE=intraday`), including the KST time guards. The run queues behind any ladder job already in progress. Editing an existing comment does not start a run. Any other comment skips the job: no secret is used and no broker call is made.
+That comment starts `ladder-intraday` once, on the same intraday path as the schedule (`LADDER_MODE=intraday`), including the time guards. The guards follow US Eastern time: 18:00–19:10 and 02:00–03:10 ET, which is 08:00–09:10 and 16:00–17:10 KST in standard time and an hour earlier in KST during US daylight time. The run queues behind any ladder job already in progress. Editing an existing comment does not start a run. Any other comment skips the job: no secret is used and no broker call is made.
 
 ## Cancel one duplicate
 
@@ -17,7 +17,7 @@ On issue **#18** (the `ladder-kick` issue), from the repository owner account, p
 cancel-dup NAIL BUY 28 10
 ```
 
-Ticker, side, price, and quantity, in that order. The run cancels one matching open order only when the broker inquiry shows two or more identical orders. Fewer than two cancels nothing. The log lists every open order for that ticker (side, price, quantity, order number, order date) before it decides. It uses the same KST time guards and the same full cancel as `ladder-adjust`, and it cancels nothing else. The order it cancels is the newest match (later order date, then higher order number).
+Ticker, side, price, and quantity, in that order. The run cancels one matching open order only when the broker inquiry shows two or more identical orders. Fewer than two cancels nothing. The log lists every open order for that ticker (side, price, quantity, order number, order date) before it decides. It uses the same time guards and the same full cancel as `ladder-adjust`, and it cancels nothing else. The order it cancels is the newest match (later order date, then higher order number).
 
 ## Reset the current slot
 
@@ -35,6 +35,6 @@ reset day
 reset premarket
 ```
 
-`reset` runs `ladder-reset` for whichever slot the clock is in. `reset day` is the 09:10 KST slot (order type 63 once the US after-hours book has closed). `reset premarket` is the 17:10 KST slot (order type 61 once US premarket is open). The other slot logs `reset skip slot` and places nothing. A slot already marked done today logs `OK skip` and places nothing. The KST time guards still apply. The run queues behind any ladder job already in progress. Editing an existing comment does not start a run.
+`reset` runs `ladder-reset` for whichever slot the clock is in. `reset day` is the 09:10 KST slot (order type 63 once the US after-hours book has closed). `reset premarket` is the 17:10 KST slot (order type 61 once US premarket is open). The other slot logs `reset skip slot` and places nothing. A slot already marked done today logs `OK skip` and places nothing. The time guards still apply. The run queues behind any ladder job already in progress. Editing an existing comment does not start a run.
 
 If the scheduled reset never starts, the next `ladder-intraday` run after the slot opens places that same reset when the ladder book is empty. It does not cancel orders that are already open.

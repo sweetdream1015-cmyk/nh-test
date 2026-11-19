@@ -4,21 +4,25 @@ on:
   workflow_dispatch:
   schedule:
     # Weekday polls, every 5 minutes UTC. The two ranges do not overlap.
-    # KST day session 09:00-15:59 = 00:00-06:59 UTC. 09:00-09:10 is the
-    # broker wipe, so those runs log the time guard and exit. Daylight
-    # time from 09:10 is order type 63. Standard time stays on US
-    # after-hours (62) until 10:00 KST (01:00 UTC), then 63. The existing
-    # 16:00-17:10 KST guard is 07:00-08:10 UTC, so this poll stops at 15:59.
-    - cron: "*/5 0-6 * * 1-5"
-    # US session 17:10-07:59 KST = 08:10-22:59 UTC. 08:00-09:10 KST
-    # (23:00-00:10 UTC) is the morning wipe guard and is not polled.
-    # Friday 15:00-22:59 UTC is Saturday 00:00-07:59 KST, still Friday
-    # in New York, so this range covers that morning too.
-    - cron: "*/5 8-22 * * 1-5"
+    # GitHub cron is UTC, so each range covers both US standard time and
+    # daylight time. The order guard is 18:00-19:10 ET and 02:00-03:10 ET
+    # and skips the runs that land inside it.
+    # 09:00-16:59 KST = 00:00-07:59 UTC. Daylight time: the evening guard
+    # is 15:00-16:10 KST, so 16:10-16:59 is the KST day session (63).
+    # Standard time: 16:00-16:59 is inside 16:00-17:10 KST and exits.
+    # Standard time stays on US after-hours (62) until 10:00 KST, then 63.
+    # Daylight time is 63 from 09:10, after the 09:00 KST cancel-all.
+    - cron: "*/5 0-7 * * 1-5"
+    # US session 17:00-08:59 KST = 08:00-23:59 UTC. Daylight time: the
+    # morning guard is 07:00-08:10 KST, so 08:10-08:59 is still US
+    # after-hours and is polled. Standard time: 08:00-08:59 is inside
+    # 08:00-09:10 KST and exits. Friday 15:00-23:59 UTC is Saturday
+    # 00:00-08:59 KST, still Friday in New York.
+    - cron: "*/5 8-23 * * 1-5"
     # Standard time: Friday after-hours runs until 10:00 KST Saturday
     # (20:00 EST). 09:10-09:55 KST is 00:10-00:55 UTC Saturday. 09:00-09:10
-    # is the wipe guard. Daylight time has already ended at 09:00 KST,
-    # so those runs hit the time guard and exit.
+    # is inside the morning guard. Daylight time has already ended at
+    # 09:00 KST, so those runs hit the time guard and exit.
     - cron: "*/5 0 * * 6"
   push:
     # Feature-branch pushes must not place orders. main still does.
@@ -105,7 +109,7 @@ jobs:
         # ladder_bot places orders only when GITHUB_EVENT_NAME is schedule
         # or workflow_dispatch. GitHub ignores a workflow env override of
         # GITHUB_*, so a kick sets it on the process. That is the scheduled
-        # intraday path, including the KST time guards. schedule,
+        # intraday path, including the time guards. schedule,
         # workflow_dispatch, and push keep the event name GitHub set.
         run: |
           if [ "$GITHUB_EVENT_NAME" = "issue_comment" ]; then

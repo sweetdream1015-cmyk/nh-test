@@ -72,7 +72,7 @@ jobs:
           NHPLUG_APP_SECRET: ${{ secrets.NHPLUG_APP_SECRET }}
           NHPLUG_TOKEN_PATH: .nhplug-token/token.json
           LADDER_STATE_PATH: .ladder-state/state.json
-        # Same clock as a scheduled intraday run, including the KST guards.
+        # Same clock as a scheduled intraday run, including the time guards.
         # The comment body is only the CANCEL_DUP env value, not shell text.
         run: GITHUB_EVENT_NAME=schedule python3 ladder_bot.py
 

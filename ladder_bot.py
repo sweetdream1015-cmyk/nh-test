@@ -1,9 +1,14 @@
 """Order-capable ladder bot. Live trading is off unless LIVE_TRADING is exactly on.
 
-No new order is sent in the KST pre-reset windows 08:00-09:10 and
-16:00-17:10. Saturday KST stays open only through the end of Friday's
-US session (20:00 ET). Sunday, and Monday before 09:10 KST, are closed.
-Those runs log "skip: time guard" and exit.
+No new order is sent in the pre-reset guards. Each one is an
+America/New_York window: 60 minutes before an anchor through 10
+minutes after it. The anchors are 19:00 ET (one hour before the
+20:00 after-hours close) and 03:00 ET (one hour before the 04:00
+premarket open), so the windows are 18:00-19:10 ET and 02:00-03:10 ET.
+US standard time is 08:00-09:10 and 16:00-17:10 KST. US daylight time
+is 07:00-08:10 and 15:00-16:10 KST. Saturday KST stays open only
+through the end of Friday's US session (20:00 ET). Sunday, and Monday
+before 09:10 KST, are closed. Those runs log "skip: time guard" and exit.
 Intraday follow-up runs in the US session and in the KST day session.
 A live reset places whole tickers only, at most 6 new orders. A ticker
 that does not fit is left uncancelled and logged DEFERRED for a later run.
@@ -53,8 +58,8 @@ the same checks, including while another ticker is the one being moved.
 An open exception is left alone. Other tickers' ladders are left alone.
 Adjust may send orders in the same US and KST sessions as intraday.
 Reset applies an unhandled confirmed fill at the current anchor before
-it restores the book, so a fill during 16:00-17:10 is not quoted again
-after the wipe.
+it restores the book, so a fill during a pre-reset guard is not quoted
+again after the wipe.
 Inquiry plus, when live and allowed, limit buy, limit sell, and full cancel.
 The modify endpoint is never called. Prints counts, OK/ERROR codes, and
 on a broker reject the ticker, side, price, and redacted rsp_cd/rsp_msg.
@@ -101,6 +106,15 @@ import ladder_dryrun as ladders
 
 KST = ZoneInfo("Asia/Seoul")
 ET = ZoneInfo("America/New_York")
+# Pre-reset quiet windows on the America/New_York clock. Each window is
+# 60 minutes before the anchor through 10 minutes after it (end exclusive).
+# 19:00 ET is one hour before the 20:00 after-hours close, the broker's
+# daily cancel-all. 03:00 ET is one hour before the 04:00 premarket open.
+# Standard time, KST = ET+14h: 08:00-09:10 and 16:00-17:10.
+# Daylight time, KST = ET+13h: 07:00-08:10 and 15:00-16:10.
+_GUARD_BEFORE = 60
+_GUARD_AFTER = 10
+_GUARD_ANCHORS_ET = ((19, 0), (3, 0))
 BUY_URL = gb.LIVE + "/gbstock/order/v1/buy"
 SELL_URL = gb.LIVE + "/gbstock/order/v1/sell"
 CANCEL_URL = gb.LIVE + "/gbstock/order/v1/cancel"
@@ -278,7 +292,8 @@ def _off_session_day(now_kst):
     Saturday KST is still Friday in New York until 20:00 ET, so that
     morning follows the same extended-hours clock as the order type.
     The rest of Saturday, all of Sunday, and Monday before the 09:10
-    KST day session are closed.
+    KST day session are closed. That Monday open is the Korean day
+    session, so it stays on the KST clock through US daylight time.
     """
     weekday = now_kst.weekday()
     if weekday == 5:
@@ -291,36 +306,56 @@ def _off_session_day(now_kst):
     return False
 
 
+def _in_order_guard(now):
+    """True inside a pre-reset quiet window on the US Eastern clock.
+
+    Local ET minutes, so the same window is an hour earlier in KST
+    while the US is on daylight time. The end minute is exclusive.
+    A spring-forward gap simply has no 02:00-02:59 ET; the 03:00-03:09
+    portion still matches. The fold hour on a fall-back day is 01:00 ET
+    and is outside this window.
+    """
+    minutes = _minutes(_as_et(now))
+    for hour, minute in _GUARD_ANCHORS_ET:
+        anchor = hour * 60 + minute
+        if anchor - _GUARD_BEFORE <= minutes < anchor + _GUARD_AFTER:
+            return True
+    return False
+
+
 def _orders_blocked(now):
     """True when a new order must not be sent.
 
-    08:00 inclusive to 09:10 exclusive, and 16:00 inclusive to 17:10
-    exclusive, including Saturday morning while Friday's US session is
-    still open. The broker wipes resting orders at 09:00 and 17:00, so
-    those spans are too late to place and too early for the 09:10 and
-    17:10 resets. 09:10 and 17:10 themselves are allowed.
+    Quiet windows are America/New_York local time, 18:00 inclusive to
+    19:10 exclusive and 02:00 inclusive to 03:10 exclusive. That is 60
+    minutes before 19:00 ET through 10 minutes after it, and the same
+    offsets around 03:00 ET. 19:00 is one hour before the 20:00
+    after-hours close (the broker cancel-all). 03:00 is one hour before
+    the 04:00 premarket open. Intraday follow-ups in those spans are
+    left for the next reset. The end minute itself is allowed.
+
+    US standard time is 08:00-09:10 and 16:00-17:10 KST. US daylight
+    time is 07:00-08:10 and 15:00-16:10 KST. Saturday morning is
+    included while Friday's US session is still open, because that
+    morning is still Friday evening in New York.
 
     After Friday's US session ends at 20:00 ET, the rest of Saturday
     KST, all of Sunday, and Monday before 09:10 KST are blocked even
-    outside those wipe windows.
+    outside those windows.
     """
     now_kst = _as_kst(now)
     if _off_session_day(now_kst):
         return True
-    minutes = _minutes(now_kst)
-    if 8 * 60 <= minutes < 9 * 60 + 10:
-        return True
-    if 16 * 60 <= minutes < 17 * 60 + 10:
-        return True
-    return False
+    return _in_order_guard(now_kst)
 
 
 def _reset_slot(now):
-    """KST reset slot after the broker wipe. None means outside the window.
+    """KST reset slot. None means outside the window.
 
     09:10 inclusive through 16:00 exclusive, then 17:10 through midnight.
-    16:00-17:10 is not a slot: orders placed then would be wiped at 17:00
-    or would land before the 17:10 reset.
+    The bounds stay on the KST clock. The reset crons are fixed KST
+    times, and the saved slot names are "09" and "17". The pre-reset
+    order guard is separate and follows US Eastern time.
     """
     if now.weekday() >= 5:
         return None
@@ -349,7 +384,7 @@ def _window_open(mode, now_kst, now_et):
     Reset stays on the post-wipe KST slots. Intraday follows fills during
     the US extended session and during the KST day session (09:10-16:59).
     Order type is 63 there, or 62 while US after-hours is still open.
-    The 08:00-09:10 and 16:00-17:10 time guard is separate and still wins.
+    The US Eastern pre-reset guard is separate and still wins.
     """
     if mode == "reset":
         return _in_reset_window(now_kst)
@@ -1676,10 +1711,11 @@ def _step_plan(ticker, pair, sell_missing, buy_missing, mult):
 def _anchor_fill_step(ticker, pair, fills, handled, mult):
     """Step a reset pair when an unhandled fill is on the current anchor.
 
-    The 16:00-17:10 window does not poll, and the 17:00 wipe then leaves
-    an empty book. Restoring the saved pair would quote the filled rung
-    again. A fill the step rules accept moves the pair first. Anything
-    else leaves the saved pair, so an odd fill cannot block the reset.
+    The pre-reset guard does not place a new quote, and the broker
+    cancel-all then leaves an empty book. Restoring the saved pair
+    would quote the filled rung again. A fill the step rules accept
+    moves the pair first. Anything else leaves the saved pair, so an
+    odd fill cannot block the reset.
     """
     core = (
         ("sell", pair["sell"]),
