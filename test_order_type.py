@@ -494,9 +494,11 @@ def test_day_session_window():
     os.environ["LIVE_TRADING"] = "on"
     os.environ["LIVE_TICKERS"] = "NAIL"
     noon = _kst(2026, 10, 29, 12, 0)
-    last = _kst(2026, 10, 29, 15, 59)
-    late = _kst(2026, 10, 29, 16, 30)
-    morning_guard = _kst(2026, 10, 29, 8, 30)
+    # Daylight time: the evening guard starts at 15:00 KST, not 16:00.
+    last = _kst(2026, 10, 29, 14, 59)
+    late = _kst(2026, 10, 29, 15, 30)
+    morning_guard = _kst(2026, 10, 29, 7, 30)
+    # 09:05 KST is 20:05 EDT, after the close and outside the ET guard.
     wipe = _kst(2026, 10, 29, 9, 5)
     weekend = _kst(2026, 10, 31, 12, 0)
     est_overlap = _kst(2026, 11, 3, 9, 30)
@@ -508,7 +510,7 @@ def test_day_session_window():
         (last, True, False),
         (late, True, True),
         (morning_guard, True, True),
-        (wipe, False, True),
+        (wipe, False, False),
         (weekend, False, True),
         (est_overlap, True, False),
         (est_day, True, False),
@@ -525,6 +527,10 @@ def test_day_session_window():
     assert not bot._window_open("intraday", est_gap, _et_of(est_gap))
     assert bot._kst_day(late)
     assert bot._order_type(late, _et_of(late), "intraday") == "63"
+    after_guard = _kst(2026, 10, 29, 16, 30)
+    assert bot._kst_day(after_guard)
+    assert not bot._orders_blocked(after_guard)
+    assert bot._order_type(after_guard, _et_of(after_guard), "intraday") == "63"
 
     state = bot._fresh_state()
     state["exception_filled"] = True
@@ -536,7 +542,7 @@ def test_day_session_window():
     state = bot._clean_state(state)
     for moment, text in (
         (morning_guard, "skip: time guard"),
-        (wipe, "skip: time guard"),
+        (wipe, "OK skip"),
         (late, "skip: time guard"),
         (weekend, "skip: time guard"),
     ):
@@ -610,7 +616,7 @@ def test_day_session_fill_followup():
     ]
     moments = (
         (_kst(2026, 10, 29, 12, 0), "63"),
-        (_kst(2026, 10, 29, 15, 59), "63"),
+        (_kst(2026, 10, 29, 14, 59), "63"),
         (_kst(2026, 11, 3, 10, 0), "63"),
         (_kst(2026, 11, 3, 9, 30), "62"),
     )
@@ -1055,8 +1061,8 @@ def _workflow_crons(name):
 
 def test_day_session_crons():
     crons = _workflow_crons("ladder-intraday.yml")
-    assert "*/5 0-6 * * 1-5" in crons
-    assert "*/5 8-22 * * 1-5" in crons
+    assert "*/5 0-7 * * 1-5" in crons
+    assert "*/5 8-23 * * 1-5" in crons
     assert "*/5 0 * * 6" in crons
     assert "*/5 * * * 1-5" not in crons
     # Monday/Wednesday/Friday in daylight time and in standard time,
@@ -1089,17 +1095,23 @@ def test_day_session_crons():
 def test_weekend_guard_follows_us_session():
     _restore_guards()
     # Saturday 31 Oct 2026 is still daylight time. Friday's session ends 09:00 KST.
+    # The morning guard is 18:00-19:10 EDT, which is 07:00-08:10 KST.
     sat = _kst(2026, 10, 31, 0, 0)
     sun = _kst(2026, 11, 1, 0, 0)
     mon = _kst(2026, 10, 26, 0, 0)
-    for hour, minute in ((0, 30), (3, 0), (7, 30)):
+    for hour, minute in ((0, 30), (3, 0), (6, 30)):
         moment = sat.replace(hour=hour, minute=minute)
         assert not bot._orders_blocked(moment), moment.isoformat()
     # Saturday morning KST is still Friday regular hours in New York.
     assert bot._order_type(sat.replace(hour=0, minute=30), _et_of(sat.replace(hour=0, minute=30)), "intraday") == "00"
     assert bot._order_type(sat.replace(hour=3, minute=0), _et_of(sat.replace(hour=3, minute=0)), "intraday") == "00"
     assert bot._order_type(sat.replace(hour=0, minute=30), _et_of(sat.replace(hour=0, minute=30)), "reset") == "00"
+    assert bot._order_type(sat.replace(hour=6, minute=30), _et_of(sat.replace(hour=6, minute=30)), "intraday") == "62"
     assert bot._order_type(sat.replace(hour=7, minute=30), _et_of(sat.replace(hour=7, minute=30)), "intraday") == "62"
+    for hour, minute in ((7, 0), (7, 30), (8, 9)):
+        moment = sat.replace(hour=hour, minute=minute)
+        assert bot._orders_blocked(moment), moment.isoformat()
+    assert not bot._orders_blocked(sat.replace(hour=8, minute=10))
     for hour, minute in ((9, 0), (9, 15), (12, 0), (17, 15), (23, 0)):
         moment = sat.replace(hour=hour, minute=minute)
         assert bot._orders_blocked(moment), moment.isoformat()
@@ -1140,12 +1152,16 @@ def test_weekend_guard_follows_us_session():
         "double_used": [],
     }
     state = bot._clean_state(state)
-    code, out, world = _run_tracking(sat.replace(hour=7, minute=30), state, [], [])
+    code, out, world = _run_tracking(sat.replace(hour=6, minute=30), state, [], [])
     assert code == 0, out
     assert "skip: time guard" not in out
     assert "order type 62" in out
     assert world["placed"] == []
     assert world["cancelled"] == []
+    code, out, world = _run_tracking(sat.replace(hour=7, minute=30), state, [], [])
+    assert code == 0, out
+    assert "skip: time guard" in out
+    assert world["placed"] == []
     code, out, world = _run_tracking(sun.replace(hour=3, minute=0), state, [], [])
     assert code == 0, out
     assert "skip: time guard" in out
@@ -2367,6 +2383,123 @@ def test_invalid_cached_token_is_replaced():
         gb._token = old_token
 
 
+def _scan_blocked(day, windows):
+    """Every minute of `day` matches the KST windows, end exclusive."""
+    for minute in range(24 * 60):
+        moment = day.replace(hour=minute // 60, minute=minute % 60)
+        inside = any(start <= minute < end for start, end in windows)
+        assert bot._orders_blocked(moment) is inside, moment.isoformat()
+
+
+def _et_clock(moment):
+    et = moment.astimezone(bot.ET)
+    return et.hour, et.minute
+
+
+def test_order_guard_follows_us_eastern():
+    """Guards are ET offsets around the close and the premarket open.
+
+    19:00 ET is one hour before the 20:00 after-hours close. The window is
+    60 minutes before that anchor through 10 minutes after it:
+    18:00-19:10 ET. Standard time is 08:00-09:10 KST. Daylight time is
+    07:00-08:10 KST.
+
+    03:00 ET is one hour before the 04:00 premarket open. The same
+    offsets are 02:00-03:10 ET. Standard time is 16:00-17:10 KST.
+    Daylight time is 15:00-16:10 KST.
+    """
+    _restore_guards()
+    assert bot._GUARD_ANCHORS_ET == ((19, 0), (3, 0))
+    assert bot._GUARD_BEFORE == 60
+    assert bot._GUARD_AFTER == 10
+
+    winter = _kst(2026, 11, 19, 0, 0)
+    assert winter.strftime("%A") == "Thursday"
+    assert winter.astimezone(bot.ET).utcoffset().total_seconds() == -5 * 3600
+    _scan_blocked(winter, ((8 * 60, 9 * 60 + 10), (16 * 60, 17 * 60 + 10)))
+    assert _et_clock(winter.replace(hour=8, minute=0)) == (18, 0)
+    assert _et_clock(winter.replace(hour=9, minute=10)) == (19, 10)
+    assert _et_clock(winter.replace(hour=16, minute=0)) == (2, 0)
+    assert _et_clock(winter.replace(hour=17, minute=10)) == (3, 10)
+
+    summer = _kst(2027, 7, 15, 0, 0)
+    assert summer.strftime("%A") == "Thursday"
+    assert summer.astimezone(bot.ET).utcoffset().total_seconds() == -4 * 3600
+    _scan_blocked(summer, ((7 * 60, 8 * 60 + 10), (15 * 60, 16 * 60 + 10)))
+    assert _et_clock(summer.replace(hour=7, minute=0)) == (18, 0)
+    assert _et_clock(summer.replace(hour=8, minute=10)) == (19, 10)
+    assert _et_clock(summer.replace(hour=15, minute=0)) == (2, 0)
+    assert _et_clock(summer.replace(hour=16, minute=10)) == (3, 10)
+
+    # Friday before the fall-back is still daylight time. Monday after
+    # it is standard time. Monday morning stays closed until 09:10 KST
+    # even where the ET guard has already ended.
+    before_fall = _kst(2026, 10, 30, 0, 0)
+    assert before_fall.strftime("%A") == "Friday"
+    _scan_blocked(before_fall, ((7 * 60, 8 * 60 + 10), (15 * 60, 16 * 60 + 10)))
+    after_fall = _kst(2026, 11, 2, 0, 0)
+    assert after_fall.strftime("%A") == "Monday"
+    _scan_blocked(
+        after_fall,
+        ((0, 9 * 60 + 10), (16 * 60, 17 * 60 + 10)),
+    )
+
+    # Friday before the spring-forward is standard time. Monday after
+    # it uses the daylight-time evening guard. The morning is still
+    # closed until the KST day session.
+    before_spring = _kst(2027, 3, 12, 0, 0)
+    assert before_spring.strftime("%A") == "Friday"
+    _scan_blocked(before_spring, ((8 * 60, 9 * 60 + 10), (16 * 60, 17 * 60 + 10)))
+    after_spring = _kst(2027, 3, 15, 0, 0)
+    assert after_spring.strftime("%A") == "Monday"
+    _scan_blocked(
+        after_spring,
+        ((0, 9 * 60 + 10), (15 * 60, 16 * 60 + 10)),
+    )
+
+    # Fall back, Sunday 2026-11-01, 02:00 EDT becomes 01:00 EST (15:00 KST).
+    # The whole Sunday is closed. The ET window itself: both 01:30 folds
+    # are outside 02:00-03:10, and 02:00-03:09 EST is inside. Saturday
+    # evening is still EDT, so Sunday 07:00-08:09 KST is the 18:00 ET window.
+    fall = _kst(2026, 11, 1, 0, 0)
+    assert fall.strftime("%A") == "Sunday"
+    for minute in range(24 * 60):
+        moment = fall.replace(hour=minute // 60, minute=minute % 60)
+        assert bot._orders_blocked(moment), moment.isoformat()
+    assert not bot._in_order_guard(_kst(2026, 11, 1, 14, 30))
+    assert _et_clock(_kst(2026, 11, 1, 14, 30)) == (1, 30)
+    assert not bot._in_order_guard(_kst(2026, 11, 1, 15, 30))
+    assert _et_clock(_kst(2026, 11, 1, 15, 30)) == (1, 30)
+    assert bot._in_order_guard(_kst(2026, 11, 1, 16, 0))
+    assert _et_clock(_kst(2026, 11, 1, 16, 0)) == (2, 0)
+    assert bot._in_order_guard(_kst(2026, 11, 1, 17, 9))
+    assert not bot._in_order_guard(_kst(2026, 11, 1, 17, 10))
+    assert bot._in_order_guard(_kst(2026, 11, 1, 7, 0))
+    assert bot._in_order_guard(_kst(2026, 11, 1, 8, 9))
+    assert not bot._in_order_guard(_kst(2026, 11, 1, 8, 10))
+
+    # Spring forward, Sunday 2027-03-14, 02:00 EST becomes 03:00 EDT
+    # (16:00 KST). 02:00-02:59 ET does not occur. Saturday evening is
+    # still EST, so the morning window is the winter KST hours. The
+    # evening window is only the 03:00-03:09 EDT stub, 16:00-16:09 KST.
+    spring = _kst(2027, 3, 14, 0, 0)
+    assert spring.strftime("%A") == "Sunday"
+    for minute in range(24 * 60):
+        moment = spring.replace(hour=minute // 60, minute=minute % 60)
+        assert bot._orders_blocked(moment), moment.isoformat()
+    assert bot._in_order_guard(_kst(2027, 3, 14, 8, 0))
+    assert _et_clock(_kst(2027, 3, 14, 8, 0)) == (18, 0)
+    assert bot._in_order_guard(_kst(2027, 3, 14, 9, 9))
+    assert not bot._in_order_guard(_kst(2027, 3, 14, 9, 10))
+    assert not bot._in_order_guard(_kst(2027, 3, 14, 15, 59))
+    assert _et_clock(_kst(2027, 3, 14, 15, 59)) == (1, 59)
+    assert bot._in_order_guard(_kst(2027, 3, 14, 16, 0))
+    assert _et_clock(_kst(2027, 3, 14, 16, 0)) == (3, 0)
+    assert bot._in_order_guard(_kst(2027, 3, 14, 16, 9))
+    assert not bot._in_order_guard(_kst(2027, 3, 14, 16, 10))
+    assert _et_clock(_kst(2027, 3, 14, 16, 10)) == (3, 10)
+
+
 def main():
     try:
         test_session_table()
@@ -2389,6 +2522,7 @@ def main():
         test_lagging_inquiry_does_not_duplicate_recent_place()
         test_reset_keeps_same_slot_recent_orders()
         test_last_wipe_follows_us_eastern_close()
+        test_order_guard_follows_us_eastern()
         test_reset_drops_places_from_before_the_wipe()
         test_intraday_ignores_places_from_before_the_wipe()
         test_cancel_dup_cancels_only_the_newest_extra()

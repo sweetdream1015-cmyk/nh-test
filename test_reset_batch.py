@@ -172,18 +172,27 @@ def test_pairs_and_limits():
     assert bot._sized("KORU", 5, 1) is None
     assert bot._sized("SOXL", 4, 1) == 4
     assert bot._sized("SOXL", 5, 1) is None
-    assert bot._orders_blocked(datetime(2026, 10, 29, 8, 30, tzinfo=bot.KST))
-    assert bot._orders_blocked(datetime(2026, 10, 29, 9, 9, tzinfo=bot.KST))
+    # 2026-10-29 is still US daylight time, so the guards are 07:00-08:10
+    # and 15:00-16:10 KST (18:00-19:10 and 02:00-03:10 ET).
+    assert bot._orders_blocked(datetime(2026, 10, 29, 7, 0, tzinfo=bot.KST))
+    assert bot._orders_blocked(datetime(2026, 10, 29, 8, 9, tzinfo=bot.KST))
+    assert not bot._orders_blocked(datetime(2026, 10, 29, 8, 10, tzinfo=bot.KST))
+    assert not bot._orders_blocked(datetime(2026, 10, 29, 8, 30, tzinfo=bot.KST))
+    assert not bot._orders_blocked(datetime(2026, 10, 29, 9, 9, tzinfo=bot.KST))
     assert not bot._orders_blocked(datetime(2026, 10, 29, 9, 10, tzinfo=bot.KST))
+    assert bot._orders_blocked(datetime(2026, 10, 29, 15, 0, tzinfo=bot.KST))
     assert bot._orders_blocked(datetime(2026, 10, 29, 16, 0, tzinfo=bot.KST))
-    assert bot._orders_blocked(datetime(2026, 10, 29, 17, 9, tzinfo=bot.KST))
+    assert bot._orders_blocked(datetime(2026, 10, 29, 16, 9, tzinfo=bot.KST))
+    assert not bot._orders_blocked(datetime(2026, 10, 29, 16, 10, tzinfo=bot.KST))
+    assert not bot._orders_blocked(datetime(2026, 10, 29, 17, 9, tzinfo=bot.KST))
     assert not bot._orders_blocked(datetime(2026, 10, 29, 17, 10, tzinfo=bot.KST))
     assert not bot._orders_blocked(datetime(2026, 10, 29, 17, 11, tzinfo=bot.KST))
     assert bot._orders_blocked(datetime(2026, 10, 31, 17, 15, tzinfo=bot.KST))
     sat = datetime(2026, 10, 31, tzinfo=bot.KST)
     assert not bot._orders_blocked(sat.replace(hour=0, minute=30))
     assert not bot._orders_blocked(sat.replace(hour=3, minute=0))
-    assert not bot._orders_blocked(sat.replace(hour=7, minute=30))
+    assert not bot._orders_blocked(sat.replace(hour=6, minute=30))
+    assert bot._orders_blocked(sat.replace(hour=7, minute=30))
     assert bot._orders_blocked(sat.replace(hour=9, minute=0))
     assert bot._orders_blocked(sat.replace(hour=12, minute=0))
     assert bot._orders_blocked(datetime(2026, 11, 1, 3, 0, tzinfo=bot.KST))
@@ -447,7 +456,7 @@ def test_push_and_time_guard_place_nothing():
     assert "saved" not in world
     assert "ERROR max_orders" not in out
     assert "OK dry" in out
-    blocked = datetime(2026, 10, 29, 16, 30, tzinfo=bot.KST)
+    blocked = datetime(2026, 10, 29, 15, 30, tzinfo=bot.KST)
     code, out, world = _run(state, [], world, when=blocked)
     assert code == 0, out
     assert world["placed"] == []
@@ -1959,8 +1968,8 @@ def test_workflows():
     assert '- cron: "12 0 * * 1-5"' in reset
     assert '- cron: "16 8 * * 1-5"' in reset
     assert "workflow_dispatch:" in intra
-    assert '- cron: "*/5 0-6 * * 1-5"' in intra
-    assert '- cron: "*/5 8-22 * * 1-5"' in intra
+    assert '- cron: "*/5 0-7 * * 1-5"' in intra
+    assert '- cron: "*/5 8-23 * * 1-5"' in intra
     assert '- cron: "*/5 0 * * 6"' in intra
     assert '- cron: "*/5 * * * 1-5"' not in intra
     assert "'ladder-bot'" in reset
