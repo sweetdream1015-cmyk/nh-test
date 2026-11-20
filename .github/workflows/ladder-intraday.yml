@@ -87,9 +87,9 @@ jobs:
           restore-keys: |
             ladder-state-
 
-      # issue_comment runs cannot write the Actions cache (Cache mode: read).
-      # A kick's state is in the artifact. Prefer that file when it is newer
-      # than the cache, so the next schedule does not reload the pre-kick book.
+      # Cache mode is read for issue_comment, so a kick cannot save the cache.
+      # actions: write does not change that. The script loads ladder-state
+      # artifacts from every event and keeps the newer saved_at/seq.
       - name: Restore ladder state artifact
         env:
           GITHUB_TOKEN: ${{ github.token }}

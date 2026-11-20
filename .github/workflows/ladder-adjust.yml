@@ -69,6 +69,8 @@ jobs:
           restore-keys: |
             ladder-state-
 
+      # Keep the newer saved_at/seq among the cache and ladder-state
+      # artifacts from every event, not whichever cache restore hit.
       - name: Restore ladder state artifact
         env:
           GITHUB_TOKEN: ${{ github.token }}

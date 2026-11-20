@@ -55,6 +55,8 @@ jobs:
           restore-keys: |
             ladder-state-
 
+      # A cancel-dup comment cannot save the cache. Keep the newer stamp
+      # inside the state, including an artifact from another event.
       - name: Restore ladder state artifact
         env:
           GITHUB_TOKEN: ${{ github.token }}
