@@ -4,7 +4,9 @@ import io
 import json
 import os
 import sys
+import zipfile
 from datetime import datetime, timezone
+from urllib.request import Request
 
 import gb_readonly_check as gb
 import ladder_bot as bot
@@ -2198,6 +2200,245 @@ def test_missed_reset_heals_and_comment_is_idempotent():
     assert not bot._should_heal("push", moment, [], _state())
 
 
+def _zip_state(data):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("state.json", json.dumps(data).encode("utf-8"))
+    return buf.getvalue()
+
+
+def test_issue_comment_artifact_beats_stale_cache():
+    """A kick artifact newer than the cache is the state, so the buy is not resent.
+
+    2026-11-19 17:06Z issue_comment run 44573607284 stored SOXL buy 2@39 and
+    uploaded ladder-state, then cache save was denied. The 17:25Z schedule
+    restored that same cache and placed the buy again. The repo list can
+    return the stale artifact first, or omit the kick. The stamp inside
+    the file decides, and the remembered place is not sent twice.
+    """
+    stale = {"saved_at": 1795105403, "seq": 4, "recent_orders": []}
+    kick = {
+        "saved_at": 1795108043,
+        "seq": 5,
+        "recent_orders": [
+            {
+                "ticker": "SOXL",
+                "side": "buy",
+                "price": 39,
+                "qty": 2,
+                "at": 1795108022,
+            }
+        ],
+    }
+    reupload = dict(stale)
+    reupload["saved_at"] = 1795105500
+    choice, raw = restore.choose_state(
+        stale,
+        [
+            {"state": reupload, "raw": b"reupload", "event": "schedule"},
+            {"state": kick, "raw": b"kick", "event": "issue_comment"},
+        ],
+    )
+    assert choice == "artifact" and raw == b"kick"
+    assert restore.prefer_newer(stale, kick) == "artifact"
+    assert restore.prefer_newer(kick, stale) == "cache"
+    assert restore.prefer_newer({"saved_at": 5, "seq": 2}, {"saved_at": 5, "seq": 1}) == "cache"
+    assert restore.prefer_newer({"saved_at": 5, "seq": 1}, {"saved_at": 5, "seq": 2}) == "artifact"
+    assert restore.prefer_newer({"seq": 9}, {"saved_at": 1}) == "artifact"
+    assert restore.choose_state(kick, [{"state": stale, "raw": b"stale"}]) == ("cache", None)
+
+    urls = restore.workflow_run_urls("https://api.github.com", "o/r")
+    joined = "\n".join(urls)
+    assert "ladder-intraday.yml" in joined
+    assert "ladder-reset.yml" in joined
+    assert "ladder-cancel-dup.yml" in joined
+    assert "event=" not in joined
+    assert "status=success" in joined
+    assert "status=failure" in joined
+    assert restore.newest_run_ids(
+        [
+            ("2026-11-19T16:23:24Z", 44565486441),
+            ("2026-11-19T17:06:52Z", 44573607284),
+            ("2026-11-19T16:23:24Z", 44565486441),
+        ],
+        2,
+    ) == [44573607284, 44565486441]
+    schedule_row = {
+        "id": 14551433330,
+        "created_at": "2026-11-19T16:23:24Z",
+        "download": "https://example.test/schedule.zip",
+        "run_id": 44565486441,
+    }
+    assert restore.runs_missing_artifact(
+        [44565486441, 44573607284], [schedule_row]
+    ) == [44573607284]
+
+    handler = restore._DropAuthRedirect()
+    secret = "supersecret-token-value"
+    req = Request(
+        "https://api.github.com/repos/o/r/actions/artifacts/1/zip",
+        headers={
+            "Authorization": "Bearer " + secret,
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "ladder-state",
+        },
+    )
+    redirected = handler.redirect_request(
+        req, None, 302, "Found", {}, "https://blob.example/actions-results/abc?sig=1"
+    )
+    assert redirected is not None
+    assert redirected.get_header("Authorization") is None
+    assert secret not in (redirected.full_url or "")
+    assert req.get_header("Authorization") == "Bearer " + secret
+
+    kick_zip = _zip_state(kick)
+    stale_zip = _zip_state(stale)
+    seen = []
+
+    def fetch(url):
+        seen.append(url)
+        if url.endswith("/artifacts?name=ladder-state&per_page=30"):
+            return json.dumps(
+                {
+                    "artifacts": [
+                        {
+                            "id": 14551433330,
+                            "name": "ladder-state",
+                            "expired": False,
+                            "created_at": "2026-11-19T16:23:24Z",
+                            "archive_download_url": "https://example.test/schedule.zip",
+                            "workflow_run": {"id": 44565486441},
+                        }
+                    ]
+                }
+            ).encode()
+        if (
+            "/workflows/ladder-intraday.yml/runs?" in url
+            and "status=success" in url
+        ):
+            return json.dumps(
+                {
+                    "workflow_runs": [
+                        {
+                            "id": 44565486441,
+                            "created_at": "2026-11-19T16:23:24Z",
+                            "event": "schedule",
+                        },
+                        {
+                            "id": 44573607284,
+                            "created_at": "2026-11-19T17:06:52Z",
+                            "event": "issue_comment",
+                        },
+                    ]
+                }
+            ).encode()
+        if url.endswith("/actions/runs/44573607284/artifacts?per_page=20"):
+            return json.dumps(
+                {
+                    "artifacts": [
+                        {
+                            "id": 14553199994,
+                            "name": "ladder-state",
+                            "expired": False,
+                            "created_at": "2026-11-19T17:07:25Z",
+                            "archive_download_url": "https://example.test/kick.zip",
+                            "workflow_run": {"id": 44573607284},
+                        }
+                    ]
+                }
+            ).encode()
+        if url == "https://example.test/schedule.zip":
+            return stale_zip
+        if url == "https://example.test/kick.zip":
+            return kick_zip
+        if "/runs?" in url:
+            return b'{"workflow_runs":[]}'
+        return None
+
+    records = restore.load_records(fetch, "https://api.github.com", "o/r")
+    assert any("/actions/runs/44573607284/artifacts" in url for url in seen)
+    choice, raw = restore.choose_state(stale, records)
+    assert choice == "artifact"
+    loaded = json.loads(raw.decode())
+    assert loaded["saved_at"] == kick["saved_at"]
+    assert loaded["recent_orders"][0]["ticker"] == "SOXL"
+    assert loaded["recent_orders"][0]["price"] == 39
+    assert loaded["recent_orders"][0]["qty"] == 2
+    assert secret not in json.dumps(loaded)
+
+    _restore_guards()
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "NAIL"
+    os.environ.pop("ORDER_TYPE", None)
+    os.environ.pop("MAX_QTY_MULT", None)
+    moment = _kst(2026, 11, 13, 4, 26)
+    assert not bot._orders_blocked(moment)
+    book = _nail_before_fill()
+    book["saved_at"] = 100
+    book["seq"] = 1
+    remembered = bot._clean_state(book)
+    remembered["saved_at"] = 200
+    remembered["seq"] = 2
+    remembered["recent_orders"] = [
+        _recent_buy(moment, orr_no=4328),
+        {
+            "ticker": "NAIL",
+            "side": "sell",
+            "price": 36,
+            "qty": 10,
+            "at": int(moment.timestamp()),
+            "slot": "",
+            "day": "20261113",
+            "orr_no": 4327,
+        },
+    ]
+    choice, raw = restore.choose_state(
+        book,
+        [
+            {"state": book, "raw": json.dumps(book).encode()},
+            {"state": remembered, "raw": json.dumps(remembered).encode()},
+        ],
+    )
+    assert choice == "artifact"
+    chosen = json.loads(raw.decode())
+    opens = _nail_lag_book()
+    fills = _nail_fill()
+    placed = []
+    code, out, _world = _run(
+        "intraday", moment, chosen, opens, fills, _record(placed)
+    )
+    assert code == 0, out
+    assert placed == [], (placed, out)
+    assert "NAIL resting buy 28 qty 10" in out
+    duplicate = []
+    code, out, _world = _run(
+        "intraday", moment, book, opens, fills, _record(duplicate)
+    )
+    assert code == 0, out
+    assert ("NAIL", "buy", 28, 10) in duplicate, duplicate
+
+    old = bot._clean_state({"tickers": {}})
+    assert old["saved_at"] == 0 and old["seq"] == 0
+    stamped = bot._stamp_state(old)
+    assert stamped["seq"] == 1 and stamped["saved_at"] >= 1700000000
+    assert bot._stamp_state(stamped)["seq"] == 2
+    assert bot._clean_state({"seq": True, "saved_at": False})["seq"] == 0
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    for name in (
+        "ladder-intraday.yml",
+        "ladder-reset.yml",
+        "ladder-cancel-dup.yml",
+        "ladder-adjust.yml",
+        "seed-state.yml",
+    ):
+        text = open(
+            os.path.join(root, ".github/workflows", name), encoding="utf-8"
+        ).read()
+        assert "actions: write" in text
+        assert "restore_ladder_state.py" in text
+
+
 def test_prefer_newer_state_and_cancel_workflow():
     assert restore.prefer_newer(None, None) == "none"
     assert restore.prefer_newer({"saved_at": 1}, None) == "cache"
@@ -2527,6 +2768,7 @@ def main():
         test_intraday_ignores_places_from_before_the_wipe()
         test_cancel_dup_cancels_only_the_newest_extra()
         test_missed_reset_heals_and_comment_is_idempotent()
+        test_issue_comment_artifact_beats_stale_cache()
         test_prefer_newer_state_and_cancel_workflow()
         test_http_error_names_the_endpoint()
         test_invalid_cached_token_is_replaced()

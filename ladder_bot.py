@@ -32,7 +32,9 @@ or `reset premarket` runs this reset for the slot the clock is in.
 `reset` uses whichever of those is open. The slot's reset_done mark
 makes a second run the same day log OK skip and send nothing. The
 comment run saves state in the ladder-state artifact, because an
-issue comment cannot write the Actions cache.
+issue comment cannot write the Actions cache. Each save stores saved_at
+and seq. The next run keeps the copy with the greater stamp, so that
+artifact wins when the cache was not updated.
 A scheduled intraday run whose slot is already open, outside the time
 guards, and not marked done places that reset itself when the ladder
 book is empty or an earlier pass of the slot already finished a ticker.
@@ -1597,6 +1599,20 @@ def _clean_saved_at(raw):
     return raw
 
 
+def _clean_seq(raw):
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return 0
+    return raw
+
+
+def _stamp_state(state):
+    """Mark one save. Old files with no seq start at 1."""
+    cleaned = _clean_state(state if isinstance(state, dict) else {})
+    cleaned["saved_at"] = int(time.time())
+    cleaned["seq"] = _clean_seq(cleaned.get("seq")) + 1
+    return cleaned
+
+
 def _clean_state(state):
     tickers = {}
     raw = state.get("tickers", {})
@@ -1636,6 +1652,7 @@ def _clean_state(state):
         "exception_resting": resting,
         "recent_orders": _clean_recent(state.get("recent_orders")),
         "saved_at": _clean_saved_at(state.get("saved_at")),
+        "seq": _clean_seq(state.get("seq")),
         "reset_done": done,
         "reset_tickers": reset_tickers,
     }
@@ -3184,9 +3201,7 @@ def _main_once():
             return
         if state is None and mode == "cancel-dup":
             return
-        cleaned = _clean_state(data)
-        cleaned["saved_at"] = int(time.time())
-        _save_json(_STATE_PATH, cleaned)
+        _save_json(_STATE_PATH, _stamp_state(data))
 
     actions = {
         "place": place,

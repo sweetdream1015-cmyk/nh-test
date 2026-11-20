@@ -192,7 +192,7 @@ def _update(force_raw, flags_raw):
     if flags is not None and not _apply_flags(state, flags):
         print("ERROR config")
         return 1
-    bot._save_json(bot._STATE_PATH, bot._clean_state(state))
+    bot._save_json(bot._STATE_PATH, bot._stamp_state(state))
     print("OK force" if force_raw else "OK flags")
     return 0
 
@@ -210,7 +210,7 @@ def main():
     if not _seed_all(state):
         print("ERROR config")
         return 1
-    bot._save_json(bot._STATE_PATH, bot._clean_state(state))
+    bot._save_json(bot._STATE_PATH, bot._stamp_state(state))
     print("OK seed")
     return 0
 
