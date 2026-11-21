@@ -76,11 +76,13 @@ def _actions(world):
     def exception_open():
         return world.get("exception_open", False)
 
-    def place_exception(counter):
+    def place_exception(counter, qty=None):
         if counter[0] >= bot._MAX_NEW:
             return None
         counter[0] += 1
-        world["exceptions"].append((200, 37.5))
+        if qty is None:
+            qty = bot._EXCEPTION_QTY
+        world["exceptions"].append((qty, bot._EXCEPTION_PRICE))
         world["exception_open"] = True
         return True
 
@@ -264,7 +266,7 @@ def test_three_resets():
     assert code == 0, out
     assert world["placed"] == _tagged("NAIL", 33, 28)
     assert world["cancelled"] == []
-    assert world["exceptions"] == [(200, 37.5)]
+    assert world["exceptions"] == [(150, 75)]
     assert "DEFERRED KORU" in out
     assert "DEFERRED SOXL" in out
     assert "DEFERRED exception" not in out
@@ -339,18 +341,18 @@ def test_deferred_not_cancelled_and_exception_survives():
     opens = [
         {"ticker": "NAIL", "side": "sell", "price": 33, "qty": 10, "orr_no": 1},
         {"ticker": "KORU", "side": "buy", "price": 10.3, "qty": 1, "orr_no": 2},
-        {"ticker": "SOXL", "side": "buy", "price": 37.5, "qty": 200, "orr_no": 38},
+        {"ticker": "SOXL", "side": "sell", "price": 75, "qty": 150, "orr_no": 75},
     ]
     world = {}
     code, out, world = _run(state, opens, world)
     assert code == 0, out
     assert [item[0] for item in world["cancelled"]] == ["NAIL"]
-    assert all(item[1] != 37.5 for item in world["cancelled"])
+    assert all(item[1] != 75 for item in world["cancelled"])
     assert [item[0] for item in world["placed"]] == ["NAIL", "NAIL", "NAIL", "NAIL"]
     assert world["exceptions"] == []
 
     done = world["saved"]
-    # SOXL's turn. The 200@37.5 buy is not a ladder rung, so the reset must not cancel it.
+    # SOXL's turn. The standing sell at 75 is not a ladder rung, so the reset must not cancel it.
     code, _out, world = _run(done, opens, world)
     assert code == 0
     code, out, world = _run(world["saved"], opens, world)
@@ -1358,10 +1360,10 @@ def _legacy_soxl():
     }
 
 
-def _fill_at(price, qty, key, cancelled=0):
+def _fill_at(price, qty, key, cancelled=0, side="sell"):
     return {
         "ticker": "SOXL",
-        "side": "buy",
+        "side": side,
         "price": price,
         "filled_qty": qty,
         "cancelled_qty": cancelled,
@@ -1370,50 +1372,70 @@ def _fill_at(price, qty, key, cancelled=0):
     }
 
 
-def test_soxl_exception_200_at_37_5():
-    """One-time SOXL buy 200@37.5. Fills at 75 and at 38 do not count."""
-    assert bot._EXCEPTION_PRICE == 37.5
-    assert bot._EXCEPTION_QTY == 200
-    assert bot._EXCEPTION_ID == "soxl-buy-200-37-5"
+def test_soxl_exception_sell_150_at_75():
+    """Standing SOXL sell 150@75 until it is fully sold.
+
+    Retired buys do not count: 100 at 75, 200 at 38, and 200 at 37.5
+    filled 2026-11-21. A buy fill at 75 or 37.5 does not count. A
+    partial sell is kept, and the next reset sells only the remainder.
+    """
+    assert bot._EXCEPTION_PRICE == 75
+    assert bot._EXCEPTION_QTY == 150
+    assert bot._EXCEPTION_ID == "soxl-sell-150-75"
     assert bot._HARD_MAX["SOXL"] == 8
+    assert bot._sized("SOXL", 150, 1) is None
     assert bot._sized("SOXL", 200, 1) is None
+    assert ladders._level_of("SOXL", 75) is None
     assert ladders._level_of("SOXL", 37.5) is None
     assert bot._exception_open(
-        [{"ticker": "SOXL", "side": "buy", "price": 37.5, "qty": 200}]
+        [{"ticker": "SOXL", "side": "sell", "price": 75, "qty": 150}]
     )
     assert bot._exception_open(
-        [{"ticker": "SOXL", "side": "buy", "price": 37.55, "qty": 1}]
+        [{"ticker": "SOXL", "side": "sell", "price": 75.05, "qty": 110}]
     )
     assert not bot._exception_open(
-        [{"ticker": "SOXL", "side": "buy", "price": 75, "qty": 100}]
+        [{"ticker": "SOXL", "side": "buy", "price": 75, "qty": 150}]
     )
     assert not bot._exception_open(
-        [{"ticker": "SOXL", "side": "buy", "price": 38, "qty": 200}]
-    )
-    assert not bot._exception_open(
-        [{"ticker": "SOXL", "side": "buy", "price": 39, "qty": 200}]
+        [{"ticker": "SOXL", "side": "buy", "price": 37.5, "qty": 200}]
     )
     assert not bot._exception_open(
         [{"ticker": "SOXL", "side": "sell", "price": 37.5, "qty": 200}]
     )
     assert not bot._exception_open(
-        [{"ticker": "NAIL", "side": "buy", "price": 37.5, "qty": 200}]
+        [{"ticker": "SOXL", "side": "sell", "price": 72, "qty": 4}]
+    )
+    assert not bot._exception_open(
+        [{"ticker": "NAIL", "side": "sell", "price": 75, "qty": 150}]
+    )
+    assert not bot._exception_open(
+        [{"ticker": "SOXL", "side": "sell", "price": 75, "qty": 0}]
+    )
+    assert bot._ladder_book_empty(
+        [{"ticker": "SOXL", "side": "sell", "price": 75, "qty": 150}]
     )
     legacy = bot._clean_state(_legacy_soxl())
     assert legacy["exception_filled"] is False
     assert legacy["exception_id"] == ""
-    retired_38 = bot._clean_state(
-        {
-            "version": 2,
-            "tickers": {},
-            "handled": [],
-            "exception_filled": True,
-            "exception_id": "soxl-buy-200-38",
-            "reset_done": {"09": "", "17": ""},
-        }
-    )
-    assert retired_38["exception_filled"] is False
-    assert retired_38["exception_id"] == ""
+    assert legacy["exception_filled_qty"] == 0
+    for retired_id in ("soxl-buy-200-38", "soxl-buy-200-37-5"):
+        retired = bot._clean_state(
+            {
+                "version": 2,
+                "tickers": {},
+                "handled": [],
+                "exception_filled": True,
+                "exception_id": retired_id,
+                "exception_filled_qty": 200,
+                "reset_done": {"09": "", "17": ""},
+            }
+        )
+        assert retired["exception_filled"] is False
+        assert retired["exception_id"] == ""
+        assert retired["exception_filled_qty"] == 0
+        assert not bot._exception_done(
+            {"exception_filled": True, "exception_id": retired_id, "exception_filled_qty": 200}
+        )
     done = bot._clean_state(
         {
             "version": 2,
@@ -1426,24 +1448,30 @@ def test_soxl_exception_200_at_37_5():
     )
     assert done["exception_filled"] is True
     assert done["exception_id"] == bot._EXCEPTION_ID
-    assert not bot._exception_filled([_fill_at(75, 100, "ab" * 32)], set())
-    assert not bot._exception_filled([_fill_at(38, 200, "12" * 32)], set())
-    assert bot._exception_filled([_fill_at(37.5, 200, "cd" * 32)], set())
-    assert bot._exception_filled([_fill_at(37.55, 200, "34" * 32)], set())
+    assert done["exception_filled_qty"] == 150
+    assert bot._exception_remaining(done) == 0
+    sell_key = "cd" * 32
+    buy_key = "ab" * 32
+    assert bot._exception_filled([_fill_at(75, 150, sell_key)], set())
+    assert bot._exception_filled([_fill_at(75.05, 40, "34" * 32)], set())
+    assert not bot._exception_filled([_fill_at(75, 150, sell_key)], {sell_key})
+    assert not bot._exception_filled([_fill_at(75, 150, buy_key, side="buy")], set())
+    assert not bot._exception_filled([_fill_at(37.5, 200, "12" * 32, side="buy")], set())
     assert not bot._exception_filled(
-        [_fill_at(37.5, 200, "ef" * 32, cancelled=200)], set()
+        [_fill_at(75, 150, "ef" * 32, cancelled=150)], set()
     )
 
     os.environ["LIVE_TRADING"] = "on"
     os.environ["LIVE_TICKERS"] = "SOXL"
     os.environ.pop("ORDER_TYPE", None)
     os.environ.pop("MAX_QTY_MULT", None)
+    os.environ.pop("CANCEL_DUP", None)
     ladder = _tagged("SOXL", 113, 94)
     book = [
         {"ticker": "SOXL", "side": side, "price": price, "qty": qty}
         for side, price, qty in _orders("SOXL", 113, 94)
     ]
-    resting = {"ticker": "SOXL", "side": "buy", "price": 37.5, "qty": 200, "orr_no": 375}
+    resting = {"ticker": "SOXL", "side": "sell", "price": 75, "qty": 150, "orr_no": 75}
     early = datetime(2026, 11, 5, 9, 59, tzinfo=bot.KST)
     morning = datetime(2026, 11, 5, 10, 0, tzinfo=bot.KST)
     before_evening = datetime(2026, 11, 5, 17, 10, tzinfo=bot.KST)
@@ -1457,9 +1485,7 @@ def test_soxl_exception_200_at_37_5():
     assert world["exceptions"] == []
     assert world["placed"] == []
 
-    code, out, world = _run(
-        _legacy_soxl(), book, {}, when=early, mode="intraday"
-    )
+    code, out, world = _run(_legacy_soxl(), book + [resting], {}, when=early, mode="intraday")
     assert code == 0, out
     assert "order type 62" in out
     assert world["placed"] == []
@@ -1469,100 +1495,84 @@ def test_soxl_exception_200_at_37_5():
     assert world["saved"]["exception_filled"] is False
     assert world["saved"]["exception_id"] == ""
 
-    code, out, world = _run(
-        _legacy_soxl(), book, {}, when=morning, mode="intraday"
-    )
+    code, out, world = _run(_legacy_soxl(), book + [resting], {}, when=morning, mode="intraday")
     assert code == 0, out
     assert world["exceptions"] == []
+    assert world["cancelled"] == []
+    assert world["placed"] == []
     assert "exception placed" not in out
 
     code, out, world = _run(_legacy_soxl(), [], {}, when=before_evening)
     assert code == 0, out
     assert "skip: premarket not open" in out
     assert world["exceptions"] == []
-    assert world["placed"] == []
 
     code, out, placed = _run(
         _legacy_soxl(),
         [],
         {"exception_open": False},
         when=morning,
-        fills=[_fill_at(75, 100, "ab" * 32)],
+        fills=[_fill_at(75, 100, buy_key, side="buy"), _fill_at(37.5, 200, "12" * 32, side="buy")],
     )
     assert code == 0, out
     assert "order type 63" in out
     assert placed["placed"] == ladder
-    assert placed["exceptions"] == [(200, 37.5)]
+    assert placed["exceptions"] == [(150, 75)]
     assert placed["cancelled"] == []
     assert "exception placed 1" in out
     assert placed["saved"]["exception_filled"] is False
     assert placed["saved"]["exception_id"] == ""
+    assert placed["saved"]["exception_filled_qty"] == 0
     assert placed["saved"]["reset_done"]["09"] == "20261105"
     for _ticker, _side, price, qty in placed["placed"]:
-        assert price != 37.5 and price != 38 and price != 75
+        assert price != 75 and price != 37.5
         if _side == "sell":
             assert qty == 4
 
-    code, out, world = _run(
-        placed["saved"], [], {"exception_open": False}, when=evening
-    )
+    code, out, world = _run(placed["saved"], [], {"exception_open": False}, when=evening)
     assert code == 0, out
     assert "order type 61" in out
-    assert world["exceptions"] == [(200, 37.5)]
+    assert world["exceptions"] == [(150, 75)]
     assert "exception placed 1" in out
     assert world["saved"]["exception_filled"] is False
 
-    code, out, world = _run(
-        _legacy_soxl(), [], {"exception_open": False}, when=evening_cron
-    )
+    code, out, world = _run(_legacy_soxl(), [], {"exception_open": False}, when=evening_cron)
     assert code == 0, out
-    assert "order type 61" in out
-    assert world["exceptions"] == [(200, 37.5)]
+    assert world["exceptions"] == [(150, 75)]
     assert world["placed"] == ladder
 
-    code, out, held = _run(
-        _legacy_soxl(), [resting], {}, when=morning
-    )
+    code, out, held = _run(_legacy_soxl(), [resting], {}, when=morning)
     assert code == 0, out
     assert held["exceptions"] == []
     assert "exception placed" not in out
-    assert all(item[1] != 37.5 for item in held["cancelled"])
+    assert all(item[1] != 75 for item in held["cancelled"])
     assert held["placed"] == ladder
     assert held["saved"]["exception_filled"] is False
 
-    code, out, held = _run(
-        _legacy_soxl(), book + [resting], {}, when=evening
-    )
+    code, out, held = _run(_legacy_soxl(), book + [resting], {}, when=evening)
     assert code == 0, out
     assert held["exceptions"] == []
-    assert "exception placed" not in out
-    assert 37.5 not in [item[1] for item in held["cancelled"]]
+    assert 75 not in [item[1] for item in held["cancelled"]]
     assert len(held["cancelled"]) == 4
 
-    code, out, world = _run(
-        _legacy_soxl(), [], {"exception_open": True}, when=morning
-    )
+    code, out, world = _run(_legacy_soxl(), [], {"exception_open": True}, when=morning)
     assert code == 0, out
     assert world["exceptions"] == []
-    assert "exception placed" not in out
     assert world["placed"] == ladder
 
-    old = {"ticker": "SOXL", "side": "buy", "price": 75, "qty": 100, "orr_no": 75}
-    code, out, world = _run(
-        _legacy_soxl(), [old], {"exception_open": False}, when=evening
-    )
+    old_buy = {"ticker": "SOXL", "side": "buy", "price": 75, "qty": 100, "orr_no": 751}
+    code, out, world = _run(_legacy_soxl(), [old_buy], {"exception_open": False}, when=evening)
     assert code == 0, out
-    assert world["exceptions"] == [(200, 37.5)]
+    assert world["exceptions"] == [(150, 75)]
     assert all(item[1] != 75 for item in world["cancelled"])
 
-    retired = {"ticker": "SOXL", "side": "buy", "price": 38, "qty": 200, "orr_no": 38}
+    retired_buy = {"ticker": "SOXL", "side": "buy", "price": 37.5, "qty": 200, "orr_no": 375}
     code, out, world = _run(
-        _legacy_soxl(), [retired], {"exception_open": False}, when=morning
+        _legacy_soxl(), [retired_buy], {"exception_open": False}, when=morning
     )
     assert code == 0, out
-    assert world["exceptions"] == [(200, 37.5)]
-    assert "exception placed 1" in out
-    assert all(item[1] != 38 and item[1] != 37.5 for item in world["cancelled"])
+    assert world["exceptions"] == [(150, 75)]
+    assert all(item[1] != 37.5 and item[1] != 75 for item in world["cancelled"])
 
     code, out, world = _run(
         {
@@ -1570,32 +1580,35 @@ def test_soxl_exception_200_at_37_5():
             "tickers": {"SOXL": _pair("SOXL", 113, 94)},
             "handled": [],
             "exception_filled": True,
-            "exception_id": "soxl-buy-200-38",
+            "exception_id": "soxl-buy-200-37-5",
+            "exception_filled_qty": 200,
             "reset_done": {"09": "", "17": ""},
         },
         [],
         {"exception_open": False},
         when=morning,
-        fills=[_fill_at(38, 200, "12" * 32)],
+        fills=[_fill_at(37.5, 200, "12" * 32, side="buy")],
     )
     assert code == 0, out
-    assert world["exceptions"] == [(200, 37.5)]
+    assert world["exceptions"] == [(150, 75)]
     assert world["saved"]["exception_filled"] is False
     assert world["saved"]["exception_id"] == ""
+    assert world["saved"]["exception_filled_qty"] == 0
 
     code, out, filled = _run(
         _legacy_soxl(),
         [],
         {},
         when=morning,
-        fills=[_fill_at(37.5, 200, "cd" * 32)],
+        fills=[_fill_at(75, 150, sell_key)],
     )
     assert code == 0, out
     assert filled["exceptions"] == []
     assert "exception placed" not in out
     assert filled["saved"]["exception_filled"] is True
     assert filled["saved"]["exception_id"] == bot._EXCEPTION_ID
-    assert "cd" * 32 in filled["saved"]["handled"]
+    assert filled["saved"]["exception_filled_qty"] == 150
+    assert sell_key in filled["saved"]["handled"]
     assert filled["saved"]["tickers"]["SOXL"]["sell"] == _level("SOXL", 113)
     assert filled["saved"]["tickers"]["SOXL"]["buy"] == _level("SOXL", 94)
 
@@ -1604,21 +1617,15 @@ def test_soxl_exception_200_at_37_5():
     )
     assert code == 0, out
     assert world["exceptions"] == []
-    assert "exception placed" not in out
     assert world["placed"] == ladder
     assert world["saved"]["exception_filled"] is True
     assert world["saved"]["exception_id"] == bot._EXCEPTION_ID
 
     code, out, world = _run(
-        filled["saved"],
-        [],
-        {"exception_open": False},
-        when=next_morning,
-        fills=[],
+        filled["saved"], [], {"exception_open": False}, when=next_morning, fills=[]
     )
     assert code == 0, out
     assert world["exceptions"] == []
-    assert "exception placed" not in out
     assert world["saved"]["exception_filled"] is True
 
     code, out, world = _run(
@@ -1626,7 +1633,7 @@ def test_soxl_exception_200_at_37_5():
         book,
         {},
         when=morning,
-        fills=[_fill_at(37.5, 200, "cd" * 32)],
+        fills=[_fill_at(75, 150, sell_key)],
         mode="intraday",
     )
     assert code == 0, out
@@ -1641,20 +1648,174 @@ def test_soxl_exception_200_at_37_5():
         [],
         {"exception_open": False},
         when=evening,
-        fills=[_fill_at(37.5, 200, "ef" * 32, cancelled=200)],
+        fills=[_fill_at(75, 150, "ef" * 32, cancelled=150)],
     )
     assert code == 0, out
-    assert world["exceptions"] == [(200, 37.5)]
+    assert world["exceptions"] == [(150, 75)]
     assert world["saved"]["exception_filled"] is False
     assert world["saved"]["exception_id"] == ""
+
+    partial_key = "a1" * 32
+    code, out, partial = _run(
+        _legacy_soxl(),
+        [],
+        {"exception_open": False},
+        when=morning,
+        fills=[_fill_at(75, 40, partial_key)],
+    )
+    assert code == 0, out
+    assert partial["exceptions"] == [(110, 75)]
+    assert "exception placed 1" in out
+    assert partial["saved"]["exception_filled"] is False
+    assert partial["saved"]["exception_id"] == bot._EXCEPTION_ID
+    assert partial["saved"]["exception_filled_qty"] == 40
+    assert partial["saved"]["exception_parts"][partial_key] == 40
+    assert partial_key in partial["saved"]["handled"]
+    assert partial["saved"]["tickers"]["SOXL"]["sell"] == _level("SOXL", 113)
+    assert partial["placed"] == ladder
+
+    code, out, again = _run(
+        partial["saved"],
+        [],
+        {"exception_open": False},
+        when=morning,
+        fills=[_fill_at(75, 40, partial_key)],
+    )
+    assert code == 0, out
+    assert "OK skip" in out
+    assert again["exceptions"] == []
+
+    code, out, nxt = _run(
+        partial["saved"],
+        [],
+        {"exception_open": False},
+        when=evening,
+        fills=[_fill_at(75, 40, partial_key)],
+    )
+    assert code == 0, out
+    assert nxt["exceptions"] == [(110, 75)]
+    assert nxt["saved"]["exception_filled_qty"] == 40
+    assert nxt["saved"]["exception_resting"]["slot"] == "17"
+
+    grew_at = datetime(2026, 11, 6, 10, 0, tzinfo=bot.KST)
+    code, out, grew = _run(
+        partial["saved"],
+        [],
+        {"exception_open": False},
+        when=grew_at,
+        fills=[_fill_at(75, 90, partial_key)],
+    )
+    assert code == 0, out
+    assert grew["exceptions"] == [(60, 75)]
+    assert grew["saved"]["exception_filled_qty"] == 90
+    assert grew["saved"]["exception_filled"] is False
+    assert grew["saved"]["exception_parts"][partial_key] == 90
+
+    rest_key = "b2" * 32
+    later = datetime(2026, 11, 6, 18, 11, tzinfo=bot.KST)
+    code, out, finished = _run(
+        grew["saved"],
+        [],
+        {"exception_open": False},
+        when=later,
+        fills=[_fill_at(75, 90, partial_key), _fill_at(75, 60, rest_key)],
+    )
+    assert code == 0, out
+    assert finished["exceptions"] == []
+    assert "exception placed" not in out
+    assert finished["saved"]["exception_filled"] is True
+    assert finished["saved"]["exception_filled_qty"] == 150
+    assert finished["saved"]["exception_id"] == bot._EXCEPTION_ID
+
+    os.environ["CANCEL_DUP"] = "cancel-dup SOXL SELL 75 150"
+    assert bot._parse_cancel_dup() is None
+    os.environ["CANCEL_DUP"] = "cancel-dup SOXL SELL 75 4"
+    dup_opens = [
+        {
+            "ticker": "SOXL",
+            "side": "sell",
+            "price": 75,
+            "qty": 4,
+            "orr_no": 1,
+            "orr_dt": "20261105",
+        },
+        {
+            "ticker": "SOXL",
+            "side": "sell",
+            "price": 75,
+            "qty": 4,
+            "orr_no": 2,
+            "orr_dt": "20261105",
+        },
+    ]
+    cancelled = []
+
+    def _cancel(ticker, order):
+        cancelled.append((ticker, order.get("price"), order.get("orr_no")))
+        return True
+
+    dup_world = {}
+    dup_actions = _actions(dup_world)
+    dup_actions["cancel"] = _cancel
+    code, out = _capture(
+        lambda: bot.run(
+            "cancel-dup",
+            "workflow_dispatch",
+            morning,
+            morning.astimezone(bot.ET),
+            dup_opens,
+            [],
+            _legacy_soxl(),
+            dup_actions,
+        )
+    )
+    assert code == 0, out
+    assert cancelled == []
+    assert "cancel-dup skip SOXL sell 75 qty 4 matches 0" in out
+    os.environ.pop("CANCEL_DUP", None)
+
+    monday = datetime(2026, 11, 23, 10, 11, tzinfo=bot.KST)
+    assert monday.strftime("%A") == "Monday"
+    assert bot._reset_slot(monday) == "09"
+    assert not bot._orders_blocked(monday)
+    assert bot._order_type(monday, monday.astimezone(bot.ET), "reset") == "63"
+    os.environ["LIVE_TICKERS"] = "SOXL"
+    code, out, world = _run(
+        {
+            "version": 2,
+            "tickers": {"SOXL": _pair("SOXL", 113, 94)},
+            "handled": [],
+            "exception_filled": True,
+            "exception_id": "soxl-buy-200-37-5",
+            "exception_filled_qty": 200,
+            "reset_done": {"09": "", "17": ""},
+        },
+        [],
+        {"exception_open": False},
+        when=monday,
+    )
+    assert code == 0, out
+    assert "order type 63" in out
+    assert "exception placed 1" in out
+    assert "DEFERRED exception" not in out
+    assert "exception plan place" not in out
+    assert world["exceptions"] == [(150, 75)]
+    assert world["saved"]["exception_filled"] is False
+    assert world["saved"]["exception_id"] == ""
+    assert world["saved"]["exception_filled_qty"] == 0
+    assert world["saved"]["exception_resting"]["id"] == bot._EXCEPTION_ID
+    assert world["saved"]["exception_resting"]["slot"] == "09"
+    assert world["saved"]["exception_resting"]["day"] == "20261123"
+    assert all(price != 75 for _ticker, _side, price, _qty in world["placed"])
 
     os.environ["ORDER_TYPE"] = "00"
     os.environ["LADDER_MODE"] = "reset"
     bot._now_kst = lambda: datetime(2026, 11, 5, 12, 0, tzinfo=bot.KST)
     captured = {"n": 0}
 
-    def fake_post(_url, raw, _extra):
+    def fake_post(url, raw, _extra):
         captured["n"] += 1
+        captured["url"] = url
         captured["body"] = json.loads(raw.decode())["Input_0"]
         return 200, {}, {"Output_0": {"orr_no": "1"}}
 
@@ -1668,27 +1829,32 @@ def test_soxl_exception_200_at_37_5():
         assert bot._place_exception("0000", True, [bot._MAX_NEW]) is None
         assert captured["n"] == 0
         assert bot._place_exception("0000", True, [0]) is True
+        assert captured["url"] == bot.SELL_URL
+        full = captured["body"]
+        assert bot._place_exception("0000", True, [1], 110) is True
     finally:
         gb._post_bearer = old_post
         os.environ.pop("ORDER_TYPE", None)
         os.environ.pop("LADDER_MODE", None)
-    body = captured["body"]
-    assert body["iem_cd"] == "SOXL"
-    assert body["orr_qty"] == 200
-    assert body["fc_orr_uit_pr"] == 37.5
-    assert body["wtm_cur_knd_cd"] == "1"
-    assert body["ahi_nmn_pr_tp_cd"] == "00"
-    assert body["fc_sec_trd_nat_cd"] == "200"
-    assert set(body) == {
+    assert full["iem_cd"] == "SOXL"
+    assert full["orr_qty"] == 150
+    assert full["fc_orr_uit_pr"] == 75
+    assert "wtm_cur_knd_cd" not in full
+    assert full["ahi_nmn_pr_tp_cd"] == "00"
+    assert full["fc_sec_trd_nat_cd"] == "200"
+    assert set(full) == {
         "act_no",
         "fc_sec_trd_nat_cd",
         "iem_cd",
         "orr_qty",
         "fc_orr_uit_pr",
         "ahi_nmn_pr_tp_cd",
-        "wtm_cur_knd_cd",
     }
-
+    body = captured["body"]
+    assert body["orr_qty"] == 110
+    assert body["fc_orr_uit_pr"] == 75
+    assert "wtm_cur_knd_cd" not in body
+    assert captured["url"] == bot.SELL_URL
 
 def test_saved_anchor_buy_sizes():
     """Current history stays. 39 used repeats at 4. An unused 39 is 8.
@@ -1767,7 +1933,7 @@ def test_saved_anchor_buy_sizes():
         ("buy", 22, 20),
         ("buy", 20, 40),
     ]
-    assert bot._EXCEPTION_QTY == 200 and bot._EXCEPTION_PRICE == 37.5
+    assert bot._EXCEPTION_QTY == 150 and bot._EXCEPTION_PRICE == 75
     assert not hasattr(ladders, "_ANCHOR_BUY")
 
     os.environ["LIVE_TRADING"] = "on"
@@ -2028,11 +2194,13 @@ def test_evening_followup_chain_places_exception_with_nail():
         def exception_open():
             return False
 
-        def place_exception(counter):
+        def place_exception(counter, qty=None):
             if counter[0] >= bot._MAX_NEW:
                 return None
             counter[0] += 1
-            sent_exceptions.append((200, 37.5))
+            if qty is None:
+                qty = bot._EXCEPTION_QTY
+            sent_exceptions.append((qty, bot._EXCEPTION_PRICE))
             return True
 
         actions["exception_open"] = exception_open
@@ -2057,7 +2225,7 @@ def test_evening_followup_chain_places_exception_with_nail():
     first_code, first_out, first_placed = passes[0]
     assert first_code == 0, first_out
     assert first_placed == _tagged("NAIL", 33, 28)
-    assert sent_exceptions == [(200, 37.5)]
+    assert sent_exceptions == [(150, 75)]
     assert "exception placed 1" in first_out
     assert "DEFERRED KORU" in first_out
     assert "DEFERRED SOXL" in first_out
@@ -2085,7 +2253,7 @@ def test_evening_followup_chain_places_exception_with_nail():
     }
     assert box["state"]["reset_done"]["17"] == "20261110"
     assert box["state"]["exception_filled"] is False
-    assert sent_exceptions == [(200, 37.5)]
+    assert sent_exceptions == [(150, 75)]
 
 
 def test_exception_not_duplicated_when_open_filled_or_resting():
@@ -2096,16 +2264,16 @@ def test_exception_not_duplicated_when_open_filled_or_resting():
     evening = datetime(2026, 11, 10, 18, 11, tzinfo=bot.KST)
     resting_order = {
         "ticker": "SOXL",
-        "side": "buy",
-        "price": 37.5,
-        "qty": 200,
+        "side": "sell",
+        "price": 75,
+        "qty": 150,
         "orr_no": 375,
     }
     code, out, world = _run(_live_book(), [resting_order], {}, when=evening)
     assert code == 0, out
     assert world["exceptions"] == []
     assert "exception placed" not in out
-    assert all(item[1] != 37.5 for item in world["cancelled"])
+    assert all(item[1] != 75 for item in world["cancelled"])
     assert world["saved"]["exception_resting"] == {}
 
     filled = _live_book()
@@ -2152,7 +2320,7 @@ def test_exception_not_duplicated_when_open_filled_or_resting():
     }
     code, out, world = _run(morning_mark, [], {"exception_open": False}, when=evening)
     assert code == 0, out
-    assert world["exceptions"] == [(200, 37.5)]
+    assert world["exceptions"] == [(150, 75)]
     assert "exception placed 1" in out
     assert world["saved"]["exception_resting"]["slot"] == "17"
     assert world["saved"]["exception_filled"] is False
@@ -2255,7 +2423,7 @@ def test_followup_guard_and_loop_limit():
     code, out, world = _run(_live_book(), [], {}, when=near_guard)
     assert code == 0, out
     assert world["placed"] == _tagged("NAIL", 33, 28)
-    assert world["exceptions"] == [(200, 37.5)]
+    assert world["exceptions"] == [(150, 75)]
     assert "DEFERRED KORU" in out
     assert "DEFERRED SOXL" in out
     assert "DEFERRED exception" not in out
@@ -2410,7 +2578,7 @@ def main():
         test_soxl_sell_qty_and_buy_rules()
         test_shared_ladder()
         test_legacy_koru_state_does_not_trade_5_9()
-        test_soxl_exception_200_at_37_5()
+        test_soxl_exception_sell_150_at_75()
         test_saved_anchor_buy_sizes()
         test_soxl_old_sizes_do_not_duplicate()
         test_soxl_monday_reset_plan()

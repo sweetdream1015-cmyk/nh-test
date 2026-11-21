@@ -48,7 +48,7 @@ def _opens():
         {"ticker": "SOXL", "side": "buy", "price": 42, "qty": 2, "orr_no": 2},
         {"ticker": "SOXL", "side": "sell", "price": 50, "qty": 4, "orr_no": 3},
         {"ticker": "SOXL", "side": "sell", "price": 55, "qty": 2, "orr_no": 4},
-        {"ticker": "SOXL", "side": "buy", "price": 37.5, "qty": 200, "orr_no": 5},
+        {"ticker": "SOXL", "side": "sell", "price": 75, "qty": 150, "orr_no": 5},
         {"ticker": "NAIL", "side": "buy", "price": 33, "qty": 10, "orr_no": 6},
         {"ticker": "NAIL", "side": "sell", "price": 39, "qty": 10, "orr_no": 7},
         {"ticker": "KORU", "side": "buy", "price": 6.0, "qty": 2, "orr_no": 8},
@@ -73,7 +73,7 @@ def _opens_without_exception():
     return [
         order
         for order in _opens()
-        if not (order.get("ticker") == "SOXL" and order.get("price") == 37.5)
+        if not (order.get("ticker") == "SOXL" and order.get("price") == 75)
     ]
 
 
@@ -118,8 +118,8 @@ def _run(state, opens, when, preview, sell="46", buy="39", step="none"):
     world = {"placed": [], "cancelled": [], "exceptions": []}
     actions = sim._actions(world)
 
-    def place_exception(_counter):
-        raise AssertionError("adjust placed the 37.5 exception")
+    def place_exception(_counter, _qty=None):
+        raise AssertionError("adjust placed the standing sell")
 
     actions["place_exception"] = place_exception
     code, out = sim._capture(
@@ -145,7 +145,7 @@ def _assert_plan(out):
     assert "SOXL plan place buy 36 qty 8" in out
     assert "SOXL plan keep buy 39 qty 4" in out
     assert "SOXL plan keep sell 50 qty 4" in out
-    assert "SOXL plan ignore buy 37.5 qty 200" in out
+    assert "SOXL plan ignore sell 75 qty 150" in out
     assert "NAIL unchanged" in out
     assert "KORU unchanged" in out
     assert "SOXL plan cancel buy 39" not in out
@@ -197,7 +197,7 @@ def test_preview_prints_delta_and_sends_nothing():
     assert world["placed"] == []
     assert world["cancelled"] == []
     assert "saved" not in world
-    assert "37.5" in out
+    assert "75" in out
     assert "orr_no" not in out
 
 
@@ -344,7 +344,7 @@ def test_reset_does_not_requote_unhandled_anchor_fill():
         ("SOXL", "sell", 46, 4),
         ("SOXL", "sell", 50, 4),
     ]
-    assert all(price != 37.5 for _ticker, price, _number in world["cancelled"])
+    assert all(price != 75 for _ticker, price, _number in world["cancelled"])
     assert {ticker for ticker, _price, _number in world["cancelled"]} == {"SOXL"}
     saved = world["saved"]
     assert saved["tickers"]["SOXL"]["sell"] == _level("SOXL", 46)
@@ -380,7 +380,7 @@ def test_adjust_places_missing_exception_once():
     before = _state()
     code, out, world = _run(before, opens, when, preview=True)
     assert code == 0, out
-    assert "exception plan place buy 37.5 qty 200" in out
+    assert "exception plan place sell 75 qty 150" in out
     assert "OK preview" in out
     assert "saved" not in world
     assert world["placed"] == []
@@ -388,12 +388,12 @@ def test_adjust_places_missing_exception_once():
 
     code, out, world = _run_sending(before, opens, when)
     assert code == 0, out
-    assert "exception plan place buy 37.5 qty 200" in out
+    assert "exception plan place sell 75 qty 150" in out
     assert "exception placed 1" in out
-    assert world["exceptions"] == [(200, 37.5)]
+    assert world["exceptions"] == [(150, 75)]
     assert ("SOXL", "buy", 36, 8) in world["placed"]
     assert ("SOXL", "sell", 46, 4) in world["placed"]
-    assert all(price != 37.5 for _ticker, price, _number in world["cancelled"])
+    assert all(price != 75 for _ticker, price, _number in world["cancelled"])
     saved = world["saved"]
     assert saved["exception_filled"] is False
     assert saved["exception_id"] == ""
@@ -420,12 +420,30 @@ def test_adjust_places_missing_exception_once():
     }
     code, out, world = _run_sending(morning_mark, opens, when)
     assert code == 0, out
-    assert world["exceptions"] == [(200, 37.5)]
+    assert world["exceptions"] == [(150, 75)]
     assert world["saved"]["exception_resting"]["slot"] == "17"
+
+    partial_key = "ab" * 32
+    partial = _state()
+    partial["exception_id"] = bot._EXCEPTION_ID
+    partial["exception_filled"] = False
+    partial["exception_filled_qty"] = 40
+    partial["exception_parts"] = {partial_key: 40}
+    code, out, world = _run(bot._clean_state(partial), opens, when, preview=True)
+    assert code == 0, out
+    assert "exception plan place sell 75 qty 110" in out
+    assert "OK preview" in out
+    code, out, world = _run_sending(bot._clean_state(partial), opens, when)
+    assert code == 0, out
+    assert "exception plan place sell 75 qty 110" in out
+    assert world["exceptions"] == [(110, 75)]
+    assert world["saved"]["exception_filled"] is False
+    assert world["saved"]["exception_filled_qty"] == 40
+    assert all(price != 75 for _ticker, price, _number in world["cancelled"])
 
 
 def test_koru_adjust_places_missing_exception():
-    """Moving KORU still sends the missing one-time SOXL buy, not KORU's ladder only."""
+    """Moving KORU still sends the missing SOXL sell, not KORU's ladder only."""
     when = _PREMARKET
     os.environ["LIVE_TRADING"] = "on"
     os.environ["LIVE_TICKERS"] = "NAIL,KORU,SOXL"
@@ -443,8 +461,8 @@ def test_koru_adjust_places_missing_exception():
     world = {"placed": [], "cancelled": [], "exceptions": []}
     actions = sim._actions(world)
 
-    def place_exception(_counter):
-        raise AssertionError("preview placed the 37.5 exception")
+    def place_exception(_counter, _qty=None):
+        raise AssertionError("preview placed the standing sell")
 
     actions["place_exception"] = place_exception
     code, out = sim._capture(
@@ -461,7 +479,7 @@ def test_koru_adjust_places_missing_exception():
     )
     assert code == 0, out
     assert "OK preview" in out
-    assert "exception plan place buy 37.5 qty 200" in out
+    assert "exception plan place sell 75 qty 150" in out
     assert "NAIL unchanged" in out
     assert "SOXL unchanged" not in out
     assert "saved" not in world
@@ -482,7 +500,7 @@ def test_koru_adjust_places_missing_exception():
         )
     )
     assert code == 0, out
-    assert world["exceptions"] == [(200, 37.5)]
+    assert world["exceptions"] == [(150, 75)]
     assert "exception placed 1" in out
     assert ("KORU", "sell", 7.9, 1) in world["placed"]
     assert ("KORU", "buy", 5.5, 2) in world["placed"]
@@ -533,8 +551,8 @@ def test_adjust_skips_ineligible_exception():
     world = {"placed": [], "cancelled": [], "exceptions": []}
     actions = sim._actions(world)
 
-    def place_exception(_counter):
-        raise AssertionError("adjust placed the 37.5 exception")
+    def place_exception(_counter, _qty=None):
+        raise AssertionError("adjust placed the standing sell")
 
     def exception_open():
         return True
