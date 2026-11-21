@@ -47,7 +47,7 @@ once. The retired buys of 100 at 75 and 200 at 38 stay retired:
 exception_filled counts only when exception_id is soxl-buy-200-37-5, so a
 saved true from either of those fills does not block 200 at 37.5 and must
 not be reseeded true.
-SOXL buys and sells 2. A first SOXL buy at 39 or below is 4, then 2
+SOXL buys and sells 4. A first SOXL buy at 39 or below is 8, then 4
 once that level is in double_used. KORU buys and sells 1. A first KORU
 buy at 6 or below is 2, then 1. NAIL is unchanged. Saved double_used
 is kept as written.
@@ -121,7 +121,8 @@ BUY_URL = gb.LIVE + "/gbstock/order/v1/buy"
 SELL_URL = gb.LIVE + "/gbstock/order/v1/sell"
 CANCEL_URL = gb.LIVE + "/gbstock/order/v1/cancel"
 _ORDER_URLS = {BUY_URL, SELL_URL, CANCEL_URL}
-_HARD_MAX = {"NAIL": 40, "KORU": 4, "SOXL": 4}
+# Ladder orders only. The one-time SOXL buy of 200 does not use this cap.
+_HARD_MAX = {"NAIL": 40, "KORU": 4, "SOXL": 8}
 _MAX_NEW = 6
 # Extra reset passes after a deferral. Three tickers need only a couple;
 # the bound stops a stuck deferral from chaining.
@@ -464,8 +465,8 @@ def _in_double_zone(ticker, price):
 def _buy_computed(ticker, index, double_used):
     """First-buy size, or base once that level is already in double_used.
 
-    SOXL is 2, or 4 on the first buy at 39 or below. A used SOXL level
-    there is 2. KORU is 1, or 2 on the first buy at 6 or below, then 1.
+    SOXL is 4, or 8 on the first buy at 39 or below. A used SOXL level
+    there is 4. KORU is 1, or 2 on the first buy at 6 or below, then 1.
     NAIL is 20 at 22 and 40 at 20 or below, then 10 once that level is used.
     """
     price = ladders._price_at(ticker, index)
@@ -2073,7 +2074,14 @@ def _unseen_recent(recent, opens, now):
 
 
 def _filled_recent(fills, item):
-    """True when a fill at this rung means the place is no longer resting."""
+    """True when a fill at this rung means the place is no longer resting.
+
+    A fill of a different order at the same rung does not count. The
+    ladder buys a used level again at the base size, and that earlier
+    fill must not erase the new order. Dropping it makes the next run
+    treat the rung as missing.
+    """
+    place_no = _order_number(item.get("orr_no"))
     for row in fills or []:
         if not isinstance(row, dict):
             continue
@@ -2084,8 +2092,12 @@ def _filled_recent(fills, item):
         idx = row.get("idx")
         if not isinstance(idx, int) or isinstance(idx, bool):
             idx = _level_of(item.get("ticker"), row.get("price"))
-        if idx == item.get("idx"):
-            return True
+        if idx != item.get("idx"):
+            continue
+        fill_no = _order_number(row.get("orr_no"))
+        if place_no is not None and fill_no is not None and place_no != fill_no:
+            continue
+        return True
     return False
 
 

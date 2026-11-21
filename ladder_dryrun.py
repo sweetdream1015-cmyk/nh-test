@@ -150,13 +150,13 @@ _CFG = {
     },
     # First buy at 6 or below is 2. 6.6 and above stay 1, used or not.
     "KORU": {"ladder": _LADDER, "base": 1, "buy_qty": _buy_qty(1, 6)},
-    # Buys and sells are 2. First buy at 39 or below is 4, then 2
-    # once that level is in double_used. 42 and above stay 2.
+    # Buys and sells are 4. First buy at 39 or below is 8, then 4
+    # once that level is in double_used. 42 and above stay 4.
     "SOXL": {
         "ladder": _LADDER,
-        "base": 2,
-        "sell_qty": 2,
-        "buy_qty": _buy_qty(2, 39),
+        "base": 4,
+        "sell_qty": 4,
+        "buy_qty": _buy_qty(4, 39),
     },
 }
 
