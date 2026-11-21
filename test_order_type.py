@@ -613,8 +613,8 @@ def test_day_session_fill_followup():
         ("NAIL", "buy", 30, 10),
         ("KORU", "sell", 11.3, 1),
         ("KORU", "buy", 9.4, 1),
-        ("SOXL", "sell", 86, 2),
-        ("SOXL", "buy", 72, 2),
+        ("SOXL", "sell", 86, 4),
+        ("SOXL", "buy", 72, 4),
     ]
     moments = (
         (_kst(2026, 10, 29, 12, 0), "63"),
@@ -830,7 +830,7 @@ def test_day_session_quantities():
         86,
         1,
     )
-    assert soxl_at["placed"] == [("SOXL", "sell", 86, 2), ("SOXL", "buy", 72, 2)]
+    assert soxl_at["placed"] == [("SOXL", "sell", 86, 4), ("SOXL", "buy", 72, 4)]
 
     soxl_below = _one(
         "SOXL",
@@ -846,9 +846,9 @@ def test_day_session_quantities():
         79,
         1,
     )
-    assert soxl_below["placed"] == [("SOXL", "sell", 79, 2), ("SOXL", "buy", 66, 2)]
+    assert soxl_below["placed"] == [("SOXL", "sell", 79, 4), ("SOXL", "buy", 66, 4)]
 
-    # Above 39 the new buy is the base 2. The new sell is 2.
+    # Above 39 the new buy is the base 4. The new sell is 4.
     soxl_above = _one(
         "SOXL",
         103,
@@ -863,9 +863,9 @@ def test_day_session_quantities():
         94,
         1,
     )
-    assert soxl_above["placed"] == [("SOXL", "sell", 94, 2), ("SOXL", "buy", 79, 2)]
+    assert soxl_above["placed"] == [("SOXL", "sell", 94, 4), ("SOXL", "buy", 79, 4)]
 
-    # A used mark above 39 does not change the base 2.
+    # A used mark above 39 does not change the base 4.
     soxl_used = _one(
         "SOXL",
         94,
@@ -880,7 +880,7 @@ def test_day_session_quantities():
         86,
         1,
     )
-    assert soxl_used["placed"] == [("SOXL", "sell", 86, 2), ("SOXL", "buy", 72, 2)]
+    assert soxl_used["placed"] == [("SOXL", "sell", 86, 4), ("SOXL", "buy", 72, 4)]
 
     soxl_used_low = _one(
         "SOXL",
@@ -896,7 +896,7 @@ def test_day_session_quantities():
         79,
         1,
     )
-    assert soxl_used_low["placed"] == [("SOXL", "sell", 79, 2), ("SOXL", "buy", 66, 2)]
+    assert soxl_used_low["placed"] == [("SOXL", "sell", 79, 4), ("SOXL", "buy", 66, 4)]
 
 
 def test_koru_buy_fill_steps_below_7_2():
@@ -1351,8 +1351,8 @@ def test_regular_reject_does_not_block_other_tickers():
     others = [
         ("KORU", "sell", 11.3, 1),
         ("KORU", "buy", 9.4, 1),
-        ("SOXL", "sell", 86, 2),
-        ("SOXL", "buy", 72, 2),
+        ("SOXL", "sell", 86, 4),
+        ("SOXL", "buy", 72, 4),
     ]
     for moment in (
         _kst(2026, 10, 30, 1, 34),  # 12:34 EDT
@@ -1637,6 +1637,105 @@ def test_lagging_inquiry_does_not_duplicate_recent_place():
     assert code == 0, out
     assert seen == [], seen
     assert world["saved"]["recent_orders"] == []
+
+
+def test_prior_fill_does_not_hide_a_new_order_at_that_rung():
+    """2026-11-20 22:05Z: SOXL buy 2@30 was placed, then the next run logged NEEDS_REVIEW.
+
+    The inquiry still omitted that buy. An earlier fill at 30, already
+    handled, shares the rung. That fill must not erase the new order, or
+    the rung looks missing and the run places nothing while flagging review.
+    The fill of this same order number still clears the memory.
+    """
+    _restore_guards()
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "SOXL"
+    os.environ.pop("ORDER_TYPE", None)
+    os.environ.pop("MAX_QTY_MULT", None)
+    moment = _kst(2026, 11, 21, 7, 5)
+    assert not bot._orders_blocked(moment)
+    used = [_idx("SOXL", price) for price in (36, 33, 30)]
+    old_key = "ab" * 32
+    state = bot._fresh_state()
+    state["exception_filled"] = True
+    state["exception_id"] = bot._EXCEPTION_ID
+    state["tickers"]["SOXL"] = {
+        "sell": _idx("SOXL", 36),
+        "buy": _idx("SOXL", 30),
+        "double_used": used,
+    }
+    state["handled"] = [old_key]
+    state["recent_orders"] = [
+        {
+            "ticker": "SOXL",
+            "side": "buy",
+            "price": 26,
+            "qty": 4,
+            "at": int(moment.timestamp()) - 3600,
+            "slot": "",
+            "day": "20261121",
+            "orr_no": 351503,
+        },
+        {
+            "ticker": "SOXL",
+            "side": "buy",
+            "price": 30,
+            "qty": 2,
+            "at": int(moment.timestamp()) - 60,
+            "slot": "",
+            "day": "20261121",
+            "orr_no": 10019694,
+        },
+    ]
+    opens = [
+        {"ticker": "SOXL", "side": "sell", "price": price, "qty": 2}
+        for price in (36, 39, 42, 46, 50)
+    ]
+    opens.append({"ticker": "SOXL", "side": "buy", "price": 28, "qty": 4})
+    old_fill = {
+        "ticker": "SOXL",
+        "side": "buy",
+        "idx": _idx("SOXL", 30),
+        "price": 30,
+        "qty": 4,
+        "filled_qty": 4,
+        "cancelled_qty": 0,
+        "orr_no": 88001,
+        "orr_dt": "20261121",
+        "key": old_key,
+    }
+    placed = []
+    code, out, world = _run(
+        "intraday", moment, bot._clean_state(state), opens, [old_fill], _record(placed)
+    )
+    assert code == 0, out
+    assert "NEEDS_REVIEW SOXL" not in out
+    assert "SOXL ok yes" in out
+    assert placed == []
+    remembered = world["saved"]["recent_orders"]
+    assert any(item.get("orr_no") == 10019694 for item in remembered)
+    assert world["saved"]["tickers"]["SOXL"]["sell"] == _idx("SOXL", 36)
+    assert world["saved"]["tickers"]["SOXL"]["buy"] == _idx("SOXL", 30)
+
+    same = dict(old_fill)
+    same["orr_no"] = 10019694
+    same["key"] = "cd" * 32
+    same["filled_qty"] = 2
+    same["qty"] = 2
+    stepped = []
+    code, out, world = _run(
+        "intraday", moment, bot._clean_state(state), opens, [same], _record(stepped)
+    )
+    assert code == 0, out
+    assert "NEEDS_REVIEW SOXL" not in out
+    assert ("SOXL", "buy", 30, 4) not in stepped
+    assert ("SOXL", "buy", 28, 8) not in stepped
+    assert ("SOXL", "sell", 33, 4) in stepped
+    assert ("SOXL", "buy", 26, 8) not in stepped
+    assert "SOXL resting buy 26 qty 8" in out
+    assert world["saved"]["tickers"]["SOXL"]["sell"] == _idx("SOXL", 33)
+    assert world["saved"]["tickers"]["SOXL"]["buy"] == _idx("SOXL", 28)
+    assert not any(item.get("orr_no") == 10019694 for item in world["saved"]["recent_orders"])
 
 
 def test_reset_keeps_same_slot_recent_orders():
@@ -2761,6 +2860,7 @@ def main():
         test_regular_reject_does_not_block_other_tickers()
         test_reset_reject_still_places_exception()
         test_lagging_inquiry_does_not_duplicate_recent_place()
+        test_prior_fill_does_not_hide_a_new_order_at_that_rung()
         test_reset_keeps_same_slot_recent_orders()
         test_last_wipe_follows_us_eastern_close()
         test_order_guard_follows_us_eastern()
