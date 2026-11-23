@@ -76,14 +76,20 @@ def _actions(world):
     def exception_open():
         return world.get("exception_open", False)
 
-    def place_exception(counter, qty=None):
+    def place_exception(counter, qty=None, exc=None):
         if counter[0] >= bot._MAX_NEW:
             return None
         counter[0] += 1
+        spec = exc or {
+            "id": bot._EXCEPTION_ID,
+            "qty": bot._EXCEPTION_QTY,
+            "price": bot._EXCEPTION_PRICE,
+        }
         if qty is None:
-            qty = bot._EXCEPTION_QTY
-        world["exceptions"].append((qty, bot._EXCEPTION_PRICE))
-        world["exception_open"] = True
+            qty = spec["qty"]
+        world["exceptions"].append((qty, spec["price"]))
+        if spec.get("id") == bot._EXCEPTION_ID:
+            world["exception_open"] = True
         return True
 
     def save_state(data):
@@ -240,7 +246,20 @@ def test_batch_selector():
     assert full["selected"] == {"NAIL"}
     assert full["deferred"] == {"KORU", "SOXL"}
     assert full["exception"] is False
+    assert full["exception_take"] == 0
     assert full["blocked"] is False
+    short = [
+        {"ticker": "NAIL", "review": False, "place": [0] * 5},
+        {"ticker": "KORU", "review": False, "place": [0] * 4},
+        {"ticker": "SOXL", "review": False, "place": [0] * 4},
+    ]
+    partial = bot._reset_batch(short, allow, bot._fresh_state(), "17", _TODAY, True, 2)
+    assert partial["selected"] == {"NAIL"}
+    assert partial["exception_take"] == 1
+    assert partial["exception"] is False
+    both = bot._reset_batch(plans, allow, bot._fresh_state(), "17", _TODAY, True, 2)
+    assert both["exception_take"] == 2
+    assert both["exception"] is True
 
 
 def test_three_resets():
@@ -266,11 +285,11 @@ def test_three_resets():
     assert code == 0, out
     assert world["placed"] == _tagged("NAIL", 33, 28)
     assert world["cancelled"] == []
-    assert world["exceptions"] == [(150, 75)]
+    assert world["exceptions"] == [(150, 75), (100, 4.2)]
     assert "DEFERRED KORU" in out
     assert "DEFERRED SOXL" in out
     assert "DEFERRED exception" not in out
-    assert "exception placed 1" in out
+    assert "exception placed 2" in out
     assert "FOLLOWUP reset" in out
     assert "ERROR max_orders" not in out
     assert "OK live" in out
@@ -349,7 +368,8 @@ def test_deferred_not_cancelled_and_exception_survives():
     assert [item[0] for item in world["cancelled"]] == ["NAIL"]
     assert all(item[1] != 75 for item in world["cancelled"])
     assert [item[0] for item in world["placed"]] == ["NAIL", "NAIL", "NAIL", "NAIL"]
-    assert world["exceptions"] == []
+    assert world["exceptions"] == [(100, 4.2)]
+    assert "exception placed 1" in out
 
     done = world["saved"]
     # SOXL's turn. The standing sell at 75 is not a ladder rung, so the reset must not cancel it.
@@ -795,8 +815,12 @@ def test_reset_low_rung_sizes():
             (ticker, side, price, qty) for side, price, qty in expected
         ], (ticker, world["placed"], out)
         assert world["cancelled"] == []
-        assert world["exceptions"] == []
-        assert "exception placed" not in out
+        if ticker == "KORU":
+            assert world["exceptions"] == [(100, 4.2)]
+            assert "exception placed 1" in out
+        else:
+            assert world["exceptions"] == []
+            assert "exception placed" not in out
 
 
 def _book(orders):
@@ -1832,6 +1856,14 @@ def test_soxl_exception_sell_150_at_75():
         assert captured["url"] == bot.SELL_URL
         full = captured["body"]
         assert bot._place_exception("0000", True, [1], 110) is True
+        sell_body = dict(captured["body"])
+        sell_url = captured["url"]
+        koru = next(item for item in bot._EXCEPTIONS if item["id"] == "koru-buy-100-4.2")
+        assert bot._place_exception("0000", True, [2], None, koru) is True
+        assert captured["url"] == bot.BUY_URL
+        koru_body = dict(captured["body"])
+        captured["body"] = sell_body
+        captured["url"] = sell_url
     finally:
         gb._post_bearer = old_post
         os.environ.pop("ORDER_TYPE", None)
@@ -1855,6 +1887,12 @@ def test_soxl_exception_sell_150_at_75():
     assert body["fc_orr_uit_pr"] == 75
     assert "wtm_cur_knd_cd" not in body
     assert captured["url"] == bot.SELL_URL
+    assert koru_body["iem_cd"] == "KORU"
+    assert koru_body["orr_qty"] == 100
+    assert koru_body["fc_orr_uit_pr"] == 4.2
+    assert koru_body["wtm_cur_knd_cd"] == "1"
+    assert koru_body["ahi_nmn_pr_tp_cd"] == "00"
+    assert koru_body["fc_sec_trd_nat_cd"] == "200"
 
 def test_saved_anchor_buy_sizes():
     """Current history stays. 39 used repeats at 4. An unused 39 is 8.
@@ -1962,7 +2000,10 @@ def test_saved_anchor_buy_sizes():
             (ticker, side, price, qty) for side, price, qty in saved_rows[ticker]
         ]
         assert world["cancelled"] == []
-        assert world["exceptions"] == []
+        if ticker == "KORU":
+            assert world["exceptions"] == [(100, 4.2)]
+        else:
+            assert world["exceptions"] == []
         kept = world["saved"]["tickers"][ticker]
         assert kept["sell"] == _level(ticker, sell)
         assert kept["buy"] == _level(ticker, buy)
@@ -2194,13 +2235,17 @@ def test_evening_followup_chain_places_exception_with_nail():
         def exception_open():
             return False
 
-        def place_exception(counter, qty=None):
+        def place_exception(counter, qty=None, exc=None):
             if counter[0] >= bot._MAX_NEW:
                 return None
             counter[0] += 1
+            spec = exc or {
+                "qty": bot._EXCEPTION_QTY,
+                "price": bot._EXCEPTION_PRICE,
+            }
             if qty is None:
-                qty = bot._EXCEPTION_QTY
-            sent_exceptions.append((qty, bot._EXCEPTION_PRICE))
+                qty = spec["qty"]
+            sent_exceptions.append((qty, spec["price"]))
             return True
 
         actions["exception_open"] = exception_open
@@ -2225,8 +2270,8 @@ def test_evening_followup_chain_places_exception_with_nail():
     first_code, first_out, first_placed = passes[0]
     assert first_code == 0, first_out
     assert first_placed == _tagged("NAIL", 33, 28)
-    assert sent_exceptions == [(150, 75)]
-    assert "exception placed 1" in first_out
+    assert sent_exceptions == [(150, 75), (100, 4.2)]
+    assert "exception placed 2" in first_out
     assert "DEFERRED KORU" in first_out
     assert "DEFERRED SOXL" in first_out
     assert "DEFERRED exception" not in first_out
@@ -2253,7 +2298,7 @@ def test_evening_followup_chain_places_exception_with_nail():
     }
     assert box["state"]["reset_done"]["17"] == "20261110"
     assert box["state"]["exception_filled"] is False
-    assert sent_exceptions == [(150, 75)]
+    assert sent_exceptions == [(150, 75), (100, 4.2)]
 
 
 def test_exception_not_duplicated_when_open_filled_or_resting():
@@ -2271,8 +2316,8 @@ def test_exception_not_duplicated_when_open_filled_or_resting():
     }
     code, out, world = _run(_live_book(), [resting_order], {}, when=evening)
     assert code == 0, out
-    assert world["exceptions"] == []
-    assert "exception placed" not in out
+    assert world["exceptions"] == [(100, 4.2)]
+    assert "exception placed 1" in out
     assert all(item[1] != 75 for item in world["cancelled"])
     assert world["saved"]["exception_resting"] == {}
 
@@ -2287,8 +2332,8 @@ def test_exception_not_duplicated_when_open_filled_or_resting():
     }
     code, out, world = _run(filled, [], {}, when=evening)
     assert code == 0, out
-    assert world["exceptions"] == []
-    assert "exception placed" not in out
+    assert world["exceptions"] == [(100, 4.2)]
+    assert all(price != 75 for _qty, price in world["exceptions"])
     assert world["saved"]["exception_filled"] is True
     assert world["saved"]["exception_id"] == bot._EXCEPTION_ID
     assert world["saved"]["exception_resting"] == {}
@@ -2302,14 +2347,14 @@ def test_exception_not_duplicated_when_open_filled_or_resting():
     }
     code, out, world = _run(resting, [], {"exception_open": False}, when=evening)
     assert code == 0, out
-    assert world["exceptions"] == []
-    assert "exception placed" not in out
+    assert world["exceptions"] == [(100, 4.2)]
+    assert "exception placed 1" in out
     assert "DEFERRED exception" not in out
 
     code, out, world = _run(_live_book(), [], {"exception_open": True}, when=evening)
     assert code == 0, out
-    assert world["exceptions"] == []
-    assert "exception placed" not in out
+    assert world["exceptions"] == [(100, 4.2)]
+    assert "exception placed 1" in out
 
     morning_mark = _live_book()
     morning_mark["exception_resting"] = {
@@ -2320,8 +2365,8 @@ def test_exception_not_duplicated_when_open_filled_or_resting():
     }
     code, out, world = _run(morning_mark, [], {"exception_open": False}, when=evening)
     assert code == 0, out
-    assert world["exceptions"] == [(150, 75)]
-    assert "exception placed 1" in out
+    assert world["exceptions"] == [(150, 75), (100, 4.2)]
+    assert "exception placed 2" in out
     assert world["saved"]["exception_resting"]["slot"] == "17"
     assert world["saved"]["exception_filled"] is False
     weekend = {
@@ -2423,7 +2468,8 @@ def test_followup_guard_and_loop_limit():
     code, out, world = _run(_live_book(), [], {}, when=near_guard)
     assert code == 0, out
     assert world["placed"] == _tagged("NAIL", 33, 28)
-    assert world["exceptions"] == [(150, 75)]
+    assert world["exceptions"] == [(150, 75), (100, 4.2)]
+    assert "exception placed 2" in out
     assert "DEFERRED KORU" in out
     assert "DEFERRED SOXL" in out
     assert "DEFERRED exception" not in out
@@ -2560,10 +2606,399 @@ def test_soxl_monday_reset_plan():
     ]
 
 
+def _koru_exc():
+    for exc in bot._EXCEPTIONS:
+        if exc["id"] == "koru-buy-100-4.2":
+            return exc
+    raise AssertionError("missing koru exception")
+
+
+def test_koru_exception_buy_100_at_4_2():
+    """Standing KORU buy of 100 at 4.2, beside the ladder's own 2-share buy.
+
+    A partial fill re-places only the remainder. Filling all 100 stops
+    the replacement. A 2-share fill is the ladder fill only when it is
+    not this order. Cancel-dup does not treat the standing buy as a copy.
+    """
+    exc = _koru_exc()
+    assert [item["id"] for item in bot._EXCEPTIONS] == [
+        "soxl-sell-150-75",
+        "koru-buy-100-4.2",
+    ]
+    assert exc == {
+        "id": "koru-buy-100-4.2",
+        "ticker": "KORU",
+        "side": "buy",
+        "price": 4.2,
+        "qty": 100,
+    }
+    assert bot._EXCEPTION_ID == "soxl-sell-150-75"
+    assert bot._EXCEPTION_QTY == 150 and bot._EXCEPTION_PRICE == 75
+    idx = _level("KORU", 4.2)
+    assert idx is not None
+    assert bot._buy_computed("KORU", idx, []) == 2
+    assert bot._buy_computed("KORU", idx, [idx]) == 1
+    ladder = _tagged("KORU", 4.6, 4.2)
+    assert ("KORU", "buy", 4.2, 2) in ladder
+    assert ("KORU", "buy", 3.9, 2) in ladder
+
+    hundred = {
+        "ticker": "KORU",
+        "side": "buy",
+        "price": 4.2,
+        "qty": 100,
+        "orr_no": 100,
+        "ordered_qty": 100,
+    }
+    two = {"ticker": "KORU", "side": "buy", "price": 4.2, "qty": 2, "orr_no": 2}
+    buys, _sells, ignored = bot._split("KORU", [dict(hundred), dict(two)])
+    assert ignored == 1
+    assert [order["qty"] for order in buys] == [2]
+    assert bot._exception_open([hundred], exc)
+    assert not bot._exception_open([two], exc)
+    assert not bot._exception_order(two)
+    assert bot._exception_order(hundred)
+    assert bot._ladder_book_empty([hundred])
+    assert not bot._ladder_book_empty([hundred, two])
+
+    remainder = {
+        "ticker": "KORU",
+        "side": "buy",
+        "price": 4.2,
+        "qty": 2,
+        "ordered_qty": 100,
+        "orr_no": 100,
+    }
+    assert bot._exception_order(remainder)
+    remembered = {
+        "exception_orders": {
+            exc["id"]: {
+                "filled": False,
+                "filled_qty": 98,
+                "parts": {},
+                "resting": {},
+                "order_nos": [100],
+            }
+        }
+    }
+    ambiguous = {"ticker": "KORU", "side": "buy", "price": 4.2, "qty": 2, "orr_no": 100}
+    assert bot._exception_order(ambiguous, remembered)
+    assert not bot._exception_order(two, remembered)
+    buys, _sells, ignored = bot._split(
+        "KORU", [dict(ambiguous), dict(two)], remembered
+    )
+    assert ignored == 1
+    assert [order["orr_no"] for order in buys] == [2]
+
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "KORU,SOXL"
+    os.environ.pop("ORDER_TYPE", None)
+    os.environ.pop("MAX_QTY_MULT", None)
+    os.environ.pop("CANCEL_DUP", None)
+    when = datetime(2026, 11, 10, 18, 11, tzinfo=bot.KST)
+    state = bot._clean_state(
+        {
+            "version": 2,
+            "tickers": {
+                "KORU": _pair("KORU", 4.6, 4.2),
+                "SOXL": _pair("SOXL", 113, 94),
+            },
+            "handled": [],
+            "exception_filled": False,
+            "reset_done": {"09": "", "17": ""},
+            "reset_tickers": {"09": {}, "17": {"SOXL": "20261110"}},
+        }
+    )
+    code, out, world = _run(state, [], {}, when=when)
+    assert code == 0, out
+    assert world["placed"] == ladder
+    assert world["exceptions"] == [(150, 75), (100, 4.2)]
+    assert "exception placed 2" in out
+    assert "DEFERRED exception" not in out
+    assert world["saved"]["tickers"]["KORU"]["double_used"] == []
+    assert world["saved"]["exception_id"] == ""
+    assert world["saved"]["exception_filled"] is False
+    stored = world["saved"]["exception_orders"][exc["id"]]
+    assert stored["filled"] is False
+    assert stored["filled_qty"] == 0
+    assert stored["resting"]["id"] == exc["id"]
+    assert stored["resting"]["slot"] == "17"
+    assert stored["resting"]["day"] == "20261110"
+
+    book = [
+        {"ticker": "KORU", "side": side, "price": price, "qty": qty, "orr_no": 10 + i}
+        for i, (side, price, qty) in enumerate(_orders("KORU", 4.6, 4.2))
+    ]
+    book.append(dict(hundred))
+    saved = world["saved"]
+    saved["reset_done"] = {"09": "", "17": ""}
+    code, out, held = _run(saved, book, {}, when=when)
+    assert code == 0, out
+    assert held["exceptions"] == []
+    assert "exception placed" not in out
+    assert held["cancelled"] == []
+    assert "KORU ignored 1" in out
+    assert held["saved"]["tickers"]["KORU"]["double_used"] == []
+    assert ("KORU", "buy", 4.2, 2) not in held["placed"]
+
+    partial_key = "c3" * 32
+    fill = {
+        "ticker": "KORU",
+        "side": "buy",
+        "price": 4.2,
+        "ordered_qty": 100,
+        "filled_qty": 40,
+        "cancelled_qty": 0,
+        "idx": idx,
+        "orr_no": 100,
+        "key": partial_key,
+    }
+    code, out, partial = _run(
+        state, [], {"exception_open": False}, when=when, fills=[fill]
+    )
+    assert code == 0, out
+    assert partial["exceptions"] == [(150, 75), (60, 4.2)]
+    assert ("KORU", "buy", 4.2, 2) in partial["placed"]
+    assert partial["saved"]["tickers"]["KORU"]["sell"] == _level("KORU", 4.6)
+    assert partial["saved"]["tickers"]["KORU"]["buy"] == idx
+    assert partial["saved"]["tickers"]["KORU"]["double_used"] == []
+    assert partial["saved"]["exception_orders"][exc["id"]]["filled_qty"] == 40
+    assert partial["saved"]["exception_orders"][exc["id"]]["parts"][partial_key] == 40
+    assert partial["saved"]["exception_filled"] is False
+    assert partial_key in partial["saved"]["handled"]
+
+    grown_key = "d4" * 32
+    grown = dict(fill, filled_qty=90, key=grown_key)
+    # Same order reporting a larger fill replaces the previous count on
+    # that key only. A different key would add. This key is new, so 40
+    # from the first key stays and 90 would overshoot. Use the same key.
+    grown = dict(fill, filled_qty=90)
+    later = datetime(2026, 11, 11, 18, 11, tzinfo=bot.KST)
+    code, out, grew = _run(
+        partial["saved"], [], {"exception_open": False}, when=later, fills=[grown]
+    )
+    assert code == 0, out
+    assert grew["exceptions"] == [(150, 75), (10, 4.2)]
+    assert grew["saved"]["exception_orders"][exc["id"]]["filled_qty"] == 90
+    assert grew["saved"]["exception_orders"][exc["id"]]["filled"] is False
+    assert grew["saved"]["tickers"]["KORU"]["double_used"] == []
+
+    rest_key = "e6" * 32
+    rest = dict(fill, filled_qty=10, key=rest_key, orr_no=101, ordered_qty=10)
+    done_at = datetime(2026, 11, 12, 18, 11, tzinfo=bot.KST)
+    code, out, finished = _run(
+        grew["saved"],
+        [],
+        {"exception_open": False},
+        when=done_at,
+        fills=[grown, rest],
+    )
+    assert code == 0, out
+    assert finished["exceptions"] == [(150, 75)]
+    assert "exception placed 1" in out
+    assert finished["saved"]["exception_orders"][exc["id"]]["filled"] is True
+    assert finished["saved"]["exception_orders"][exc["id"]]["filled_qty"] == 100
+    assert finished["saved"]["exception_orders"][exc["id"]]["resting"] == {}
+    assert finished["saved"]["tickers"]["KORU"]["double_used"] == []
+
+    after = datetime(2026, 11, 13, 18, 11, tzinfo=bot.KST)
+    code, out, stopped = _run(
+        finished["saved"], [], {"exception_open": False}, when=after
+    )
+    assert code == 0, out
+    assert stopped["exceptions"] == [(150, 75)]
+    assert stopped["saved"]["exception_orders"][exc["id"]]["filled"] is True
+
+    # A 2-share fill of the standing order must not step the ladder or
+    # mark the rung used. A separate 2-share ladder fill still does.
+    tiny_key = "f7" * 32
+    tiny = dict(fill, filled_qty=2, key=tiny_key)
+    code, out, tiny_world = _run(
+        state, [], {"exception_open": False}, when=when, fills=[tiny]
+    )
+    assert code == 0, out
+    assert tiny_world["exceptions"] == [(150, 75), (98, 4.2)]
+    assert tiny_world["placed"] == ladder
+    assert tiny_world["saved"]["tickers"]["KORU"]["double_used"] == []
+    assert tiny_world["saved"]["exception_orders"][exc["id"]]["filled_qty"] == 2
+
+    ladder_key = "a8" * 32
+    ladder_fill = {
+        "ticker": "KORU",
+        "side": "buy",
+        "price": 4.2,
+        "ordered_qty": 2,
+        "filled_qty": 2,
+        "cancelled_qty": 0,
+        "idx": idx,
+        "orr_no": 2,
+        "key": ladder_key,
+    }
+    code, out, stepped = _run(
+        state, [], {"exception_open": False}, when=when, fills=[ladder_fill]
+    )
+    assert code == 0, out
+    assert (100, 4.2) in stepped["exceptions"]
+    assert idx in stepped["saved"]["tickers"]["KORU"]["double_used"]
+    assert stepped["saved"]["tickers"]["KORU"]["buy"] == _level("KORU", 3.9)
+    assert ("KORU", "buy", 4.2, 2) not in stepped["placed"]
+    assert stepped["saved"]["exception_orders"].get(exc["id"], {}).get("filled_qty", 0) == 0
+
+    code, out, both_fills = _run(
+        state,
+        [],
+        {"exception_open": False},
+        when=when,
+        fills=[ladder_fill, fill],
+    )
+    assert code == 0, out
+    assert (60, 4.2) in both_fills["exceptions"]
+    assert idx in both_fills["saved"]["tickers"]["KORU"]["double_used"]
+    assert both_fills["saved"]["exception_orders"][exc["id"]]["filled_qty"] == 40
+    assert both_fills["saved"]["tickers"]["KORU"]["buy"] == stepped["saved"]["tickers"]["KORU"]["buy"]
+
+    # Intraday sees the standing fill and does not follow it.
+    os.environ["LIVE_TICKERS"] = "KORU"
+    intra_state = bot._clean_state(
+        {
+            "version": 2,
+            "tickers": {"KORU": _pair("KORU", 4.6, 4.2)},
+            "handled": [],
+            "exception_filled": True,
+            "exception_id": bot._EXCEPTION_ID,
+            "reset_done": {"09": "20261110", "17": "20261110"},
+        }
+    )
+    intra_book = [
+        {"ticker": "KORU", "side": side, "price": price, "qty": qty, "orr_no": 30 + i}
+        for i, (side, price, qty) in enumerate(_orders("KORU", 4.6, 4.2))
+    ]
+    noon = datetime(2026, 11, 10, 12, 0, tzinfo=bot.KST)
+    code, out, intra = _run(
+        intra_state, intra_book, {}, when=noon, fills=[fill], mode="intraday"
+    )
+    assert code == 0, out
+    assert intra["placed"] == []
+    assert intra["cancelled"] == []
+    assert intra["exceptions"] == []
+    assert intra["saved"]["tickers"]["KORU"]["double_used"] == []
+    assert intra["saved"]["tickers"]["KORU"]["buy"] == idx
+    assert intra["saved"]["exception_orders"][exc["id"]]["filled_qty"] == 40
+
+    os.environ["LIVE_TICKERS"] = "KORU"
+    os.environ["CANCEL_DUP"] = "cancel-dup KORU BUY 4.2 2"
+    dup_opens = [
+        {
+            "ticker": "KORU",
+            "side": "buy",
+            "price": 4.2,
+            "qty": 2,
+            "orr_no": 1,
+            "orr_dt": "20261110",
+        },
+        {
+            "ticker": "KORU",
+            "side": "buy",
+            "price": 4.2,
+            "qty": 2,
+            "orr_no": 3,
+            "orr_dt": "20261110",
+        },
+        dict(hundred, orr_dt="20261110"),
+        {
+            "ticker": "KORU",
+            "side": "buy",
+            "price": 4.2,
+            "qty": 2,
+            "ordered_qty": 100,
+            "orr_no": 100,
+            "orr_dt": "20261110",
+        },
+    ]
+    cancelled = []
+
+    def _cancel(ticker, order):
+        cancelled.append((ticker, order.get("price"), order.get("orr_no"), order.get("qty")))
+        return True
+
+    dup_world = {}
+    dup_actions = _actions(dup_world)
+    dup_actions["cancel"] = _cancel
+    code, out = _capture(
+        lambda: bot.run(
+            "cancel-dup",
+            "workflow_dispatch",
+            when,
+            when.astimezone(bot.ET),
+            dup_opens,
+            [],
+            remembered,
+            dup_actions,
+        )
+    )
+    assert code == 0, out
+    assert cancelled == [("KORU", 4.2, 3, 2)]
+    os.environ["CANCEL_DUP"] = "cancel-dup KORU BUY 4.2 2"
+    cancelled.clear()
+    only = [dup_opens[0], dup_opens[3]]
+    code, out = _capture(
+        lambda: bot.run(
+            "cancel-dup",
+            "workflow_dispatch",
+            when,
+            when.astimezone(bot.ET),
+            only,
+            [],
+            remembered,
+            dup_actions,
+        )
+    )
+    assert code == 0, out
+    assert cancelled == []
+    assert "matches 1" in out
+    os.environ.pop("CANCEL_DUP", None)
+
+    # One free slot places the SOXL sell and defers the KORU buy.
+    # The next pass places the KORU buy.
+    os.environ["LIVE_TICKERS"] = "NAIL,KORU,SOXL"
+    old_max = bot._MAX_NEW
+    bot._MAX_NEW = 5
+    try:
+        defer_state = bot._clean_state(
+            {
+                "version": 2,
+                "tickers": {
+                    "NAIL": _pair("NAIL", 33, 28),
+                    "KORU": _pair("KORU", 13.5, 11.3),
+                    "SOXL": _pair("SOXL", 113, 94),
+                },
+                "handled": [],
+                "exception_filled": False,
+                "reset_done": {"09": "", "17": ""},
+            }
+        )
+        code, out, first = _run(defer_state, [], {}, when=when)
+        assert code == 0, out
+        assert first["exceptions"] == [(150, 75)]
+        assert "exception placed 1" in out
+        assert "DEFERRED exception" in out
+        assert "DEFERRED KORU" in out
+        assert bot._wants_reset_followup is True
+        code, out, second = _run(first["saved"], [], {}, when=when)
+        assert code == 0, out
+        assert second["exceptions"] == [(100, 4.2)]
+        assert "exception placed 1" in out
+        assert second["saved"]["exception_orders"][exc["id"]]["resting"]["slot"] == "17"
+        assert second["placed"] == _tagged("KORU", 13.5, 11.3)
+    finally:
+        bot._MAX_NEW = old_max
+
+
 def main():
     try:
         test_pairs_and_limits()
         test_batch_selector()
+        test_koru_exception_buy_100_at_4_2()
         test_three_resets()
         test_evening_followup_chain_places_exception_with_nail()
         test_exception_not_duplicated_when_open_filled_or_resting()

@@ -353,7 +353,9 @@ def test_reset_does_not_requote_unhandled_anchor_fill():
     assert key in saved["handled"]
     assert saved["tickers"]["NAIL"] == state["tickers"]["NAIL"]
     assert saved["tickers"]["KORU"] == state["tickers"]["KORU"]
-    assert "exception placed" not in out
+    assert world["exceptions"] == [(100, 4.2)]
+    assert "exception placed 1" in out
+    assert all(price != 75 for _qty, price in world["exceptions"])
 
     wiped = [order for order in opens if order["orr_no"] in (5, 6, 7, 8, 9)]
     code, out, wiped_world = sim._run(state, wiped, {}, fills=[fill])
@@ -576,6 +578,77 @@ def test_adjust_skips_ineligible_exception():
     assert world["exceptions"] == []
 
 
+def test_adjust_leaves_koru_exception():
+    """Adjust cancels a stray 2-share KORU buy and leaves the 100-share buy."""
+    when = _PREMARKET
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "NAIL,KORU,SOXL"
+    os.environ.pop("ORDER_TYPE", None)
+    os.environ.pop("MAX_QTY_MULT", None)
+    os.environ["LADDER_MODE"] = "adjust"
+    os.environ["ADJUST_TICKER"] = "KORU"
+    os.environ["ADJUST_SELL"] = "7.2"
+    os.environ["ADJUST_BUY"] = "6"
+    os.environ["ADJUST_STEP"] = "none"
+    os.environ["ADJUST_PREVIEW"] = "false"
+    bot._now_kst = lambda: when
+    standing = {
+        "ticker": "KORU",
+        "side": "buy",
+        "price": 4.2,
+        "qty": 100,
+        "orr_no": 100,
+        "ordered_qty": 100,
+    }
+    stray = {"ticker": "KORU", "side": "buy", "price": 4.2, "qty": 2, "orr_no": 2}
+    opens = _opens() + [standing, stray]
+    world = {"placed": [], "cancelled": [], "exceptions": []}
+    actions = sim._actions(world)
+
+    def place_exception(_counter, _qty=None, _exc=None):
+        raise AssertionError("adjust placed a standing order")
+
+    actions["place_exception"] = place_exception
+    code, out = sim._capture(
+        lambda: bot.run(
+            "adjust",
+            "workflow_dispatch",
+            when,
+            when.astimezone(bot.ET),
+            opens,
+            [],
+            _state(),
+            actions,
+        )
+    )
+    assert code == 0, out
+    assert ("KORU", 4.2, 2) in world["cancelled"]
+    assert ("KORU", 4.2, 100) not in world["cancelled"]
+    assert "KORU plan ignore buy 4.2 qty 100" in out
+    assert "KORU plan cancel buy 4.2 qty 2" in out
+    assert "exception plan place" not in out
+    assert "exception placed" not in out
+    assert world["exceptions"] == []
+    assert world["saved"]["tickers"]["SOXL"] == _state()["tickers"]["SOXL"]
+
+    missing = [order for order in opens if order.get("orr_no") != 100]
+    code, out = sim._capture(
+        lambda: bot.run(
+            "adjust",
+            "workflow_dispatch",
+            when,
+            when.astimezone(bot.ET),
+            missing,
+            [],
+            _state(),
+            actions,
+        )
+    )
+    assert code == 0, out
+    assert "exception placed" not in out
+    assert "4.2" not in out or "KORU plan cancel buy 4.2 qty 2" in out
+
+
 def test_adjust_does_not_replace_recent_order():
     """A rung placed moments ago stays put when the inquiry omits it."""
     before = _state()
@@ -647,6 +720,7 @@ def main():
         test_adjust_places_missing_exception_once()
         test_koru_adjust_places_missing_exception()
         test_adjust_skips_ineligible_exception()
+        test_adjust_leaves_koru_exception()
         test_adjust_does_not_replace_recent_order()
         test_workflow_file()
         print("OK adjust")
