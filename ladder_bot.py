@@ -12,10 +12,10 @@ before 09:10 KST, are closed. Those runs log "skip: time guard" and exit.
 Intraday follow-up runs in the US session and in the KST day session.
 A live reset places whole tickers only, at most 6 new orders. A ticker
 that does not fit is left uncancelled and logged DEFERRED for a later run.
-The standing SOXL sell uses a free slot in that same run when one remains,
-even if SOXL's ladder is deferred. A successful place is remembered for
-that reset slot, so a later pass does not send it again while the broker
-inquiry still omits it. Open-order and already-sold checks still apply.
+Each standing exception uses a free slot in that same run when one remains,
+even if that ticker's ladder is deferred. A successful place is remembered
+for that reset slot, so a later pass does not send it again while the broker
+inquiry still omits it. Open-order and already-filled checks still apply.
 A ladder order this bot just placed is stored on its state for 3 hours:
 ticker, side, price, quantity, time, and the order number when the broker
 returns one. Intraday, adjust, and reset treat that order as still open
@@ -42,13 +42,15 @@ That covers a cron GitHub never started. It does not cancel a book
 that already has ladder orders; those stay on the intraday path.
 Deferred work is retried in this process about 2 minutes later, at most
 3 extra passes, and not into a blocked window or out of the slot.
-Reset keeps one SOXL sell of 150 shares at 75 until that sell is fully
-filled, and places it again after each broker cancel-all. A partial fill
-reduces the next order to the shares still unsold. The retired buys stay
-retired: 100 at 75 on 2026-10-31, 200 at 38, and 200 at 37.5 filled
-2026-11-21. exception_filled counts only when exception_id is
-soxl-sell-150-75, so a saved true from any of those buys does not block
-150 at 75 and must not be reseeded true.
+Reset keeps two standing orders until each is fully filled, and places
+them again after each broker cancel-all. A partial fill reduces the next
+order to the shares still left. The SOXL sell is 150 at 75. The KORU buy
+is 100 at 4.2, sent to the buy endpoint, and it is not the ladder's own
+2-share buy at that rung. The retired buys stay retired: 100 at 75 on
+2026-10-31, 200 at 38, and 200 at 37.5 filled 2026-11-21. exception_filled
+counts only when exception_id is soxl-sell-150-75, so a saved true from
+any of those buys does not block 150 at 75 and must not be reseeded true.
+The KORU buy keeps its own filled count under exception_orders.
 SOXL buys and sells 4. A first SOXL buy at 39 or below is 8, then 4
 once that level is in double_used. KORU buys and sells 1. A first KORU
 buy at 6 or below is 2, then 1. NAIL is unchanged. Saved double_used
@@ -59,8 +61,9 @@ match and places the missing ones. Preview prints those prices and
 quantities and does not save state or send orders. When the SOXL sell
 at 75 is missing and still has shares unsold, adjust places the
 remaining quantity with the same checks, including while another ticker
-is the one being moved. An open exception is left alone. Intraday and
-cancel-dup leave that sell alone and do not treat it as a ladder rung
+is the one being moved. An open exception is left alone. The KORU buy
+at 4.2 is placed only by reset. Intraday, adjust, and cancel-dup leave
+both standing orders alone and do not treat either as a ladder rung
 or a duplicate. Other tickers' ladders are left alone.
 Adjust may send orders in the same US and KST sessions as intraday.
 Reset applies an unhandled confirmed fill at the current anchor before
@@ -94,6 +97,7 @@ Spec fields used:
   Spec requires fc_orr_uit_pr for 00, 61, 62, and 63. There is no
   separate price field for 00. Buy also sends wtm_cur_knd_cd 1.
   The standing SOXL sell uses the sell body and does not send that field.
+  The standing KORU buy uses the buy body and does send it.
 - POST /gbstock/order/v1/cancel
   org_orr_no, all_pat_dit_cd 1 (full cancel)
 """
@@ -126,7 +130,7 @@ BUY_URL = gb.LIVE + "/gbstock/order/v1/buy"
 SELL_URL = gb.LIVE + "/gbstock/order/v1/sell"
 CANCEL_URL = gb.LIVE + "/gbstock/order/v1/cancel"
 _ORDER_URLS = {BUY_URL, SELL_URL, CANCEL_URL}
-# Ladder orders only. The standing SOXL sell of 150 does not use this cap.
+# Ladder orders only. Standing exceptions do not use this cap.
 _HARD_MAX = {"NAIL": 40, "KORU": 4, "SOXL": 8}
 _MAX_NEW = 6
 # Extra reset passes after a deferral. Three tickers need only a couple;
@@ -138,10 +142,28 @@ _FOLLOWUP_GAP = 120
 _RECENT_GRACE = 3 * 60 * 60
 _RECENT_MAX = 40
 _wants_reset_followup = False
-# Standing SOXL sell, replaced after every broker cancel-all until all
-# 150 shares are sold. Retired, and a saved true must not block this one:
-# buy 100 at 75 on 2026-10-31, buy 200 at 38, buy 200 at 37.5 filled
-# 2026-11-21 (soxl-buy-200-37-5).
+# Standing orders, replaced after every broker cancel-all until each
+# target is filled. The SOXL fields below stay the sell of 150 at 75.
+# Retired, and a saved true must not block that sell: buy 100 at 75 on
+# 2026-10-31, buy 200 at 38, buy 200 at 37.5 filled 2026-11-21
+# (soxl-buy-200-37-5). The KORU buy is not the ladder's 2-share rung.
+_EXCEPTIONS = (
+    {
+        "id": "soxl-sell-150-75",
+        "ticker": "SOXL",
+        "side": "sell",
+        "price": 75,
+        "qty": 150,
+    },
+    {
+        "id": "koru-buy-100-4.2",
+        "ticker": "KORU",
+        "side": "buy",
+        "price": 4.2,
+        "qty": 100,
+    },
+)
+_EXCEPTION_BY_ID = {item["id"]: item for item in _EXCEPTIONS}
 _EXCEPTION_PRICE = 75
 _EXCEPTION_QTY = 150
 _EXCEPTION_ID = "soxl-sell-150-75"
@@ -421,14 +443,14 @@ def _level_of(ticker, price):
     return ladders._level_of(ticker, float(price))
 
 
-def _split(ticker, orders):
+def _split(ticker, orders, state=None):
     ignored = 0
     buys = []
     sells = []
     for order in orders:
-        # 75 is not a rung. If it ever matched one, it would still not be
-        # a ladder sell: the standing order is not part of the book.
-        if _counts_as_exception(ticker, order):
+        # 75 is not a rung. 4.2 is, and the 100-share buy there is still
+        # not a ladder order. The ladder's own 1- or 2-share buy stays.
+        if _counts_as_exception(ticker, order, state):
             ignored += 1
             continue
         index = _level_of(ticker, order.get("price"))
@@ -595,11 +617,13 @@ def _parse_row(row):
     status = ladders._text(row.get("oss_ato_orr_sts_cd"))
     filled = ladders._float(row.get("cns_qty"))
     cancelled = ladders._float(row.get("can_qty"))
+    ordered = ladders._blank_number(row.get("orr_qty"))
     return {
         "ticker": ticker,
         "side": ladders._side(row),
         "price": price,
         "qty": qty,
+        "ordered_qty": 0 if ordered is None else ordered,
         "filled_qty": 0 if filled is None else filled,
         "cancelled_qty": 0 if cancelled is None else cancelled,
         "idx": _level_of(ticker, price),
@@ -827,8 +851,14 @@ def _exception_this_run(plans, allow, state, slot, today, selected):
     return False
 
 
-def _reset_batch(plans, allow, state, slot, today, want_exception):
-    """Whole tickers only. A ticker that does not fit waits for a later run."""
+def _reset_batch(plans, allow, state, slot, today, want_exception, exception_n=None):
+    """Whole tickers only. A ticker that does not fit waits for a later run.
+
+    `want_exception` True asks for one standing order, the historical
+    call. `exception_n` asks for that many, and a short remaining slot
+    count takes the first of them. `exception` is True only when every
+    requested standing order fits. `exception_take` is how many do.
+    """
     remaining = _MAX_NEW
     selected = []
     deferred = []
@@ -844,6 +874,7 @@ def _reset_batch(plans, allow, state, slot, today, want_exception):
                 "selected": set(),
                 "deferred": set(),
                 "exception": False,
+                "exception_take": 0,
                 "blocked": True,
             }
         if cost > remaining:
@@ -851,23 +882,30 @@ def _reset_batch(plans, allow, state, slot, today, want_exception):
             continue
         selected.append(ticker)
         remaining -= cost
-    take_exception = False
-    if want_exception and remaining >= 1:
-        take_exception = _exception_this_run(
-            plans, allow, state, slot, today, set(selected)
-        )
+    wanted = 0
+    if want_exception:
+        wanted = 1 if exception_n is None else exception_n
+        if isinstance(wanted, bool) or not isinstance(wanted, int) or wanted < 1:
+            wanted = 1
+    take = 0
+    if wanted and remaining >= 1 and _exception_this_run(
+        plans, allow, state, slot, today, set(selected)
+    ):
+        take = min(wanted, remaining)
     return {
         "selected": set(selected),
         "deferred": set(deferred),
-        "exception": take_exception,
+        "exception": take == wanted and wanted > 0,
+        "exception_take": take,
         "blocked": False,
     }
 
 
-def _clean_exception_resting(raw):
+def _clean_exception_resting(raw, exc_id=None):
+    expected = _EXCEPTION_ID if exc_id is None else exc_id
     if not isinstance(raw, dict):
         return {}
-    if raw.get("id") != _EXCEPTION_ID:
+    if raw.get("id") != expected:
         return {}
     day = raw.get("day")
     slot = raw.get("slot")
@@ -875,21 +913,29 @@ def _clean_exception_resting(raw):
         return {}
     if slot not in ("09", "17", ""):
         return {}
-    cleaned = {"id": _EXCEPTION_ID, "slot": slot, "day": day}
+    cleaned = {"id": expected, "slot": slot, "day": day}
     at = raw.get("at")
     if isinstance(at, int) and not isinstance(at, bool) and at >= 0:
         cleaned["at"] = at
     return cleaned
 
 
-def _exception_resting(state, slot, today):
-    """True when this bot already placed the standing sell for this slot.
+def _exception_resting(state, slot, today, exc=None):
+    """True when this bot already placed this standing order for this slot.
 
     The broker inquiry can omit a new order for a long time. The mark is
     only for the slot that placed it, so the next wipe's slot can send
-    another if the order is still unfilled and not open.
+    another if the order is still unfilled and not open. The SOXL sell
+    keeps the top-level mark. Any other standing order keeps its own.
     """
-    raw = _clean_exception_resting(state.get("exception_resting"))
+    spec = _soxl_exc() if exc is None else exc
+    if spec["id"] == _EXCEPTION_ID:
+        raw = _clean_exception_resting(
+            state.get("exception_resting") if isinstance(state, dict) else None
+        )
+    else:
+        bucket = _read_exception_bucket(state, spec) or {}
+        raw = _clean_exception_resting(bucket.get("resting"), spec["id"])
     if not raw or raw["day"] != today:
         return False
     if slot in ("09", "17"):
@@ -897,22 +943,36 @@ def _exception_resting(state, slot, today):
     return True
 
 
-def _mark_exception_resting(state, slot, today, now):
-    state["exception_resting"] = {
-        "id": _EXCEPTION_ID,
+def _mark_exception_resting(state, slot, today, now, exc=None):
+    spec = _soxl_exc() if exc is None else exc
+    mark = {
+        "id": spec["id"],
         "slot": slot if slot in ("09", "17") else "",
         "day": today,
         "at": int(now.timestamp()),
     }
+    if spec["id"] == _EXCEPTION_ID:
+        state["exception_resting"] = mark
+        return
+    _ensure_exception_bucket(state, spec)["resting"] = mark
 
 
-def _exception_due(state, opens, slot, today):
-    """True when the standing sell is still unsold and not already resting."""
-    if _exception_done(state):
+def _exception_due(state, opens, slot, today, exc=None):
+    """True when this standing order is still open-work and not resting."""
+    spec = _soxl_exc() if exc is None else exc
+    if spec["id"] == _EXCEPTION_ID:
+        if _exception_done(state):
+            return False
+        if _exception_open(opens):
+            return False
+        if _exception_resting(state, slot, today):
+            return False
+        return True
+    if _exception_done_for(state, spec):
         return False
-    if _exception_open(opens):
+    if _exception_open(opens, spec, state):
         return False
-    if _exception_resting(state, slot, today):
+    if _exception_resting(state, slot, today, spec):
         return False
     return True
 
@@ -1332,10 +1392,127 @@ def _cancel(account, ticker, order, live):
     return _post_order(CANCEL_URL, body)
 
 
-def _near_exception(price):
+def _soxl_exc():
+    return _EXCEPTIONS[0]
+
+
+def _near_price(price, target):
     if isinstance(price, bool) or not isinstance(price, (int, float)):
         return False
-    return abs(float(price) - _EXCEPTION_PRICE) < _EXCEPTION_TOL
+    return abs(float(price) - float(target)) < _EXCEPTION_TOL
+
+
+def _near_exception(price):
+    return _near_price(price, _EXCEPTION_PRICE)
+
+
+def _ladder_sizes(exc):
+    """Share counts the ladder itself uses at this standing price.
+
+    None when the price is not a rung. KORU at 4.2 is 1, or 2 on the
+    first buy. The 100-share order is neither of those.
+    """
+    index = _level_of(exc["ticker"], exc["price"])
+    if index is None:
+        return None
+    sizes = set()
+    base = _cfg(exc["ticker"])["base"]
+    if isinstance(base, int) and not isinstance(base, bool) and base > 0:
+        sizes.add(base)
+    first = _cfg(exc["ticker"])["buy_qty"](float(exc["price"]))
+    if isinstance(first, int) and not isinstance(first, bool) and first > 0:
+        sizes.add(first)
+    return sizes
+
+
+def _clean_order_nos(raw):
+    found = []
+    if not isinstance(raw, list):
+        return found
+    for item in raw:
+        number = _order_number(item)
+        if number is None or number in found:
+            continue
+        found.append(number)
+    return found[-20:]
+
+
+def _read_exception_bucket(state, exc):
+    if not isinstance(state, dict):
+        return None
+    raw = state.get("exception_orders")
+    if not isinstance(raw, dict):
+        return None
+    item = raw.get(exc["id"])
+    return item if isinstance(item, dict) else None
+
+
+def _ensure_exception_bucket(state, exc):
+    book = state.setdefault("exception_orders", {})
+    item = book.get(exc["id"])
+    if not isinstance(item, dict):
+        item = {
+            "filled": False,
+            "filled_qty": 0,
+            "parts": {},
+            "resting": {},
+            "order_nos": [],
+        }
+        book[exc["id"]] = item
+    return item
+
+
+def _exception_order_nos(state, exc):
+    if exc["id"] == _EXCEPTION_ID:
+        return ()
+    bucket = _read_exception_bucket(state, exc)
+    if not bucket:
+        return ()
+    return tuple(_clean_order_nos(bucket.get("order_nos")))
+
+
+def _add_exception_order_no(state, exc, number):
+    """Remember one broker order number for a non-SOXL standing order.
+
+    The SOXL sell is not a rung, so its order number is not needed to
+    tell it from the ladder. The KORU buy shares 4.2 with a 2-share rung.
+    """
+    if not isinstance(state, dict) or exc["id"] == _EXCEPTION_ID:
+        return
+    if _order_number(number) is None:
+        return
+    bucket = _ensure_exception_bucket(state, exc)
+    nos = _clean_order_nos(bucket.get("order_nos"))
+    if number not in nos:
+        nos.append(number)
+    bucket["order_nos"] = nos[-20:]
+
+
+def _match_open_exception(order, exc, state=None):
+    """True when this open row is `exc`, not the ladder order at that price."""
+    if not isinstance(order, dict):
+        return False
+    if order.get("ticker") != exc["ticker"] or order.get("side") != exc["side"]:
+        return False
+    if not _near_price(order.get("price"), exc["price"]):
+        return False
+    if not _positive_qty(order.get("qty", 0)):
+        return False
+    if exc["id"] == _EXCEPTION_ID:
+        return True
+    number = _order_number(order.get("orr_no"))
+    if number is not None and number in _exception_order_nos(state, exc):
+        return True
+    sizes = _ladder_sizes(exc)
+    if not sizes:
+        return True
+    qty = _share_count(order.get("qty", 0))
+    ordered = _share_count(order.get("ordered_qty", 0))
+    if ordered and ordered not in sizes:
+        return True
+    if qty and qty not in sizes:
+        return True
+    return False
 
 
 def _positive_qty(qty):
@@ -1360,40 +1537,41 @@ def _fill_key_ok(key):
     )
 
 
-def _exception_order(order):
-    """Resting SOXL sell at 75. Not a ladder rung.
+def _exception_order(order, state=None):
+    """True for a standing order. False for the ladder's own rung.
 
-    A buy at 75 or at 37.5 is not this order. 75 is not a ladder level.
+    A SOXL sell at 75 is never a rung. A KORU buy at 4.2 is the standing
+    order when its size is not the ladder's 1 or 2, or when its order
+    number is one this bot stored for that buy. A partial that leaves 2
+    shares uses the order number, or the original order size when the
+    row still carries it.
     """
     if not isinstance(order, dict):
         return False
-    if order.get("ticker") != "SOXL" or order.get("side") != "sell":
-        return False
-    if not _near_exception(order.get("price")):
-        return False
-    return _positive_qty(order.get("qty", 0))
+    ticker = order.get("ticker")
+    for exc in _EXCEPTIONS:
+        if ticker != exc["ticker"]:
+            continue
+        if _match_open_exception(order, exc, state):
+            return True
+    return False
 
 
-def _counts_as_exception(ticker, order):
-    """True for the standing sell even when the row omits the ticker name."""
-    if ticker != "SOXL" or not isinstance(order, dict):
+def _counts_as_exception(ticker, order, state=None):
+    """True for a standing order even when the row omits the ticker name."""
+    if ticker not in ("SOXL", "KORU") or not isinstance(order, dict):
         return False
-    if order.get("ticker") not in (None, "SOXL"):
+    if order.get("ticker") not in (None, ticker):
         return False
-    if order.get("ticker") == "SOXL":
-        return _exception_order(order)
-    return _exception_order(dict(order, ticker="SOXL"))
+    probe = order if order.get("ticker") == ticker else dict(order, ticker=ticker)
+    return _exception_order(probe, state)
 
 
 def _exception_id_owned(state):
     return isinstance(state, dict) and state.get("exception_id") == _EXCEPTION_ID
 
 
-def _clean_exception_parts(state):
-    """Fill-key to shares already counted, only for this exception id."""
-    if not _exception_id_owned(state):
-        return {}
-    raw = state.get("exception_parts")
+def _clean_parts_map(raw):
     if not isinstance(raw, dict):
         return {}
     found = {}
@@ -1404,6 +1582,13 @@ def _clean_exception_parts(state):
     if len(found) > 80:
         found = dict(list(found.items())[-80:])
     return found
+
+
+def _clean_exception_parts(state):
+    """Fill-key to shares already counted, only for this exception id."""
+    if not _exception_id_owned(state):
+        return {}
+    return _clean_parts_map(state.get("exception_parts"))
 
 
 def _raw_exception_qty(state):
@@ -1440,50 +1625,118 @@ def _exception_done(state):
     return bool(state.get("exception_filled"))
 
 
-def _exception_remaining(state):
-    """Shares still to sell. Zero once the 150 are done."""
-    if _exception_done(state):
+def _bucket_qty(bucket):
+    parts = _clean_parts_map(bucket.get("parts") if isinstance(bucket, dict) else None)
+    if parts:
+        return sum(parts.values())
+    if not isinstance(bucket, dict):
         return 0
-    left = _EXCEPTION_QTY - _stored_exception_qty(state)
+    return _share_count(bucket.get("filled_qty", 0))
+
+
+def _exception_done_for(state, exc):
+    """True when `exc` has reached its target. The SOXL sell uses the legacy fields."""
+    if exc["id"] == _EXCEPTION_ID:
+        return _exception_done(state)
+    bucket = _read_exception_bucket(state, exc)
+    if not bucket:
+        return False
+    if _bucket_qty(bucket) >= exc["qty"]:
+        return True
+    return bool(bucket.get("filled"))
+
+
+def _stored_qty_for(state, exc):
+    if exc["id"] == _EXCEPTION_ID:
+        return _stored_exception_qty(state)
+    bucket = _read_exception_bucket(state, exc)
+    if not bucket:
+        return 0
+    return _bucket_qty(bucket)
+
+
+def _exception_remaining(state, exc=None):
+    """Shares still to send. Zero once this standing order is done."""
+    spec = _soxl_exc() if exc is None else exc
+    if spec["id"] == _EXCEPTION_ID:
+        if _exception_done(state):
+            return 0
+        left = _EXCEPTION_QTY - _stored_exception_qty(state)
+    else:
+        if _exception_done_for(state, spec):
+            return 0
+        left = spec["qty"] - _stored_qty_for(state, spec)
     if left < 1:
         return 0
     return int(left)
 
 
-def _exception_fill_shares(order):
-    """Sold shares on one inquiry row. A buy, a cancel, or a rung is zero."""
+def _exception_fill_shares(order, exc=None, state=None):
+    """Filled shares on one inquiry row that belong to this standing order.
+
+    The SOXL sell ignores a row that already has a ladder index, because
+    75 is not a rung. The KORU buy is on a rung, so a 2-share fill there
+    counts only when the order number or the original size says it is
+    the 100-share order. A ladder fill of 2 at 4.2 stays a ladder fill.
+    """
+    spec = _soxl_exc() if exc is None else exc
     if not isinstance(order, dict):
         return 0
-    if order.get("ticker") != "SOXL" or order.get("side") != "sell":
+    if order.get("ticker") != spec["ticker"] or order.get("side") != spec["side"]:
         return 0
-    if not _near_exception(order.get("price")):
+    if not _near_price(order.get("price"), spec["price"]):
         return 0
-    if order.get("idx") is not None:
+    if spec["id"] == _EXCEPTION_ID and order.get("idx") is not None:
         return 0
     cancelled = order.get("cancelled_qty", 0)
     if isinstance(cancelled, bool) or not isinstance(cancelled, (int, float)):
         cancelled = 0
     if cancelled > 0:
         return 0
-    return _share_count(order.get("filled_qty", 0))
+    filled = _share_count(order.get("filled_qty", 0))
+    if filled <= 0:
+        return 0
+    if spec["id"] == _EXCEPTION_ID:
+        return filled
+    number = _order_number(order.get("orr_no"))
+    if number is not None and number in _exception_order_nos(state, spec):
+        return filled
+    sizes = _ladder_sizes(spec)
+    if not sizes:
+        return filled
+    ordered = _share_count(order.get("ordered_qty", 0))
+    if ordered and ordered not in sizes:
+        return filled
+    if filled not in sizes:
+        return filled
+    return 0
 
 
-def _place_exception(account, live, counter, qty=None):
-    """Sell the standing order. `qty` is the unsold remainder.
+def _row_is_exception_fill(order, state=None):
+    for exc in _EXCEPTIONS:
+        if _exception_fill_shares(order, exc, state) > 0:
+            return True
+    return False
 
-    The body matches a ladder sell: no wtm_cur_knd_cd. The share count
-    is not capped by _HARD_MAX.
+
+def _place_exception(account, live, counter, qty=None, exc=None):
+    """Send one standing order. `qty` is the unfilled remainder.
+
+    The SOXL body matches a ladder sell: no wtm_cur_knd_cd. The KORU
+    body matches a ladder buy and does send that field. Neither share
+    count is capped by _HARD_MAX.
     """
     global _last_reject
     _last_reject = None
+    spec = _soxl_exc() if exc is None else exc
     if not live:
         return False
-    send = _EXCEPTION_QTY if qty is None else qty
+    send = spec["qty"] if qty is None else qty
     send = _share_count(send)
     if send < 1:
         return False
-    if send > _EXCEPTION_QTY:
-        send = _EXCEPTION_QTY
+    if send > spec["qty"]:
+        send = spec["qty"]
     kind = _order_type(_now_kst(), mode=os.environ.get("LADDER_MODE"))
     if kind is None:
         return None
@@ -1493,16 +1746,23 @@ def _place_exception(account, live, counter, qty=None):
     body = {
         "act_no": account,
         "fc_sec_trd_nat_cd": "200",
-        "iem_cd": "SOXL",
+        "iem_cd": spec["ticker"],
         "orr_qty": send,
-        "fc_orr_uit_pr": round(float(_EXCEPTION_PRICE), 2),
+        "fc_orr_uit_pr": round(float(spec["price"]), 2),
         "ahi_nmn_pr_tp_cd": kind,
     }
-    return _post_order(SELL_URL, body)
+    if spec["side"] == "buy":
+        body["wtm_cur_knd_cd"] = "1"
+        return _post_order(BUY_URL, body)
+    if spec["side"] == "sell":
+        return _post_order(SELL_URL, body)
+    return None
 
 
-def _exception_open(orders):
-    return any(_exception_order(order) for order in orders)
+def _exception_open(orders, exc=None, state=None):
+    """True when `exc` is already open. The default is the SOXL sell."""
+    spec = _soxl_exc() if exc is None else exc
+    return any(_match_open_exception(order, spec, state) for order in orders or [])
 
 
 def _exception_filled(fills, handled):
@@ -1521,8 +1781,8 @@ def _exception_filled(fills, handled):
     return False
 
 
-def _note_exception_fills(state, fills):
-    """Add new SOXL sells at 75 onto this exception id.
+def _note_soxl_fills(state, fills):
+    """Add new SOXL sells at 75 onto the legacy exception fields.
 
     The same fill key is counted once. A later inquiry that shows more
     shares on that key adds only the increase. Buys do not count. Old
@@ -1555,6 +1815,121 @@ def _note_exception_fills(state, fills):
     if total >= _EXCEPTION_QTY:
         state["exception_filled"] = True
     _remember(state, remembered)
+
+
+def _note_named_fills(state, fills, exc):
+    """Add new fills of one non-SOXL standing order onto its own bucket."""
+    done = _exception_done_for(state, exc)
+    bucket = _read_exception_bucket(state, exc)
+    parts = _clean_parts_map(None if bucket is None else bucket.get("parts"))
+    remembered = []
+    changed = False
+    for order in fills or []:
+        qty = _exception_fill_shares(order, exc, state)
+        if qty <= 0:
+            continue
+        number = _order_number(order.get("orr_no"))
+        if number is not None:
+            _add_exception_order_no(state, exc, number)
+        key = order.get("key")
+        if not _fill_key_ok(key):
+            continue
+        remembered.append(key)
+        if done:
+            continue
+        prev = parts.get(key, 0)
+        if qty <= prev:
+            continue
+        parts[key] = qty
+        changed = True
+    if remembered:
+        _remember(state, remembered)
+    if done or not changed:
+        return
+    total = sum(parts.values())
+    bucket = _ensure_exception_bucket(state, exc)
+    bucket["filled_qty"] = total
+    bucket["parts"] = parts
+    bucket["filled"] = total >= exc["qty"]
+
+
+def _note_exception_fills(state, fills):
+    """Record fills for every standing order. Ladder fills are not included."""
+    if not isinstance(state, dict):
+        return
+    _note_soxl_fills(state, fills)
+    for exc in _EXCEPTIONS:
+        if exc["id"] == _EXCEPTION_ID:
+            continue
+        _note_named_fills(state, fills, exc)
+
+
+def _absorb_exception_order_ids(state, orders):
+    """Store order numbers of standing rows that are already unambiguous."""
+    if not isinstance(state, dict):
+        return
+    for order in orders or []:
+        if not isinstance(order, dict):
+            continue
+        number = _order_number(order.get("orr_no"))
+        if number is None:
+            continue
+        for exc in _EXCEPTIONS:
+            if exc["id"] == _EXCEPTION_ID:
+                continue
+            if _match_open_exception(order, exc, state):
+                _add_exception_order_no(state, exc, number)
+
+
+def _clean_exception_orders(state):
+    """Per-id progress for standing orders other than the SOXL sell."""
+    raw = state.get("exception_orders") if isinstance(state, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    cleaned = {}
+    for exc in _EXCEPTIONS:
+        if exc["id"] == _EXCEPTION_ID:
+            continue
+        item = raw.get(exc["id"])
+        if not isinstance(item, dict):
+            continue
+        parts = _clean_parts_map(item.get("parts"))
+        qty = sum(parts.values()) if parts else _share_count(item.get("filled_qty", 0))
+        done = qty >= exc["qty"] or bool(item.get("filled"))
+        if done and qty < exc["qty"]:
+            qty = exc["qty"]
+        resting = {}
+        if not done:
+            resting = _clean_exception_resting(item.get("resting"), exc["id"])
+        order_nos = _clean_order_nos(item.get("order_nos"))
+        keep = done or qty > 0 or parts or resting or order_nos
+        if not keep:
+            continue
+        cleaned[exc["id"]] = {
+            "filled": done,
+            "filled_qty": qty if done or qty > 0 else 0,
+            "parts": parts if done or qty > 0 else {},
+            "resting": resting,
+            "order_nos": order_nos,
+        }
+    return cleaned
+
+
+def _call_place_exception(actions, counter, qty, exc):
+    """Place one standing order. The SOXL sell stays a two-argument call."""
+    fn = actions["place_exception"]
+    if exc["id"] == _EXCEPTION_ID:
+        return fn(counter, qty)
+    return fn(counter, qty, exc)
+
+
+def _fresh_exception_open(actions, opens, exc, state=None):
+    named = actions.get("exception_open_for")
+    if named is not None:
+        return named(exc["id"])
+    if exc["id"] == _EXCEPTION_ID:
+        return actions["exception_open"]()
+    return _exception_open(opens, exc, state)
 
 
 def _report(ticker, buys, sells, ignored, place, cancel, review, placed, cancelled):
@@ -1814,7 +2189,7 @@ def _clean_state(state):
     resting = {} if done_exception else _clean_exception_resting(
         state.get("exception_resting")
     )
-    return {
+    cleaned = {
         "version": 2,
         "ladder_id": _LADDER_ID,
         "tickers": tickers,
@@ -1830,6 +2205,10 @@ def _clean_state(state):
         "reset_done": done,
         "reset_tickers": reset_tickers,
     }
+    extra = _clean_exception_orders(state)
+    if extra:
+        cleaned["exception_orders"] = extra
+    return cleaned
 
 
 def _step_sell(ticker, pair):
@@ -1899,7 +2278,7 @@ def _step_plan(ticker, pair, sell_missing, buy_missing, mult):
     return current, desired
 
 
-def _anchor_fill_step(ticker, pair, fills, handled, mult):
+def _anchor_fill_step(ticker, pair, fills, handled, mult, state=None):
     """Step a reset pair when an unhandled fill is on the current anchor.
 
     The pre-reset guard does not place a new quote, and the broker
@@ -1917,7 +2296,7 @@ def _anchor_fill_step(ticker, pair, fills, handled, mult):
     hit = []
     for side, index in core:
         found = _confirmed_fills(
-            ticker, [{"side": side, "idx": index}], fills, handled
+            ticker, [{"side": side, "idx": index}], fills, handled, state
         )
         if not found:
             continue
@@ -1946,7 +2325,7 @@ def _core_missing(anchors, orders):
     return missing
 
 
-def _confirmed_fills(ticker, missing, fills, handled):
+def _confirmed_fills(ticker, missing, fills, handled, state=None):
     found = []
     for item in missing:
         matches = [
@@ -1958,6 +2337,7 @@ def _confirmed_fills(ticker, missing, fills, handled):
             and row.get("key") not in handled
             and row.get("filled_qty", 0) > 0
             and row.get("cancelled_qty", 0) <= 0
+            and not _row_is_exception_fill(row, state)
         ]
         if len(matches) != 1:
             return None
@@ -1973,8 +2353,8 @@ def _remember(state, keys):
     state["handled"] = handled[-200:]
 
 
-def _ladder_book_empty(opens):
-    """True when no ladder order is open. The standing SOXL sell does not count."""
+def _ladder_book_empty(opens, state=None):
+    """True when no ladder order is open. Standing orders do not count."""
     if not isinstance(opens, list):
         return True
     for order in opens:
@@ -1984,7 +2364,7 @@ def _ladder_book_empty(opens):
             continue
         if order.get("side") not in ("buy", "sell"):
             continue
-        if _exception_order(order):
+        if _exception_order(order, state):
             continue
         qty = order.get("qty", 0)
         if isinstance(qty, bool) or not isinstance(qty, (int, float)):
@@ -2056,7 +2436,7 @@ def _should_heal(event, now_kst, opens, state):
     done = state.get("reset_done")
     if isinstance(done, dict) and done.get(slot) == today:
         return False
-    if _ladder_book_empty(opens):
+    if _ladder_book_empty(opens, state):
         return True
     raw = state.get("reset_tickers")
     if not isinstance(raw, dict):
@@ -2361,13 +2741,13 @@ def _forget_recent(state, ticker, order):
             return
 
 
-def _book_delta(ticker, desired, orders):
-    """Cancel ladder orders that are not in `desired`. Keep the exception sell."""
+def _book_delta(ticker, desired, orders, state=None):
+    """Cancel ladder orders that are not in `desired`. Keep standing orders."""
     mine = [dict(order) for order in orders if order.get("ticker") == ticker]
-    buys, sells, _ignored = _split(ticker, mine)
+    buys, sells, _ignored = _split(ticker, mine, state)
     pool = []
     for order in buys + sells:
-        if _exception_order(order):
+        if _exception_order(order, state):
             continue
         pool.append(order)
     used = set()
@@ -2461,7 +2841,7 @@ def _run_adjust(event, now_kst, now_et, opens, _fills, state, actions):
     if not desired:
         print("ERROR config")
         return 1
-    cancel, place, keep, ignored_orders = _book_delta(ticker, desired, opens)
+    cancel, place, keep, ignored_orders = _book_delta(ticker, desired, opens, working)
     preview = spec["preview"]
     today = now_kst.strftime("%Y%m%d")
     slot = _reset_slot(now_kst)
@@ -2472,6 +2852,8 @@ def _run_adjust(event, now_kst, now_et, opens, _fills, state, actions):
     visible = set()
     for order in opens:
         if order.get("ticker") != ticker:
+            continue
+        if _exception_order(order, working):
             continue
         idx = order.get("idx")
         if not isinstance(idx, int) or isinstance(idx, bool):
@@ -2486,6 +2868,7 @@ def _run_adjust(event, now_kst, now_et, opens, _fills, state, actions):
             continue
         kept_place.append(item)
     place = kept_place
+    _absorb_exception_order_ids(working, opens)
     _note_exception_fills(working, _fills)
     exception_qty = _exception_remaining(working)
     exception_due = _exception_due(working, opens, slot, today)
@@ -2767,7 +3150,7 @@ def _run_cancel_dup(event, now_kst, now_et, opens, state, actions):
         for order in opens
         if isinstance(order, dict)
         and _dup_match(order, spec)
-        and not _exception_order(order)
+        and not _exception_order(order, state)
     ]
     label = "%s %s %s qty %s" % (
         spec["ticker"],
@@ -2865,6 +3248,7 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
         print(_reason or wall_reason or "skip: session closed")
         return 0
     print(f"order type {kind}")
+    _absorb_exception_order_ids(working, opens)
     _note_exception_fills(working, fills)
     working["recent_orders"] = _prepare_recent(
         working, opens, now_kst, mode, slot, today, fills
@@ -2873,7 +3257,7 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
     plans = []
     for ticker in ("NAIL", "KORU", "SOXL"):
         mine = [order for order in opens if order.get("ticker") == ticker]
-        buys, sells, ignored = _split(ticker, [dict(order) for order in mine])
+        buys, sells, ignored = _split(ticker, [dict(order) for order in mine], working)
         recent_levels = _recent_levels(working.get("recent_orders"), ticker)
         covered_orders = list(buys + sells) + [
             {"side": side, "idx": idx} for side, idx in recent_levels
@@ -2888,7 +3272,7 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
             review = True
         elif mode == "reset":
             pair = _anchor_fill_step(
-                ticker, stored, fills, set(working["handled"]), mult
+                ticker, stored, fills, set(working["handled"]), mult, working
             )
             place = _desired(
                 ticker, pair["sell"], pair["buy"], mult, pair["double_used"]
@@ -2898,14 +3282,14 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
                 place = []
             else:
                 cancel = [
-                    order for order in buys + sells if not _exception_order(order)
+                    order for order in buys + sells if not _exception_order(order, working)
                 ]
                 indexes = pair
         else:
             missing = _core_missing(stored, covered_orders)
             if missing:
                 found = _confirmed_fills(
-                    ticker, missing, fills, set(working["handled"])
+                    ticker, missing, fills, set(working["handled"]), working
                 )
                 if found is None:
                     review = True
@@ -2971,22 +3355,33 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
             (order.get("side"), order.get("idx"))
             for order in opens
             if order.get("ticker") == plan["ticker"]
+            and not _exception_order(order, working)
         }
         for item in plan["place"]:
             if (item["side"], item["idx"]) not in existing:
                 planned += 1
-    want_exception = (
-        live
-        and mode == "reset"
-        and "SOXL" in allow
-        and _exception_due(working, opens, slot, today)
-    )
+    due = []
+    if live and mode == "reset":
+        for exc in _EXCEPTIONS:
+            if exc["ticker"] not in allow:
+                continue
+            if _exception_due(working, opens, slot, today, exc):
+                due.append(exc)
+    want_exception = bool(due)
     if want_exception:
-        planned += 1
+        planned += len(due)
     batch = None
     over = False
     if live and mode == "reset":
-        batch = _reset_batch(plans, allow, working, slot, today, want_exception)
+        batch = _reset_batch(
+            plans,
+            allow,
+            working,
+            slot,
+            today,
+            want_exception,
+            len(due) if due else None,
+        )
         over = batch["blocked"]
     elif live and planned > _MAX_NEW:
         over = True
@@ -3162,41 +3557,59 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
         elif already:
             print(plan["ticker"] + " skip done")
 
-    settled_exception = not want_exception
-    hold_exception = want_exception and batch is not None and not batch["exception"]
-    if hold_exception:
+    take_n = 0 if batch is None else batch.get("exception_take", 0)
+    chosen = due[:take_n]
+    held = due[take_n:]
+    settled_exception = not due
+    if due and not chosen:
         print("DEFERRED exception")
-    elif want_exception:
+        settled_exception = False
+    elif chosen:
         stopped = _guard_stop()
         if stopped is not None:
             return stopped
-        current = actions["exception_open"]()
-        if current is None:
-            return _abort_unexpected("inquiry")
-        if current:
-            settled_exception = True
-        else:
-            left = _exception_remaining(working)
+        placed_n = 0
+        settled_exception = True
+        for exc in chosen:
+            current = _fresh_exception_open(actions, opens, exc, working)
+            if current is None:
+                if placed_n:
+                    _save_progress()
+                if exc["id"] == _EXCEPTION_ID:
+                    return _abort_unexpected("inquiry")
+                return _abort_unexpected("inquiry", exc["ticker"])
+            if current:
+                continue
+            left = _exception_remaining(working, exc)
             if left < 1:
-                settled_exception = True
-            elif counter[0] >= _MAX_NEW:
+                continue
+            if counter[0] >= _MAX_NEW:
                 print("ERROR max_orders")
                 if rejected:
                     _save_progress()
                     print("ERROR reject")
                 return 1
+            result = _call_place_exception(actions, counter, left, exc)
+            if result is None:
+                if not _note_reject():
+                    if placed_n:
+                        _save_progress()
+                    return _abort_unexpected("place", exc["ticker"])
+                settled_exception = False
+            elif result:
+                sent_any = True
+                placed_n += 1
+                _mark_exception_resting(working, slot, today, now_kst, exc)
+                number = _order_number(result)
+                if number is not None:
+                    _add_exception_order_no(working, exc, number)
             else:
-                result = actions["place_exception"](counter, left)
-                if result is None:
-                    if not _note_reject():
-                        return _abort_unexpected("place", "SOXL")
-                elif result:
-                    sent_any = True
-                    print("exception placed 1")
-                    settled_exception = True
-                    _mark_exception_resting(working, slot, today, now_kst)
-                else:
-                    settled_exception = False
+                settled_exception = False
+        if held:
+            print("DEFERRED exception")
+            settled_exception = False
+        if placed_n:
+            print("exception placed %s" % (placed_n,))
 
     if (
         live
@@ -3371,6 +3784,8 @@ def _main_once():
         if fresh is None:
             return None
         for order in fresh:
+            if _exception_order(order, state):
+                continue
             if (
                 order.get("ticker") == ticker
                 and order.get("side") == side
@@ -3386,7 +3801,7 @@ def _main_once():
         for order in fresh:
             if order.get("ticker") != ticker or order.get("idx") is None:
                 continue
-            if _exception_order(order):
+            if _exception_order(order, state):
                 continue
             return False
         return True
@@ -3397,10 +3812,22 @@ def _main_once():
             return None
         return _exception_open(fresh)
 
-    def place_exception(count, qty=None):
+    def exception_open_for(exc_id):
+        fresh = _inquiry(account, now_kst, "open")
+        if fresh is None:
+            return None
+        exc = _EXCEPTION_BY_ID.get(exc_id)
+        if exc is None:
+            return False
+        return _exception_open(fresh, exc, state)
+
+    def place_exception(count, qty=None, exc=None):
         if not live:
             return False
-        return _place_exception(account, True, count, qty)
+        result = _place_exception(account, True, count, qty, exc)
+        if result is True and isinstance(_last_order_no, int):
+            return {"ok": True, "orr_no": _last_order_no}
+        return result
 
     def save_state(data):
         if state is not None and not live:
@@ -3415,6 +3842,7 @@ def _main_once():
         "exists": exists,
         "confirm_clear": confirm_clear,
         "exception_open": exception_open,
+        "exception_open_for": exception_open_for,
         "place_exception": place_exception,
         "save_state": save_state,
     }

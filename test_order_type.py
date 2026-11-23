@@ -2119,8 +2119,10 @@ def test_missed_reset_heals_and_comment_is_idempotent():
             "exists": lambda *_args: False,
             "confirm_clear": lambda *_args: True,
             "exception_open": lambda: False,
-            "place_exception": lambda *_args: (_ for _ in ()).throw(
-                AssertionError("exception")
+            "place_exception": lambda counter, qty=None, exc=None: (
+                (_ for _ in ()).throw(AssertionError("exception"))
+                if exc is None or exc.get("id") == bot._EXCEPTION_ID
+                else True
             ),
             "save_state": save_state,
         }
