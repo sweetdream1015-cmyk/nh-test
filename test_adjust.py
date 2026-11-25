@@ -361,8 +361,8 @@ def test_reset_does_not_requote_unhandled_anchor_fill():
     assert key in saved["handled"]
     assert saved["tickers"]["NAIL"] == state["tickers"]["NAIL"]
     assert saved["tickers"]["KORU"] == state["tickers"]["KORU"]
-    assert world["exceptions"] == [(100, 4.2)]
-    assert "exception placed 1" in out
+    assert world["exceptions"] == [(100, 4.2), (400, 18.7)]
+    assert "exception placed 2" in out
     assert all(price != 75 for _qty, price in world["exceptions"])
 
     wiped = [order for order in opens if order["orr_no"] in (5, 6, 7, 8, 9)]
@@ -696,6 +696,59 @@ def test_workflow_file():
     assert "SEED_FORCE:" in seed
 
 
+def test_adjust_leaves_soxl_400():
+    """Adjust does not cancel, count, or replace the buy of 400 at 18.7."""
+    when = _PREMARKET
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "NAIL,KORU,SOXL"
+    os.environ.pop("ORDER_TYPE", None)
+    os.environ.pop("MAX_QTY_MULT", None)
+    os.environ["LADDER_MODE"] = "adjust"
+    os.environ["ADJUST_TICKER"] = "SOXL"
+    os.environ["ADJUST_SELL"] = "50"
+    os.environ["ADJUST_BUY"] = "42"
+    os.environ["ADJUST_STEP"] = "none"
+    os.environ["ADJUST_PREVIEW"] = "false"
+    bot._now_kst = lambda: when
+    standing = {
+        "ticker": "SOXL",
+        "side": "buy",
+        "price": 18.7,
+        "qty": 400,
+        "orr_no": 187,
+        "ordered_qty": 400,
+    }
+    opens = _opens() + [standing]
+    world = {"placed": [], "cancelled": [], "exceptions": []}
+    actions = sim._actions(world)
+
+    def place_exception(_counter, _qty=None, _exc=None):
+        raise AssertionError("adjust placed a standing order")
+
+    actions["place_exception"] = place_exception
+    code, out = sim._capture(
+        lambda: bot.run(
+            "adjust",
+            "workflow_dispatch",
+            when,
+            when.astimezone(bot.ET),
+            opens,
+            [],
+            _state(),
+            actions,
+        )
+    )
+    assert code == 0, out
+    assert ("SOXL", 18.7, 187) not in world["cancelled"]
+    assert "SOXL plan ignore buy 18.7 qty 400" in out
+    assert "SOXL plan cancel buy 18.7" not in out
+    assert "exception plan place" not in out
+    assert "exception placed" not in out
+    assert world["exceptions"] == []
+    buys, sells, ignored = bot._split("SOXL", [dict(standing)], _state())
+    assert buys == [] and sells == [] and ignored == 1
+
+
 def main():
     try:
         test_target_book_quantities()
@@ -708,6 +761,7 @@ def main():
         test_koru_adjust_does_not_place_retired_sell()
         test_adjust_skips_ineligible_exception()
         test_adjust_leaves_koru_exception()
+        test_adjust_leaves_soxl_400()
         test_adjust_does_not_replace_recent_order()
         test_workflow_file()
         print("OK adjust")

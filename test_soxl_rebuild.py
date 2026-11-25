@@ -1,4 +1,4 @@
-"""SOXL is 20 shares. The buy of 400 at 18.7 is not placed."""
+"""SOXL is 20 shares. Reset places the buy of 400 at 18.7. Rebuild leaves it."""
 
 import os
 from datetime import datetime
@@ -130,15 +130,39 @@ def test_flat_twenty_and_no_double():
     ]
 
 
-def test_buy_400_at_18_7_is_not_an_exception():
+def test_buy_400_at_18_7_is_a_reset_exception():
     ids = [item["id"] for item in bot._EXCEPTIONS]
-    assert ids == ["koru-buy-100-4.2"]
+    assert ids == ["koru-buy-100-4.2", "soxl-buy-400-18-7-v2"]
     assert "soxl-buy-400-18-7" not in ids
     assert "soxl-sell-150-75" not in ids
+    exc = bot._EXCEPTION_BY_ID["soxl-buy-400-18-7-v2"]
+    assert exc["side"] == "buy" and exc["qty"] == 400
+    assert abs(exc["price"] - 18.7) < 1e-9
     assert ladders._level_of("SOXL", 18.7) is None
     state = bot._clean_state({})
+    assert bot._exception_remaining(state, exc) == 400
     assert bot._exception_remaining(state) == 0
     assert bot._exception_due(state, [], "09", "20261125") is False
+    assert bot._exception_due(state, [], "09", "20261125", exc) is True
+    state["exception_id"] = bot._EXCEPTION_ID
+    state["exception_filled"] = True
+    assert bot._exception_done(state) is True
+    assert bot._exception_due(state, [], "09", "20261125", exc) is True
+    old = bot._clean_state(
+        {
+            "exception_orders": {
+                "soxl-buy-400-18-7": {
+                    "filled": True,
+                    "filled_qty": 400,
+                    "parts": {},
+                    "resting": {},
+                    "order_nos": [9],
+                }
+            }
+        }
+    )
+    assert "soxl-buy-400-18-7" not in old.get("exception_orders", {})
+    assert bot._exception_done_for(old, exc) is False
 
 
 def test_last_sell_from_36_is_103_for_15():
@@ -221,6 +245,7 @@ def test_live_rebuild_cancels_only_soxl_ladder_orders():
     assert saved["tickers"]["KORU"]["buy"] == sim._pair("KORU", 7.2, 6.0)["buy"]
     assert _KEY in saved["handled"]
     assert "soxl-buy-400-18-7" not in saved.get("exception_orders", {})
+    assert "soxl-buy-400-18-7-v2" not in saved.get("exception_orders", {})
 
 
 def test_later_reset_and_intraday_keep_36_30():
@@ -470,11 +495,12 @@ def test_extra_sell_39_is_cancelled_and_anchor_stays():
     assert code == 0, out
     assert "SOXL plan cancel sell 39 qty 4" in out
     assert "SOXL plan cancel sell 75 qty 150" in out
-    assert "SOXL plan cancel buy 18.7 qty 400" in out
+    assert "SOXL plan ignore buy 18.7 qty 400" in out
+    assert "SOXL plan cancel buy 18.7" not in out
     assert "exception plan place buy 18.7" not in out
     assert ("SOXL", 39, 39) in world["cancelled"]
     assert ("SOXL", 75, 75) in world["cancelled"]
-    assert ("SOXL", 18.7, 187) in world["cancelled"]
+    assert all(number != 187 for _ticker, _price, number in world["cancelled"])
     assert all(ticker == "SOXL" for ticker, _price, _number in world["cancelled"])
     assert world["placed"].count(("SOXL", "sell", 39, 20)) == 1
     assert world["exceptions"] == []
@@ -531,7 +557,8 @@ def test_reinquire_does_not_double_place():
     assert world["placed"].count(("SOXL", "sell", 36, 20)) == 1
     assert world["placed"].count(("SOXL", "buy", 30, 20)) == 1
     assert world["placed"].count(("SOXL", "buy", 28, 20)) == 1
-    assert ("SOXL", 18.7, 187) in world["cancelled"]
+    assert all(number != 187 for _ticker, _price, number in world["cancelled"])
+    assert "SOXL still open buy 18.7" not in out
     assert world["saved"]["tickers"]["SOXL"]["sell"] == _level(36)
     assert world["saved"]["tickers"]["SOXL"]["buy"] == _level(30)
 
@@ -638,7 +665,8 @@ def test_live_rebuild_cancels_without_live_trading():
         cancelled = [item["cancel"] for item in sent if item["cancel"] is not None]
         assert 39 in cancelled
         assert 75 in cancelled
-        assert 187 in cancelled
+        assert 187 not in cancelled
+        assert "SOXL plan ignore buy 18.7 qty 400" in out
         assert sum(1 for item in sent if item["price"] == 18.7) == 0
         assert sum(1 for item in sent if item["price"] == 39.0 and item["qty"] == 20) == 1
         assert saved["data"]["tickers"]["SOXL"]["sell"] == _level(36)
@@ -682,8 +710,8 @@ def test_evening_reset_keeps_the_rebuilt_soxl_book():
     assert code == 0, out
     assert world["placed"] == []
     assert world["cancelled"] == []
-    assert world["exceptions"] == []
-    assert "18.7" not in out
+    assert world["exceptions"] == [(400, 18.7)]
+    assert "exception placed 1" in out
     kept = world["saved"]["tickers"]["SOXL"]
     assert kept["sell"] == _level(36)
     assert kept["buy"] == _level(30)
@@ -713,7 +741,7 @@ def main():
     original = bot._now_kst
     try:
         test_flat_twenty_and_no_double()
-        test_buy_400_at_18_7_is_not_an_exception()
+        test_buy_400_at_18_7_is_a_reset_exception()
         test_last_sell_from_36_is_103_for_15()
         test_dry_rebuild_keeps_36_30_despite_the_30_fill()
         test_live_rebuild_cancels_only_soxl_ladder_orders()
