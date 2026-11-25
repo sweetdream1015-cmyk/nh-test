@@ -361,8 +361,8 @@ def test_reset_does_not_requote_unhandled_anchor_fill():
     assert key in saved["handled"]
     assert saved["tickers"]["NAIL"] == state["tickers"]["NAIL"]
     assert saved["tickers"]["KORU"] == state["tickers"]["KORU"]
-    assert world["exceptions"] == [(100, 4.2), (400, 18.7)]
-    assert "exception placed 2" in out
+    assert world["exceptions"] == [(100, 4.2)]
+    assert "exception placed 1" in out
     assert all(price != 75 for _qty, price in world["exceptions"])
 
     wiped = [order for order in opens if order["orr_no"] in (5, 6, 7, 8, 9)]
