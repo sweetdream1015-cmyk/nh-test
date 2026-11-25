@@ -1,0 +1,113 @@
+name: tqqq-exception
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekdays, after the broker cancel-all and after the ladder's first
+    # batch. 10:11 KST = 01:11 UTC (day session, order type 63).
+    # 18:11 KST = 09:11 UTC (US premarket, order type 61).
+    # Order type follows the same US/KST session rules as ladder-reset.
+    # Deferred levels are retried in this job, about 2 minutes apart,
+    # at most 3 extra passes. These two crons are the resets.
+    - cron: "11 1 * * 1-5"
+    - cron: "11 9 * * 1-5"
+  issue_comment:
+    types: [created]
+
+concurrency:
+  # Separate from the ladder trading lock so a TQQQ run cannot cancel it.
+  # A comment joins the lock only when the body starts with tqqq-reset.
+  group: >-
+    ${{
+      (github.event_name != 'issue_comment'
+        || startsWith(github.event.comment.body, 'tqqq-reset'))
+      && 'tqqq-exception'
+      || format('tqqq-skip-{0}', github.run_id)
+    }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  tqqq-exception:
+    name: tqqq-exception
+    # schedule and workflow_dispatch always run. A comment runs only for
+    # the owner, on issue #18 (not a pull request), when the new comment
+    # starts with tqqq-reset. Any other comment skips before checkout.
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (!github.event.issue.pull_request &&
+      github.event.issue.number == 18 &&
+      github.event.comment.user.login == github.repository_owner &&
+      startsWith(github.event.comment.body, 'tqqq-reset'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Read a token the ladder already issued. Restore-only, so this
+      # job does not save over the ladder token cache.
+      - name: Restore access token
+        uses: actions/cache/restore@v4
+        with:
+          path: .nhplug-token
+          key: nhplug-token-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            nhplug-token-
+
+      - name: Restore tqqq token
+        uses: actions/cache@v4
+        with:
+          path: .tqqq-token
+          key: tqqq-token-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            tqqq-token-
+
+      - name: Restore tqqq state
+        uses: actions/cache@v4
+        with:
+          path: .tqqq-state
+          key: tqqq-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            tqqq-state-
+
+      # Cache saves are read-only for issue_comment. The artifact below
+      # still uploads, and the next run keeps the newer saved_at/seq.
+      - name: Restore tqqq state artifact
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TQQQ_STATE_PATH: .tqqq-state/state.json
+        run: python3 restore_tqqq_state.py
+
+      - name: Run tqqq reset
+        env:
+          TQQQ_LIVE: ${{ vars.TQQQ_LIVE }}
+          TQQQ_COMMENT: ${{ github.event_name == 'issue_comment' && github.event.comment.body || '' }}
+          NHPLUG_ACCOUNT_SUFFIX: "201-12"
+          NHPLUG_APP_KEY: ${{ secrets.NHPLUG_APP_KEY }}
+          NHPLUG_APP_SECRET: ${{ secrets.NHPLUG_APP_SECRET }}
+          NHPLUG_TOKEN_PATH: .nhplug-token/token.json
+          TQQQ_TOKEN_PATH: .tqqq-token/token.json
+          TQQQ_STATE_PATH: .tqqq-state/state.json
+        # A tqqq-reset comment uses the scheduled reset path, including
+        # the time guards and the order-type rules. The comment body is
+        # only the TQQQ_COMMENT env value, not shell text.
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "issue_comment" ]; then
+            GITHUB_EVENT_NAME=schedule python3 tqqq_bot.py
+          else
+            python3 tqqq_bot.py
+          fi
+
+      - name: Upload tqqq state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tqqq-state
+          path: .tqqq-state/state.json
+          retention-days: 30
+          include-hidden-files: true
+          if-no-files-found: ignore

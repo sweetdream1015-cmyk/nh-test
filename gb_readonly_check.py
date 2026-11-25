@@ -207,12 +207,73 @@ def _issue_token(key, secret):
     return token
 
 
+def _digits(value):
+    """Digits only. Non-strings (except ints) contribute nothing."""
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, int):
+        value = str(value)
+    if not isinstance(value, str):
+        return ""
+    return "".join(ch for ch in value if ch.isdigit())
+
+
+def _account_suffix():
+    """NHPLUG_ACCOUNT_SUFFIX as digits. Empty means the historical selector."""
+    raw = os.environ.get("NHPLUG_ACCOUNT_SUFFIX", "")
+    if not isinstance(raw, str):
+        return ""
+    return _digits(raw)
+
+
+def _mask_account(account):
+    """Hide the middle of an account number. Example: 201-12-68***5.
+
+    An 11-digit number 20112681235 is shown as branch, product, the
+    first two serial digits, three stars, and the last digit. The full
+    digit string is never returned.
+    """
+    digits = _digits(account)
+    if len(digits) < 2:
+        return "***"
+    if len(digits) >= 8:
+        return digits[:3] + "-" + digits[3:5] + "-" + digits[5:7] + "***" + digits[-1]
+    return digits[:2] + "***" + digits[-1]
+
+
+def _remember_secret(value):
+    if isinstance(value, str) and len(value) >= 8 and value not in _secrets:
+        _secrets.append(value)
+
+
 def _select_account(payload):
+    """First production account, or the one named by NHPLUG_ACCOUNT_SUFFIX.
+
+    Unset suffix keeps today's rule: the first Output_0 row whose
+    acct_type is 01. A suffix (201-12 and 20112 are the same digits)
+    returns that type-01 account when exactly one row contains those
+    digits. Zero or several matches return "" so the caller places nothing.
+    """
     if not isinstance(payload, dict) or not isinstance(payload.get("Output_0"), list):
         return ""
     cust_no = payload.get("cust_no")
     if isinstance(cust_no, str) and len(cust_no) >= 8:
         _secrets.append(cust_no)
+    suffix = _account_suffix()
+    if not suffix:
+        for row in payload["Output_0"]:
+            if not isinstance(row, dict):
+                continue
+            acct_type = row.get("acct_type")
+            acct_no = row.get("acct_no")
+            if not isinstance(acct_type, str) or acct_type.strip() != "01":
+                continue
+            if isinstance(acct_no, str) and acct_no.strip():
+                account = acct_no.strip()
+                _secrets.append(account)
+                return account
+        return ""
+    matches = []
     for row in payload["Output_0"]:
         if not isinstance(row, dict):
             continue
@@ -220,10 +281,14 @@ def _select_account(payload):
         acct_no = row.get("acct_no")
         if not isinstance(acct_type, str) or acct_type.strip() != "01":
             continue
-        if isinstance(acct_no, str) and acct_no.strip():
-            account = acct_no.strip()
-            _secrets.append(account)
-            return account
+        if not isinstance(acct_no, str) or not acct_no.strip():
+            continue
+        account = acct_no.strip()
+        _remember_secret(account)
+        if suffix in _digits(account):
+            matches.append(account)
+    if len(matches) == 1:
+        return matches[0]
     return ""
 
 

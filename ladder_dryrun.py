@@ -108,6 +108,9 @@ _ISIN = {
     "US25490K5965": "NAIL",
     "US25461A3876": "KORU",
     "US25459W4583": "SOXL",
+    "US74347X8314": "TQQQ",
+    # TLTW CUSIP 46436E338 on the iShares product page. ISIN check digit 3.
+    "US46436E3383": "TLTW",
 }
 
 
@@ -217,14 +220,21 @@ def _level_of(ticker, price):
     return found
 
 
+def _known_name(name):
+    """Ticker symbol this book understands. TQQQ is inquiry-only."""
+    return name in _CFG or name in _ISIN.values()
+
+
 def _identify(row):
     iem = _text(row.get("iem_cd")).upper()
     if iem in _CFG:
         return iem
     if iem in _ISIN:
         return _ISIN[iem]
+    if _known_name(iem):
+        return iem
     ticker = _text(row.get("tck_iem_cd")).upper()
-    if ticker in _CFG:
+    if _known_name(ticker):
         return ticker
     return ""
 

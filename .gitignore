@@ -1,3 +1,5 @@
 .nhplug-token/
+.tqqq-token/
 .ladder-state/
+.tqqq-state/
 __pycache__/

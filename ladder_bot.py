@@ -83,6 +83,9 @@ exception text.
 Spec fields used:
 - POST /oauth2/token
 - POST /n2/acctinfo Output_0 acct_type 01
+  NHPLUG_ACCOUNT_SUFFIX, when set, selects the type-01 row whose account
+  digits contain that suffix (201-12 and 20112 are the same). Unset keeps
+  the first type-01 row. No match places nothing.
 - POST /gbstock/inquiry/v1/unexecuted
   open rows: ost_cns_dit 2; executions: ost_cns_dit 1
   oss_sby_dit_cd 1 sell / 2 buy, fc_orr_uit_pr, orr_qty, ny_cns_orr_qty,
@@ -3746,6 +3749,11 @@ def _main_once():
         return _die_http(), False
     account = gb._select_account(payload)
     if not account:
+        # A requested suffix that is not in acctinfo must not fall through
+        # to another account. Unset suffix keeps the historical stop line.
+        if gb._account_suffix():
+            print("ERROR account not found")
+            return 1, False
         print(_unexpected_line("select"))
         return 1, False
     if account not in gb._secrets:
