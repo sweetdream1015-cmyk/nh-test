@@ -1378,7 +1378,9 @@ def _cancel(account, ticker, order, live):
     _last_reject = None
     if not live:
         return False
-    if order.get("idx") is None:
+    # A normal cancel is a ladder rung. soxl-rebuild also cancels SOXL
+    # orders that are not rungs, such as the retired sell at 75.
+    if order.get("idx") is None and order.get("rebuild_cancel") is not True:
         return None
     number = order.get("orr_no")
     if isinstance(number, bool) or number is None:
@@ -3325,17 +3327,82 @@ def _core_buy_fill_keys(fills, buy_idx):
     return keys
 
 
-def _run_soxl_rebuild(event, now_kst, now_et, opens, fills, state, actions):
-    """Cancel SOXL ladder orders and quote sell 36 / buy 30 at 20 shares.
+def _kept_soxl_400(order, state):
+    """True for the standing buy of 400 at 18.7. Rebuild leaves it open."""
+    exc = _EXCEPTION_BY_ID.get("soxl-buy-400-18-7")
+    if exc is None:
+        return False
+    return _match_open_exception(order, exc, state)
 
-    The 11:55 buy of 4 at 30 is already handled. This does not step that
-    fill to sell 33 / buy 28. A live save stores sell 36 / buy 30 and the
-    fill key, so the next reset or intraday keeps the same anchor.
-    An open sell of 150 at 75 is cancelled and is not placed again.
-    The buy of 400 at 18.7 is not cancelled. An open one stays. A missing
-    one is placed with the ladder orders. KORU, NAIL, and the other
-    account are not touched. Dry unless SOXL_REBUILD_LIVE is on. A dry
-    run does not save state.
+
+def _soxl_rebuild_targets(opens, state):
+    """Every open SOXL order in this account, except the buy of 400 at 18.7.
+
+    The whole SOXL book is being replaced. An order does not need a ladder
+    index. KORU and NAIL are not in this list.
+    """
+    targets = []
+    for order in opens or []:
+        if not isinstance(order, dict) or order.get("ticker") != "SOXL":
+            continue
+        if order.get("side") not in ("buy", "sell"):
+            continue
+        if _share_count(order.get("qty", 0)) < 1:
+            continue
+        if _kept_soxl_400(order, state):
+            continue
+        row = dict(order)
+        row["rebuild_cancel"] = True
+        targets.append(row)
+    return targets
+
+
+def _soxl_open_levels(orders, state):
+    """SOXL ladder rungs still open. The 400 at 18.7 is not one of them."""
+    levels = set()
+    for order in orders or []:
+        if not isinstance(order, dict) or order.get("ticker") != "SOXL":
+            continue
+        if order.get("side") not in ("buy", "sell"):
+            continue
+        if _kept_soxl_400(order, state):
+            continue
+        idx = order.get("idx")
+        if isinstance(idx, bool) or not isinstance(idx, int):
+            idx = _level_of("SOXL", order.get("price"))
+        if isinstance(idx, bool) or not isinstance(idx, int):
+            continue
+        levels.add((order.get("side"), idx))
+    return levels
+
+
+def _soxl_seen_fill_keys(fills):
+    """SOXL fill keys already on the book. A manual buy is one of these.
+
+    Holdings can change without a ladder fill. Remembering the key keeps
+    the saved pair at sell 36 / buy 30. A fill that arrives later has a
+    new key and can still step the anchor.
+    """
+    keys = []
+    for row in fills or []:
+        if not isinstance(row, dict) or row.get("ticker") != "SOXL":
+            continue
+        key = row.get("key")
+        if _fill_key_ok(key) and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _run_soxl_rebuild(event, now_kst, now_et, opens, fills, state, actions):
+    """Cancel open SOXL orders and quote sell 36 / buy 30 at 20 shares.
+
+    Every open SOXL order in this account is cancelled, including one
+    that is not a ladder rung. The buy of 400 at 18.7 stays. After the
+    cancels, the open book is read again and a rung that is still open
+    is not placed a second time. The saved pair stays sell 36 / buy 30.
+    A manual buy is not a ladder fill and does not step that pair.
+    KORU, NAIL, and the other account are not touched. Dry unless
+    SOXL_REBUILD_LIVE is on. A dry run does not save state.
     """
     mult = _mult()
     if mult is None or _order_type_override() is None or state is None:
@@ -3352,21 +3419,13 @@ def _run_soxl_rebuild(event, now_kst, now_et, opens, fills, state, actions):
     if pair is None:
         print("ERROR config")
         return 1
-    handled_fill = _core_buy_fill_keys(fills, pair["buy"])
+    handled_fill = _soxl_seen_fill_keys(fills)
     desired = _desired("SOXL", pair["sell"], pair["buy"], mult, pair["double_used"])
     if not desired:
         print("ERROR config")
         return 1
-    cancel, place, keep, ignored = _book_delta("SOXL", desired, opens, working)
-    retired = []
-    kept_ignored = []
-    for order in ignored:
-        if _match_open_exception(order, _soxl_exc(), working):
-            retired.append(order)
-        else:
-            kept_ignored.append(order)
-    cancel = list(cancel) + retired
-    ignored = kept_ignored
+    cancel = _soxl_rebuild_targets(opens, working)
+    place = list(desired)
     today = now_kst.strftime("%Y%m%d")
     slot = _reset_slot(now_kst) or ""
     due, extra_lines = _soxl_exception_lines(working, opens, slot, today)
@@ -3382,10 +3441,8 @@ def _run_soxl_rebuild(event, now_kst, now_et, opens, fills, state, actions):
         _line("cancel", order.get("side", ""), order.get("price"), order.get("qty"))
     for item in place:
         _line("place", item["side"], item["price"], item["qty"])
-    for order in keep:
-        _line("keep", order.get("side", ""), order.get("price"), order.get("qty"))
-    for order in ignored:
-        if _exception_order(order, working):
+    for order in opens or []:
+        if _kept_soxl_400(order, working):
             _line("ignore", order.get("side", ""), order.get("price"), order.get("qty"))
     for line in extra_lines:
         print(line)
@@ -3411,16 +3468,45 @@ def _run_soxl_rebuild(event, now_kst, now_et, opens, fills, state, actions):
         print("ERROR max_orders")
         return 1
     counter = [0]
+    failed = False
+    cancelled_nos = set()
     for order in cancel:
         result = actions["cancel"]("SOXL", order)
         if not result:
-            print("ERROR reject" if _log_reject() else _unexpected_line("cancel", "SOXL"))
+            failed = True
+            if not _log_reject():
+                print(_unexpected_line("cancel", "SOXL"))
+            continue
+        number = _order_number(order.get("orr_no"))
+        if number is not None:
+            cancelled_nos.add(number)
+    inquire = actions.get("fresh_opens")
+    if callable(inquire):
+        fresh = inquire()
+        if fresh is None:
+            print(_unexpected_line("inquiry", "SOXL"))
             return 1
+    else:
+        fresh = []
+        for order in opens or []:
+            number = _order_number(order.get("orr_no"))
+            if number is not None and number in cancelled_nos:
+                continue
+            fresh.append(order)
+    open_levels = _soxl_open_levels(fresh, working)
+    placed_levels = set()
     for item in place:
+        level = (item["side"], item["idx"])
+        if level in open_levels or level in placed_levels:
+            _log_resting("SOXL", item["side"], item["price"], item["qty"])
+            continue
         result = actions["place"]("SOXL", item, counter)
         if not result:
-            print("ERROR reject" if _log_reject() else _unexpected_line("place", "SOXL"))
-            return 1
+            failed = True
+            if not _log_reject():
+                print(_unexpected_line("place", "SOXL"))
+            continue
+        placed_levels.add(level)
         _remember_placed(working, "SOXL", item, result, now_kst)
     placed_n = 0
     for exc, left in due:
@@ -3429,8 +3515,10 @@ def _run_soxl_rebuild(event, now_kst, now_et, opens, fills, state, actions):
             break
         result = _call_place_exception(actions, counter, left, exc)
         if not result:
-            print("ERROR reject" if _log_reject() else _unexpected_line("place", "SOXL"))
-            return 1
+            failed = True
+            if not _log_reject():
+                print(_unexpected_line("place", "SOXL"))
+            break
         placed_n += 1
         _mark_exception_resting(working, slot if slot in ("09", "17") else "", today, now_kst, exc)
         number = _order_number(result)
@@ -3438,10 +3526,18 @@ def _run_soxl_rebuild(event, now_kst, now_et, opens, fills, state, actions):
             _add_exception_order_no(working, exc, number)
     if placed_n:
         print("exception placed %s" % (placed_n,))
-    # The 11:55 buy at 30 stays handled so the next reset does not step.
+    # Seen fills, including a manual buy, stay handled. The pair does not step.
     _remember(working, handled_fill)
     working["tickers"]["SOXL"] = pair
     actions["save_state"](_clean_state(working))
+    still = _soxl_rebuild_targets(fresh, working)
+    for order in still:
+        print(
+            "SOXL still open %s %s qty %s"
+            % (order.get("side", ""), _px(order.get("price")), _px(order.get("qty")))
+        )
+    if failed or still:
+        return 1
     print("OK live")
     return 0
 
@@ -4055,6 +4151,16 @@ def _main_once():
             and not _orders_blocked(now_kst)
             and not _orders_blocked(_now_kst())
         )
+    elif mode == "soxl-rebuild":
+        # SOXL_REBUILD_LIVE is the switch. LIVE_TRADING must not gate the
+        # cancel and place calls, or a live rebuild plans and then stops.
+        live = (
+            _rebuild_live()
+            and event in ("schedule", "workflow_dispatch")
+            and _window_open("soxl-rebuild", now_kst, now_et)
+            and not _orders_blocked(now_kst)
+            and not _orders_blocked(_now_kst())
+        )
     else:
         live = _may_trade(event, mode, now_kst, now_et, state is None)
 
@@ -4119,6 +4225,9 @@ def _main_once():
             return {"ok": True, "orr_no": _last_order_no}
         return result
 
+    def fresh_opens():
+        return _inquiry(account, now_kst, "open")
+
     def save_state(data):
         if state is not None and not live:
             return
@@ -4134,6 +4243,7 @@ def _main_once():
         "exception_open": exception_open,
         "exception_open_for": exception_open_for,
         "place_exception": place_exception,
+        "fresh_opens": fresh_opens,
         "save_state": save_state,
     }
     code = run(mode, event, now_kst, now_et, opens, fills, state, actions)

@@ -430,6 +430,243 @@ def test_live_clocked_rebuild_at_1240_reaches_runner():
         os.environ.pop("NHPLUG_APP_SECRET", None)
 
 
+def _user_book():
+    """The 12:51 book: old 4/8 orders, an extra sell 4 at 39, and the 400."""
+    rows = [
+        ("buy", 28, 8, 28),
+        ("buy", 26, 8, 26),
+        ("sell", 36, 4, 36),
+        ("sell", 39, 4, 39),
+        ("sell", 33, 4, 33),
+    ]
+    book = []
+    for side, price, qty, number in rows:
+        book.append(
+            {
+                "ticker": "SOXL",
+                "side": side,
+                "price": price,
+                "qty": qty,
+                "orr_no": number,
+                "idx": _level(price),
+            }
+        )
+    book.append(
+        {"ticker": "SOXL", "side": "sell", "price": 75, "qty": 150, "orr_no": 75, "idx": None}
+    )
+    book.append(
+        {"ticker": "SOXL", "side": "buy", "price": 18.7, "qty": 400, "orr_no": 187, "idx": None}
+    )
+    book.append({"ticker": "KORU", "side": "buy", "price": 6.0, "qty": 2, "orr_no": 60})
+    return book
+
+
+def _manual_buy():
+    """A share-count change, not a ladder fill at the buy anchor."""
+    return {
+        "ticker": "SOXL",
+        "side": "buy",
+        "price": 31.2,
+        "qty": 15,
+        "filled_qty": 15,
+        "cancelled_qty": 0,
+        "key": "ef" * 32,
+    }
+
+
+def test_extra_sell_39_is_cancelled_and_anchor_stays():
+    book = _user_book()
+    code, out, world = _go(_state(), book, [_fill_30(), _manual_buy()], live=True)
+    assert code == 0, out
+    assert "SOXL plan cancel sell 39 qty 4" in out
+    assert "SOXL plan cancel sell 75 qty 150" in out
+    assert "SOXL plan ignore buy 18.7 qty 400" in out
+    assert "SOXL plan cancel buy 18.7" not in out
+    assert ("SOXL", 39, 39) in world["cancelled"]
+    assert ("SOXL", 75, 75) in world["cancelled"]
+    assert all(number != 187 for _ticker, _price, number in world["cancelled"])
+    assert all(ticker == "SOXL" for ticker, _price, _number in world["cancelled"])
+    assert world["placed"].count(("SOXL", "sell", 39, 20)) == 1
+    assert (400, 18.7) not in world["exceptions"]
+    saved = world["saved"]
+    assert saved["tickers"]["SOXL"]["sell"] == _level(36)
+    assert saved["tickers"]["SOXL"]["buy"] == _level(30)
+    assert _KEY in saved["handled"]
+    assert "ef" * 32 in saved["handled"]
+
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "SOXL"
+    os.environ.pop("SOXL_REBUILD_LIVE", None)
+    code, out, later = sim._run(
+        saved, [], {}, fills=[_fill_30(), _manual_buy()], mode="reset", when=_WHEN
+    )
+    assert code == 0, out
+    kept = later["saved"]["tickers"]["SOXL"]
+    assert kept["sell"] == _level(36)
+    assert kept["buy"] == _level(30)
+    assert ("SOXL", "sell", 33, 20) not in later["placed"]
+    assert ("SOXL", "buy", 26, 20) not in later["placed"]
+
+
+def test_reinquire_does_not_double_place():
+    """A rung still open after the cancels is not placed again."""
+    book = _user_book()
+    stuck = [
+        {"ticker": "SOXL", "side": "sell", "price": 39, "qty": 4, "orr_no": 39, "idx": _level(39)},
+        {"ticker": "SOXL", "side": "buy", "price": 18.7, "qty": 400, "orr_no": 187, "idx": None},
+    ]
+    os.environ["SOXL_REBUILD_LIVE"] = "on"
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ.pop("ORDER_TYPE", None)
+    bot._now_kst = lambda: _WHEN
+    world = {"placed": [], "cancelled": [], "exceptions": []}
+    actions = sim._actions(world)
+    actions["fresh_opens"] = lambda: stuck
+    code, out = sim._capture(
+        lambda: bot.run(
+            "soxl-rebuild",
+            "workflow_dispatch",
+            _WHEN,
+            _WHEN.astimezone(bot.ET),
+            book,
+            [_manual_buy()],
+            _state(),
+            actions,
+        )
+    )
+    assert code == 1, out
+    assert "SOXL still open sell 39 qty 4" in out
+    assert "SOXL resting sell 39 qty 20" in out
+    assert ("SOXL", "sell", 39, 20) not in world["placed"]
+    assert world["placed"].count(("SOXL", "sell", 36, 20)) == 1
+    assert world["placed"].count(("SOXL", "buy", 30, 20)) == 1
+    assert world["placed"].count(("SOXL", "buy", 28, 20)) == 1
+    assert all(number != 187 for _ticker, _price, number in world["cancelled"])
+    assert world["saved"]["tickers"]["SOXL"]["sell"] == _level(36)
+    assert world["saved"]["tickers"]["SOXL"]["buy"] == _level(30)
+
+    already = [
+        {"ticker": "SOXL", "side": "sell", "price": 39, "qty": 20, "orr_no": 391, "idx": _level(39)},
+        {"ticker": "SOXL", "side": "buy", "price": 18.7, "qty": 400, "orr_no": 187, "idx": None},
+    ]
+    world = {"placed": [], "cancelled": [], "exceptions": []}
+    actions = sim._actions(world)
+    actions["fresh_opens"] = lambda: already
+    code, out = sim._capture(
+        lambda: bot.run(
+            "soxl-rebuild",
+            "workflow_dispatch",
+            _WHEN,
+            _WHEN.astimezone(bot.ET),
+            already,
+            [],
+            _state(),
+            actions,
+        )
+    )
+    assert code == 1, out
+    assert ("SOXL", "sell", 39, 20) not in world["placed"]
+    assert "SOXL resting sell 39 qty 20" in out
+
+
+def test_live_rebuild_cancels_without_live_trading():
+    """The 12:51 run planned, then cancel was not live, so nothing was sent."""
+    noon = datetime(2026, 11, 25, 12, 40, tzinfo=bot.KST)
+    moment = {"when": noon}
+
+    class _Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = moment["when"]
+            if tz is None:
+                return current.replace(tzinfo=None)
+            return current.astimezone(tz)
+
+    book = _user_book()
+    opened = {"n": 0}
+    sent = []
+    saved = {}
+    original_datetime = bot.datetime
+    original_inquiry = bot._inquiry
+    original_token = bot._load_token
+    original_state = bot._load_state
+    original_post_order = bot._post_order
+    original_save = bot._save_json
+    original_bearer = gb._post_bearer
+
+    def inquiry(_account, _now, kind):
+        if kind == "fill":
+            return [_fill_30(), _manual_buy()]
+        opened["n"] += 1
+        if opened["n"] == 1:
+            return book
+        return []
+
+    def post_order(_url, body):
+        sent.append(
+            {
+                "cancel": body.get("org_orr_no"),
+                "qty": body.get("orr_qty"),
+                "price": body.get("fc_orr_uit_pr"),
+            }
+        )
+        return True
+
+    def bearer(url, _body, _extra):
+        if "acctinfo" not in url:
+            return 500, {}, {}
+        return 200, {}, {"Output_0": [{"acct_type": "01", "acct_no": "20102999991"}]}
+
+    os.environ["LADDER_MODE"] = "soxl-rebuild"
+    os.environ["GITHUB_EVENT_NAME"] = "schedule"
+    os.environ["SOXL_REBUILD_LIVE"] = "on"
+    os.environ.pop("LIVE_TRADING", None)
+    os.environ.pop("ORDER_TYPE", None)
+    os.environ.pop("NHPLUG_ACCOUNT_SUFFIX", None)
+    os.environ["NHPLUG_APP_KEY"] = "test-key"
+    os.environ["NHPLUG_APP_SECRET"] = "test-secret"
+    bot._now_kst = lambda: moment["when"]
+    bot.datetime = _Clock
+    bot._load_token = lambda: "token"
+    bot._load_state = _state
+    bot._inquiry = inquiry
+    bot._post_order = post_order
+    bot._save_json = lambda _path, data: saved.__setitem__("data", data)
+    gb._post_bearer = bearer
+    try:
+        assert bot._cancel(
+            "20102999991", "SOXL", {"idx": None, "orr_no": 75, "rebuild_cancel": True}, True
+        ) is True
+        assert bot._cancel("20102999991", "SOXL", {"idx": None, "orr_no": 76}, True) is None
+        sent.clear()
+        code, out = sim._capture(bot._main_once)
+        assert code == (0, False), out
+        assert "ERROR unexpected cancel" not in out
+        assert "SOXL plan cancel sell 39 qty 4" in out
+        assert "OK live" in out
+        assert "20102999991" not in out
+        cancelled = [item["cancel"] for item in sent if item["cancel"] is not None]
+        assert 39 in cancelled
+        assert 75 in cancelled
+        assert 187 not in cancelled
+        assert sum(1 for item in sent if item["price"] == 39.0 and item["qty"] == 20) == 1
+        assert saved["data"]["tickers"]["SOXL"]["sell"] == _level(36)
+        assert saved["data"]["tickers"]["SOXL"]["buy"] == _level(30)
+        assert "ef" * 32 in saved["data"]["handled"]
+    finally:
+        bot.datetime = original_datetime
+        bot._inquiry = original_inquiry
+        bot._load_token = original_token
+        bot._load_state = original_state
+        bot._post_order = original_post_order
+        bot._save_json = original_save
+        gb._post_bearer = original_bearer
+        os.environ.pop("LADDER_MODE", None)
+        os.environ.pop("GITHUB_EVENT_NAME", None)
+        os.environ.pop("NHPLUG_APP_KEY", None)
+        os.environ.pop("NHPLUG_APP_SECRET", None)
+
+
 def test_live_trading_alone_stays_dry():
     os.environ["LIVE_TRADING"] = "on"
     os.environ.pop("SOXL_REBUILD_LIVE", None)
@@ -454,6 +691,9 @@ def main():
         test_later_reset_and_intraday_keep_36_30()
         test_scheduled_runs_leave_the_old_book()
         test_live_clocked_rebuild_at_1240_reaches_runner()
+        test_extra_sell_39_is_cancelled_and_anchor_stays()
+        test_reinquire_does_not_double_place()
+        test_live_rebuild_cancels_without_live_trading()
         test_live_trading_alone_stays_dry()
         print("OK soxl rebuild")
     finally:
