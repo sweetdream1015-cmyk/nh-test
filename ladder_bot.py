@@ -46,16 +46,19 @@ Reset keeps the standing orders until each is fully filled, and places
 them again after each broker cancel-all. A partial fill reduces the next
 order to the shares still left. The SOXL sell of 150 at 75 is retired.
 Reset, intraday, and adjust do not place it. soxl-rebuild cancels an
-open one and does not replace it. The SOXL buy of 400 at 18.7 is
-retired. The broker rejected it for insufficient funds (rsp_cd 16156).
-Reset, intraday, adjust, and soxl-rebuild do not place it. The KORU
-buy is 100 at 4.2, sent to the buy endpoint, and it is not the ladder's
-own 2-share buy at that rung. The retired buys stay retired: 100 at 75
-on 2026-10-31, 200 at 38, 200 at 37.5 filled 2026-11-21, and 400 at
-18.7. exception_filled still names soxl-sell-150-75 when that old sell
-was marked, and that mark does not place an order. The KORU buy keeps
-its own count under exception_orders. A broker reject of one standing
-order is logged and does not stop the other tickers.
+open one and does not replace it. The SOXL buy is 400 at 18.7
+(soxl-buy-400-18-7-v2). Reset places it again after each cancel-all
+until 400 shares have filled. An open match is kept and is not sent
+again. The previous id soxl-buy-400-18-7 does not block this order.
+Intraday, adjust, and cancel-dup leave it alone. soxl-rebuild does not
+cancel it and does not place it. The KORU buy is 100 at 4.2, sent to
+the buy endpoint, and it is not the ladder's own 2-share buy at that
+rung. The retired buys stay retired: 100 at 75 on 2026-10-31, 200 at
+38, and 200 at 37.5 filled 2026-11-21. exception_filled still names
+soxl-sell-150-75 when that old sell was marked, and that mark does not
+place an order. The KORU buy and the 400 buy keep their own counts
+under exception_orders. A broker reject of one standing order is logged
+and does not stop the other tickers.
 SOXL ladder buys and sells are 20. There is no doubled first buy.
 KORU buys and sells 1. A first KORU buy at 6 or below is 2, then 1.
 NAIL is unchanged. Saved double_used is kept as written.
@@ -63,10 +66,11 @@ A manual adjust sets one ticker's sell and buy anchors, or steps that
 ticker once, then cancels only that ticker's ladder orders that do not
 match and places the missing ones. Preview prints those prices and
 quantities and does not save state or send orders. Adjust does not
-place the retired SOXL sell at 75 or the retired buy of 400 at 18.7.
-The KORU buy at 4.2 is placed only by reset. Intraday, adjust,
-and cancel-dup leave the standing orders alone and do not treat either
-as a ladder rung or a duplicate. Other tickers' ladders are left alone.
+place the retired SOXL sell at 75. An open buy of 400 at 18.7 is left
+alone. The KORU buy at 4.2 and the SOXL buy of 400 at 18.7 are placed
+only by reset. Intraday, adjust, and cancel-dup leave the standing
+orders alone and do not treat them as a ladder rung or a duplicate.
+Other tickers' ladders are left alone.
 Adjust may send orders in the same US and KST sessions as intraday.
 Reset applies an unhandled confirmed fill at the current anchor before
 it restores the book, so a fill during a pre-reset guard is not quoted
@@ -103,8 +107,8 @@ Spec fields used:
   ORDER_TYPE overrides that when it is 00, 61, 62, or 63.
   Spec requires fc_orr_uit_pr for 00, 61, 62, and 63. There is no
   separate price field for 00. Buy also sends wtm_cur_knd_cd 1.
-  The standing KORU buy uses the buy body and does send it. The retired
-  SOXL sell at 75 and the retired buy of 400 at 18.7 are not sent.
+  The standing KORU buy and the SOXL buy of 400 at 18.7 use the buy
+  body and do send it. The retired SOXL sell at 75 is not sent.
 - POST /gbstock/order/v1/cancel
   org_orr_no, all_pat_dit_cd 1 (full cancel)
 """
@@ -154,7 +158,9 @@ _wants_reset_followup = False
 # in _EXCEPTIONS, nothing places it, and soxl-rebuild cancels an open
 # one. Retired buys that must not be reseeded as a new order: buy 100
 # at 75 on 2026-10-31, buy 200 at 38, buy 200 at 37.5 filled 2026-11-21
-# (soxl-buy-200-37-5). The KORU buy is not the ladder's 2-share rung.
+# (soxl-buy-200-37-5). The old SOXL buy id soxl-buy-400-18-7 is not
+# reused, so a filled or resting record under that id does not block
+# the new order. The KORU buy is not the ladder's 2-share rung.
 _RETIRED_SOXL_SELL = {
     "id": "soxl-sell-150-75",
     "ticker": "SOXL",
@@ -162,8 +168,9 @@ _RETIRED_SOXL_SELL = {
     "price": 75,
     "qty": 150,
 }
-# The SOXL buy of 400 at 18.7 (soxl-buy-400-18-7) is retired. The broker
-# rejected it, rsp_cd 16156. Nothing places it again.
+# Fresh id. soxl-buy-400-18-7 was retired after rsp_cd 16156 and must
+# not be used again. Reset places this buy until 400 shares fill.
+_SOXL_BUY_400_ID = "soxl-buy-400-18-7-v2"
 _EXCEPTIONS = (
     {
         "id": "koru-buy-100-4.2",
@@ -171,6 +178,13 @@ _EXCEPTIONS = (
         "side": "buy",
         "price": 4.2,
         "qty": 100,
+    },
+    {
+        "id": _SOXL_BUY_400_ID,
+        "ticker": "SOXL",
+        "side": "buy",
+        "price": 18.7,
+        "qty": 400,
     },
 )
 _EXCEPTION_BY_ID = {item["id"]: item for item in _EXCEPTIONS}
@@ -1552,7 +1566,8 @@ def _fill_key_ok(key):
 def _exception_order(order, state=None):
     """True for a standing order. False for the ladder's own rung.
 
-    A SOXL sell at 75 is never a rung. A KORU buy at 4.2 is the standing
+    A SOXL sell at 75 is never a rung. A SOXL buy at 18.7 is the standing
+    order: that price is not a rung. A KORU buy at 4.2 is the standing
     order when its size is not the ladder's 1 or 2, or when its order
     number is one this bot stored for that buy. A partial that leaves 2
     shares uses the order number, or the original order size when the
@@ -1827,7 +1842,11 @@ def _note_soxl_fills(state, fills):
 
 
 def _note_named_fills(state, fills, exc):
-    """Add new fills of one non-SOXL standing order onto its own bucket."""
+    """Add new fills of one standing order onto its own bucket.
+
+    The retired SOXL sell uses the legacy fields instead. The buy of
+    400 at 18.7 uses this bucket, keyed by its own id.
+    """
     done = _exception_done_for(state, exc)
     bucket = _read_exception_bucket(state, exc)
     parts = _clean_parts_map(None if bucket is None else bucket.get("parts"))
@@ -3270,12 +3289,24 @@ def _rebuild_live():
     return os.environ.get("SOXL_REBUILD_LIVE") == "on"
 
 
+def _kept_soxl_400(order, state):
+    """True for the standing buy of 400 at 18.7. Rebuild leaves it open."""
+    exc = _EXCEPTION_BY_ID.get(_SOXL_BUY_400_ID)
+    if exc is None:
+        return False
+    return _match_open_exception(order, exc, state)
+
+
 def _soxl_exception_lines(state, opens, slot, today):
-    """Due SOXL standing orders. The KORU buy is not part of this rebuild."""
+    """Due SOXL standing orders this rebuild would place.
+
+    The buy of 400 at 18.7 is placed only by reset. The KORU buy is
+    not part of this rebuild.
+    """
     lines = []
     due = []
     for exc in _EXCEPTIONS:
-        if exc["ticker"] != "SOXL":
+        if exc["ticker"] != "SOXL" or exc["id"] == _SOXL_BUY_400_ID:
             continue
         if not _exception_due(state, opens, slot, today, exc):
             continue
@@ -3327,13 +3358,12 @@ def _core_buy_fill_keys(fills, buy_idx):
 
 
 def _soxl_rebuild_targets(opens, state):
-    """Every open SOXL order in this account.
+    """Every open SOXL order in this account except the buy of 400 at 18.7.
 
-    The whole SOXL book is being replaced, including a leftover buy of
-    400 at 18.7. That buy is not placed again. An order does not need a
-    ladder index. KORU and NAIL are not in this list.
+    The whole SOXL book is being replaced. That standing buy stays.
+    An order does not need a ladder index. KORU and NAIL are not in
+    this list.
     """
-    del state
     targets = []
     for order in opens or []:
         if not isinstance(order, dict) or order.get("ticker") != "SOXL":
@@ -3342,6 +3372,8 @@ def _soxl_rebuild_targets(opens, state):
             continue
         if _share_count(order.get("qty", 0)) < 1:
             continue
+        if _kept_soxl_400(order, state):
+            continue
         row = dict(order)
         row["rebuild_cancel"] = True
         targets.append(row)
@@ -3349,13 +3381,14 @@ def _soxl_rebuild_targets(opens, state):
 
 
 def _soxl_open_levels(orders, state):
-    """SOXL ladder rungs still open. 18.7 is not a rung."""
-    del state
+    """SOXL ladder rungs still open. The buy of 400 at 18.7 is not one."""
     levels = set()
     for order in orders or []:
         if not isinstance(order, dict) or order.get("ticker") != "SOXL":
             continue
         if order.get("side") not in ("buy", "sell"):
+            continue
+        if _kept_soxl_400(order, state):
             continue
         idx = order.get("idx")
         if isinstance(idx, bool) or not isinstance(idx, int):
@@ -3387,10 +3420,10 @@ def _run_soxl_rebuild(event, now_kst, now_et, opens, fills, state, actions):
     """Cancel open SOXL orders and quote sell 36 / buy 30 at 20 shares.
 
     Every open SOXL order in this account is cancelled, including one
-    that is not a ladder rung. The buy of 400 at 18.7 is not placed.
-    After the cancels, the open book is read again and a rung that is
-    still open is not placed a second time. The saved pair stays sell
-    36 / buy 30.
+    that is not a ladder rung, except the buy of 400 at 18.7. That buy
+    stays open and is not placed here. After the cancels, the open book
+    is read again and a rung that is still open is not placed a second
+    time. The saved pair stays sell 36 / buy 30.
     A manual buy is not a ladder fill and does not step that pair.
     KORU, NAIL, and the other account are not touched. Dry unless
     SOXL_REBUILD_LIVE is on. A dry run does not save state.
@@ -3432,6 +3465,9 @@ def _run_soxl_rebuild(event, now_kst, now_et, opens, fills, state, actions):
         _line("cancel", order.get("side", ""), order.get("price"), order.get("qty"))
     for item in place:
         _line("place", item["side"], item["price"], item["qty"])
+    for order in opens or []:
+        if _kept_soxl_400(order, working):
+            _line("ignore", order.get("side", ""), order.get("price"), order.get("qty"))
     for line in extra_lines:
         print(line)
     print("NAIL unchanged")
@@ -3731,6 +3767,10 @@ def run(mode, event, now_kst, now_et, opens, fills, state, actions):
     if live and mode == "reset":
         for exc in _EXCEPTIONS:
             if exc["ticker"] not in allow:
+                continue
+            # The pre-20 book is left for soxl-rebuild. Do not add the
+            # 400 buy beside those 4- and 8-share orders.
+            if hold_soxl and exc["id"] == _SOXL_BUY_400_ID:
                 continue
             if _exception_due(working, opens, slot, today, exc):
                 due.append(exc)
