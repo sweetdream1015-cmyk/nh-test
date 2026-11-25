@@ -73,10 +73,10 @@ def _row(acct_type, acct_no):
     return {"acct_type": acct_type, "acct_no": acct_no}
 
 
-def _fill(price, qty, key=_KEY):
+def _fill(price, qty, key=_KEY, ticker="TQQQ", side="buy"):
     return {
-        "ticker": "TQQQ",
-        "side": "buy",
+        "ticker": ticker,
+        "side": side,
         "price": price,
         "qty": 0,
         "filled_qty": qty,
@@ -170,6 +170,11 @@ def test_prices_exact():
     assert numbers == sorted(numbers, reverse=True)
     assert tqqq._ISIN == "US74347X8314"
     assert ladders._ISIN["US74347X8314"] == "TQQQ"
+    assert tqqq._TLTW_ID == "tltw-buy-100-18"
+    assert tqqq._TLTW_QTY == 100
+    assert tqqq._TLTW_PRICE == "18.00"
+    assert tqqq._TLTW_ISIN == "US46436E3383"
+    assert ladders._ISIN["US46436E3383"] == "TLTW"
 
 
 def test_account_unset_is_unchanged():
@@ -351,6 +356,7 @@ def test_dry_run_prints_twenty_and_places_nothing():
     assert len(plans) == 20
     for price in _EXPECTED:
         assert "TQQQ plan buy %s qty 10" % price in out
+    assert out.count("TLTW plan buy 18.00 qty 100") == 1
     assert _SECOND not in out
     assert _FIRST not in out
     assert world["account"] == _SECOND
@@ -442,7 +448,9 @@ def test_no_duplicates_and_other_orders_untouched():
     assert all(item[0] == "TQQQ" or True for item in placed)
     assert not any(price == 90 or price == "90" for price, _qty in placed)
     assert "SCHD" not in out
-    assert "TLTW" not in out
+    assert "TLTW defer buy 18.00 qty 100" in out
+    assert "90" not in out
+    assert ("18.00", 100) not in placed
     assert "cancel" not in out.lower()
     root = os.path.dirname(os.path.abspath(__file__))
     source = open(os.path.join(root, "tqqq_bot.py"), encoding="utf-8").read()
@@ -498,9 +506,10 @@ def test_batches_highest_first_and_ladder_state_untouched():
         _NOW, payload, [], [], world, live=True, gap=0
     )
     assert code == 0, out
-    assert world["placed"] == [(price, 10) for price in _EXPECTED], world["placed"]
+    assert world["placed"] == [(price, 10) for price in _EXPECTED] + [("18.00", 100)]
     assert world["placed"][0] == ("43.00", 10)
     assert world["placed"][6] == ("34.93", 10)
+    assert world["placed"][-1] == ("18.00", 100)
     assert "DEFERRED TQQQ" in out
     assert "follow-up reset 1" in out
     assert "follow-up reset 3" in out
@@ -512,6 +521,8 @@ def test_batches_highest_first_and_ladder_state_untouched():
     assert "tickers" not in saved
     assert "exception_orders" not in saved
     assert saved["levels"]["43.00"]["resting"]["qty"] == 10
+    assert saved["exceptions"]["tltw-buy-100-18"]["resting"]["qty"] == 100
+    assert saved["exceptions"]["tltw-buy-100-18"]["filled"] is False
     with open(ladder_path, "rb") as handle:
         assert handle.read() == sentinel
     os.environ["TQQQ_STATE_PATH"] = ladder_path
@@ -542,6 +553,9 @@ def test_broker_max_orders_keeps_levels():
     assert saved["levels"]["40.12"]["resting"] == {}
     assert saved["levels"]["22.26"]["filled_qty"] == 0
     assert saved["levels"]["22.26"]["filled"] is False
+    assert saved["exceptions"]["tltw-buy-100-18"]["filled_qty"] == 0
+    assert saved["exceptions"]["tltw-buy-100-18"]["resting"] == {}
+    assert ("18.00", 100) not in world["placed"]
     assert _SECOND not in out
 
 
@@ -627,6 +641,7 @@ def test_order_types_and_skips():
     assert code == 0, out
     assert "order type 61" in out
     assert "TQQQ plan buy 43.00 qty 10" in out
+    assert "TLTW plan buy 18.00 qty 100" in out
 
 
 def test_buy_body_and_max_order_detector():
@@ -653,6 +668,14 @@ def test_buy_body_and_max_order_detector():
     tqqq._broker_place(_SECOND, "22.26", 10)
     assert seen["body"]["ahi_nmn_pr_tp_cd"] == "61"
     assert seen["body"]["fc_orr_uit_pr"] == 22.26
+    assert tqqq._broker_place(_SECOND, "18.00", 100) is True
+    assert seen["body"]["iem_cd"] == "TLTW"
+    assert seen["body"]["orr_qty"] == 100
+    assert seen["body"]["fc_orr_uit_pr"] == 18.0
+    assert seen["body"]["wtm_cur_knd_cd"] == "1"
+    assert seen["url"].endswith("/gbstock/order/v1/buy")
+    assert tqqq._broker_place(_SECOND, "19.00", 100) is None
+    assert tqqq._broker_place(_SECOND, "18.00", 101) is None
 
     def reject(url, body):
         bot._last_reject = {
@@ -705,6 +728,11 @@ def test_inquiry_matches_isin_and_ladder_is_untouched():
     assert bot._parse_row(soxl)["ticker"] == "SOXL"
     assert ladders._identify({"iem_cd": "US25461A3876"}) == "KORU"
     assert ladders._identify({"iem_cd": "US25490K5965"}) == "NAIL"
+    assert ladders._identify({"iem_cd": "US46436E3383"}) == "TLTW"
+    assert ladders._identify({"tck_iem_cd": "TLTW"}) == "TLTW"
+    tltw = dict(row, iem_cd="US46436E3383", fc_orr_uit_pr="18.00")
+    assert bot._parse_row(tltw)["ticker"] == "TLTW"
+    assert bot._parse_row(tltw)["ticker"] != "SOXL"
     mine = [parsed, bot._parse_row(soxl)]
     soxl_only = [order for order in mine if order.get("ticker") == "SOXL"]
     assert [order["ticker"] for order in soxl_only] == ["SOXL"]
@@ -788,6 +816,100 @@ def test_workflows_and_restore_do_not_touch_ladder():
     assert not os.path.exists(blocked)
 
 
+def test_tltw_partial_priority_and_other_orders():
+    """TLTW is one exception after the TQQQ levels. Other TLTW rows stay put."""
+    _freeze(_NOW)
+    state = tqqq._fresh()
+    assert state["exceptions"]["tltw-buy-100-18"]["filled_qty"] == 0
+    legacy = tqqq._clean({"program": "tqqq-buy", "levels": {}})
+    assert legacy["exceptions"]["tltw-buy-100-18"]["filled"] is False
+    assert legacy["exceptions"]["tltw-buy-100-18"]["filled_qty"] == 0
+
+    def place(price, qty):
+        raise AssertionError("placed")
+
+    _code, out = _capture(
+        lambda: tqqq._trade(_NOW, [], [], state, place, False, "09")
+    )
+    assert "TLTW plan buy 18.00 qty 100" in out
+    assert out.index("TQQQ plan buy 22.26 qty 10") < out.index("TLTW plan buy 18.00 qty 100")
+
+    _code, out = _capture(
+        lambda: tqqq._trade(_NOW, [], [_fill(18, 40, ticker="TLTW")], state, place, False, "09")
+    )
+    assert "TLTW plan buy 18.00 qty 60" in out, out
+    assert "TLTW plan buy 18.00 qty 100" not in out
+    assert state["exceptions"]["tltw-buy-100-18"]["filled_qty"] == 40
+
+    _code, out = _capture(
+        lambda: tqqq._trade(_NOW, [], [_fill(18, 40, ticker="TLTW")], state, place, False, "09")
+    )
+    assert "TLTW plan buy 18.00 qty 60" in out
+    assert state["exceptions"]["tltw-buy-100-18"]["filled_qty"] == 40
+
+    ignored = [
+        _fill(18, 40, ticker="TLTW"),
+        _fill(21, 100, ticker="TLTW", key=_KEY2),
+        _fill(18, 100, ticker="TLTW", key="ef" * 32, side="sell"),
+        _fill(18, 50, ticker="SCHD", key="12" * 32),
+    ]
+    _code, out = _capture(lambda: tqqq._trade(_NOW, [], ignored, state, place, False, "09"))
+    assert state["exceptions"]["tltw-buy-100-18"]["filled_qty"] == 40
+    assert "TLTW plan buy 18.00 qty 60" in out
+    assert "SCHD" not in out
+
+    _code, out = _capture(
+        lambda: tqqq._trade(
+            _NOW,
+            [],
+            [_fill(18, 100, ticker="TLTW")],
+            state,
+            place,
+            False,
+            "09",
+        )
+    )
+    assert "TLTW filled 18.00" in out
+    assert "TLTW plan buy" not in out
+    assert state["exceptions"]["tltw-buy-100-18"]["filled"] is True
+    assert state["levels"]["43.00"]["filled"] is False
+
+    fresh = tqqq._fresh()
+    for price in tqqq._PRICES[:-2]:
+        fresh["levels"][price]["filled"] = True
+        fresh["levels"][price]["filled_qty"] = 10
+    placed = []
+
+    def live_place(price, qty):
+        placed.append((price, qty))
+        return True
+
+    _code, out = _capture(
+        lambda: tqqq._trade(_NOW, [], [], fresh, live_place, True, "09")
+    )
+    assert placed == [("23.04", 10), ("22.26", 10), ("18.00", 100)], placed
+    assert "TLTW plan buy 18.00 qty 100" in out
+    assert fresh["exceptions"]["tltw-buy-100-18"]["resting"]["qty"] == 100
+
+    again = tqqq._fresh()
+    opens = [
+        _open(18, 100, ticker="TLTW"),
+        _open(19, 50, ticker="TLTW"),
+        _open(27, 10, ticker="SCHD"),
+        _open(18, 20, ticker="TLTW", side="sell"),
+    ]
+    placed.clear()
+    _code, out = _capture(
+        lambda: tqqq._trade(_NOW, opens, [], again, live_place, True, "09")
+    )
+    assert "TLTW skip open 18.00 qty 100" in out
+    assert ("18.00", 100) not in placed
+    assert not any(price == 19 or price == "19.00" for price, _qty in placed)
+    assert "SCHD" not in out
+    assert "cancel" not in out.lower()
+    assert again["exceptions"]["tltw-buy-100-18"]["filled_qty"] == 0
+
+
 def test_main_stops_before_broker():
     def boom(_key, _secret):
         raise AssertionError("token")
@@ -853,6 +975,7 @@ def main():
         test_order_types_and_skips()
         test_buy_body_and_max_order_detector()
         test_inquiry_matches_isin_and_ladder_is_untouched()
+        test_tltw_partial_priority_and_other_orders()
         test_workflows_and_restore_do_not_touch_ladder()
         test_main_stops_before_broker()
         print("OK tqqq")

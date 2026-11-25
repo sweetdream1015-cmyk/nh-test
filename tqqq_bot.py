@@ -1,8 +1,13 @@
-"""Standing TQQQ buys for the second NH account (201-12) only.
+"""Standing buys for the second NH account (201-12) only.
 
-Twenty limit buys, 10 shares each, re-placed at each reset until that
-level has filled 10 shares. Partial fills reduce the next order to the
-shares still left. A level that has filled 10 is never sent again.
+Twenty TQQQ limit buys, 10 shares each, re-placed at each reset until
+that level has filled 10 shares. One TLTW limit buy, id
+tltw-buy-100-18, 100 shares at 18.00, re-placed for its unfilled
+remainder until 100 shares have filled once. Partial fills reduce the
+next order. A finished level or the finished TLTW buy is never sent again.
+
+Within one pass the cap is filled with TQQQ levels, highest price first,
+and the TLTW buy takes a free slot only after those.
 
 This does not cancel, modify, or replace any other order. It does not
 read or write ladder state. Live orders require TQQQ_LIVE=on and a
@@ -48,6 +53,12 @@ _PRICES = (
 _QTY = 10
 _TICKER = "TQQQ"
 _ISIN = "US74347X8314"
+# iShares 20+ Year Treasury Bond BuyWrite Strategy ETF (ticker TLTW).
+_TLTW_ID = "tltw-buy-100-18"
+_TLTW_TICKER = "TLTW"
+_TLTW_PRICE = "18.00"
+_TLTW_QTY = 100
+_TLTW_ISIN = "US46436E3383"
 _SUFFIX = "20112"
 _PROGRAM = "tqqq-buy"
 _MAX_NEW = 6
@@ -71,20 +82,27 @@ def _suffix_is_target():
     return gb._account_suffix() == _SUFFIX
 
 
-def _level_for(price):
-    """One of the 20 prices, or None. A gap smaller than the book stays unique."""
+def _as_price(price):
     if isinstance(price, bool) or price is None:
         return None
     if isinstance(price, str):
         try:
             number = float(Decimal(price.strip()))
         except Exception:
-            number = None
+            return None
     elif isinstance(price, (int, float)):
         number = float(price)
     else:
-        number = None
-    if number is None or not number > 0:
+        return None
+    if not number > 0:
+        return None
+    return number
+
+
+def _level_for(price):
+    """One of the 20 prices, or None. A gap smaller than the book stays unique."""
+    number = _as_price(price)
+    if number is None:
         return None
     found = None
     for level in _PRICES:
@@ -95,16 +113,37 @@ def _level_for(price):
     return found
 
 
+def _tltw_price(price):
+    """18.00 when this row is the TLTW exception. Other TLTW prices are not."""
+    number = _as_price(price)
+    if number is None:
+        return None
+    if abs(number - float(_TLTW_PRICE)) < _PRICE_GAP:
+        return _TLTW_PRICE
+    return None
+
+
+def _empty_bucket():
+    return {
+        "filled_qty": 0,
+        "parts": {},
+        "filled": False,
+        "resting": {},
+    }
+
+
 def _fresh():
     levels = {}
     for price in _PRICES:
-        levels[price] = {
-            "filled_qty": 0,
-            "parts": {},
-            "filled": False,
-            "resting": {},
-        }
-    return {"version": 1, "program": _PROGRAM, "levels": levels, "seq": 0, "saved_at": 0}
+        levels[price] = _empty_bucket()
+    return {
+        "version": 1,
+        "program": _PROGRAM,
+        "levels": levels,
+        "exceptions": {_TLTW_ID: _empty_bucket()},
+        "seq": 0,
+        "saved_at": 0,
+    }
 
 
 def _clean_resting(raw):
@@ -123,27 +162,33 @@ def _clean_resting(raw):
     return cleaned
 
 
+def _clean_bucket(item, target):
+    if not isinstance(item, dict):
+        item = {}
+    parts = bot._clean_parts_map(item.get("parts"))
+    qty = sum(parts.values()) if parts else bot._share_count(item.get("filled_qty", 0))
+    if qty > target:
+        qty = target
+    done = qty >= target
+    return {
+        "filled_qty": target if done else qty,
+        "parts": parts if qty else {},
+        "filled": done,
+        "resting": {} if done else _clean_resting(item.get("resting")),
+    }
+
+
 def _clean(state):
     raw_levels = state.get("levels") if isinstance(state, dict) else None
     if not isinstance(raw_levels, dict):
         raw_levels = {}
     levels = {}
     for price in _PRICES:
-        item = raw_levels.get(price)
-        if not isinstance(item, dict):
-            item = {}
-        parts = bot._clean_parts_map(item.get("parts"))
-        qty = sum(parts.values()) if parts else bot._share_count(item.get("filled_qty", 0))
-        if qty > _QTY:
-            qty = _QTY
-        done = qty >= _QTY
-        resting = {} if done else _clean_resting(item.get("resting"))
-        levels[price] = {
-            "filled_qty": _QTY if done else qty,
-            "parts": parts if qty else {},
-            "filled": done,
-            "resting": resting,
-        }
+        levels[price] = _clean_bucket(raw_levels.get(price), _QTY)
+    raw_extra = state.get("exceptions") if isinstance(state, dict) else None
+    if not isinstance(raw_extra, dict):
+        raw_extra = {}
+    exceptions = {_TLTW_ID: _clean_bucket(raw_extra.get(_TLTW_ID), _TLTW_QTY)}
     seq = state.get("seq") if isinstance(state, dict) else 0
     if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
         seq = 0
@@ -154,6 +199,7 @@ def _clean(state):
         "version": 1,
         "program": _PROGRAM,
         "levels": levels,
+        "exceptions": exceptions,
         "seq": seq,
         "saved_at": saved,
     }
@@ -182,53 +228,58 @@ def _save_state(state):
     return True
 
 
+def _add_fill(bucket, order, target):
+    """Add one buy fill onto a bucket. The same key keeps the larger total."""
+    cancelled = order.get("cancelled_qty", 0)
+    if isinstance(cancelled, bool) or not isinstance(cancelled, (int, float)):
+        cancelled = 0
+    if cancelled > 0:
+        return
+    qty = bot._share_count(order.get("filled_qty", 0))
+    if qty <= 0 or bucket.get("filled"):
+        return
+    key = order.get("key")
+    if not bot._fill_key_ok(key):
+        return
+    parts = bucket["parts"]
+    prev = parts.get(key, 0)
+    if qty <= prev:
+        return
+    parts[key] = qty
+    total = sum(parts.values())
+    if total > target:
+        total = target
+    bucket["filled_qty"] = total
+    bucket["parts"] = parts
+    bucket["filled"] = total >= target
+    if bucket["filled"]:
+        bucket["resting"] = {}
+
+
 def _note_fills(state, rows):
-    """Count TQQQ buy fills at a level. The same fill key is not added twice."""
+    """Count TQQQ level fills and the TLTW buy at 18.00. Other rows are ignored."""
     for order in rows or []:
-        if not isinstance(order, dict):
+        if not isinstance(order, dict) or order.get("side") != "buy":
             continue
-        if order.get("ticker") != _TICKER or order.get("side") != "buy":
+        ticker = order.get("ticker")
+        if ticker == _TICKER:
+            price = _level_for(order.get("price"))
+            if price is None:
+                continue
+            _add_fill(state["levels"][price], order, _QTY)
             continue
-        price = _level_for(order.get("price"))
-        if price is None:
-            continue
-        cancelled = order.get("cancelled_qty", 0)
-        if isinstance(cancelled, bool) or not isinstance(cancelled, (int, float)):
-            cancelled = 0
-        if cancelled > 0:
-            continue
-        qty = bot._share_count(order.get("filled_qty", 0))
-        if qty <= 0:
-            continue
-        key = order.get("key")
-        if not bot._fill_key_ok(key):
-            continue
-        bucket = state["levels"][price]
-        if bucket["filled"]:
-            continue
-        parts = bucket["parts"]
-        prev = parts.get(key, 0)
-        if qty <= prev:
-            continue
-        parts[key] = qty
-        total = sum(parts.values())
-        if total > _QTY:
-            total = _QTY
-        bucket["filled_qty"] = total
-        bucket["parts"] = parts
-        bucket["filled"] = total >= _QTY
-        if bucket["filled"]:
-            bucket["resting"] = {}
+        if ticker == _TLTW_TICKER and _tltw_price(order.get("price")):
+            _add_fill(state["exceptions"][_TLTW_ID], order, _TLTW_QTY)
 
 
-def _remainder(bucket):
-    if bucket.get("filled") or bucket.get("filled_qty", 0) >= _QTY:
+def _remainder(bucket, target):
+    if bucket.get("filled") or bucket.get("filled_qty", 0) >= target:
         return 0
-    left = _QTY - int(bucket.get("filled_qty", 0))
+    left = target - int(bucket.get("filled_qty", 0))
     if left < 1:
         return 0
-    if left > _QTY:
-        return _QTY
+    if left > target:
+        return target
     return left
 
 
@@ -251,13 +302,45 @@ def _open_orders_at(opens, price):
 def _classify(state, opens, slot, today, price):
     """filled, open, resting, or place. Open orders are never cancelled."""
     bucket = state["levels"][price]
-    left = _remainder(bucket)
+    left = _remainder(bucket, _QTY)
     if left < 1:
         return "filled", 0
     opened = _open_orders_at(opens, price)
     if opened:
         # Same price and side is already working. Leave it alone, including
         # when that open quantity is the unfilled remainder.
+        return "open", opened[0]
+    resting = bucket.get("resting") or {}
+    if resting.get("day") == today and resting.get("slot") == slot:
+        return "resting", left
+    return "place", left
+
+
+def _open_tltw(opens):
+    """Open TLTW buy quantities at 18.00. Other TLTW orders are not included."""
+    found = []
+    for order in opens or []:
+        if not isinstance(order, dict):
+            continue
+        if order.get("ticker") != _TLTW_TICKER or order.get("side") != "buy":
+            continue
+        if _tltw_price(order.get("price")) is None:
+            continue
+        qty = bot._share_count(order.get("qty", 0))
+        if qty < 1:
+            continue
+        found.append(qty)
+    return found
+
+
+def _classify_tltw(state, opens, slot, today):
+    """The one TLTW exception. A different TLTW order is left untouched."""
+    bucket = state["exceptions"][_TLTW_ID]
+    left = _remainder(bucket, _TLTW_QTY)
+    if left < 1:
+        return "filled", 0
+    opened = _open_tltw(opens)
+    if opened:
         return "open", opened[0]
     resting = bucket.get("resting") or {}
     if resting.get("day") == today and resting.get("slot") == slot:
@@ -302,22 +385,42 @@ def _live_now(event, now):
     )
 
 
+def _emit_kind(ticker, kind, price, qty):
+    if kind == "filled":
+        print("%s filled %s" % (ticker, price))
+    elif kind == "open":
+        print("%s skip open %s qty %s" % (ticker, price, qty))
+    elif kind == "resting":
+        print("%s resting %s qty %s" % (ticker, price, qty))
+
+
 def _due(state, opens, slot, today):
-    """Levels that still need an order, highest price first."""
+    """TQQQ levels highest price first, then the TLTW buy if it still fits."""
     due = []
     for price in _PRICES:
         kind, qty = _classify(state, opens, slot, today, price)
-        if kind == "filled":
-            print("TQQQ filled %s" % price)
+        if kind == "place":
+            due.append({"ticker": _TICKER, "price": price, "qty": qty})
             continue
-        if kind == "open":
-            print("TQQQ skip open %s qty %s" % (price, qty))
-            continue
-        if kind == "resting":
-            print("TQQQ resting %s qty %s" % (price, qty))
-            continue
-        due.append((price, qty))
+        _emit_kind(_TICKER, kind, price, qty)
+    kind, qty = _classify_tltw(state, opens, slot, today)
+    if kind == "place":
+        due.append({"ticker": _TLTW_TICKER, "price": _TLTW_PRICE, "qty": qty})
+    else:
+        _emit_kind(_TLTW_TICKER, kind, _TLTW_PRICE, qty)
     return due
+
+
+def _mark_resting(state, item, slot, today):
+    if item["ticker"] == _TLTW_TICKER:
+        bucket = state["exceptions"][_TLTW_ID]
+    else:
+        bucket = state["levels"][item["price"]]
+    bucket["resting"] = {"slot": slot, "day": today, "qty": item["qty"]}
+
+
+def _plan_line(item):
+    return "%s plan buy %s qty %s" % (item["ticker"], item["price"], item["qty"])
 
 
 def _trade(now, opens, fills, state, place, live, slot):
@@ -325,21 +428,21 @@ def _trade(now, opens, fills, state, place, live, slot):
     _note_fills(state, list(fills or []) + list(opens or []))
     due = _due(state, opens, slot, today)
     if not live:
-        for price, qty in due:
-            print("TQQQ plan buy %s qty %s" % (price, qty))
+        for item in due:
+            print(_plan_line(item))
         print("OK dry")
         return 0, False, state
     sending = due[:_MAX_NEW]
     deferred = due[_MAX_NEW:]
-    for price, qty in sending:
-        print("TQQQ plan buy %s qty %s" % (price, qty))
-    for price, qty in deferred:
-        print("TQQQ defer buy %s qty %s" % (price, qty))
-    for price, qty in sending:
+    for item in sending:
+        print(_plan_line(item))
+    for item in deferred:
+        print("%s defer buy %s qty %s" % (item["ticker"], item["price"], item["qty"]))
+    for item in sending:
         if bot._orders_blocked(now) or bot._orders_blocked(bot._now_kst()):
             print("skip: time guard")
             return 0, False, state
-        result = place(price, qty)
+        result = place(item["price"], item["qty"])
         if result == "max_orders":
             print("ERROR max_orders")
             print("FOLLOWUP reset")
@@ -350,14 +453,12 @@ def _trade(now, opens, fills, state, place, live, slot):
             else:
                 print("ERROR reject")
             return 1, False, state
-        state["levels"][price]["resting"] = {
-            "slot": slot,
-            "day": today,
-            "qty": qty,
-        }
-        print("TQQQ placed buy %s qty %s" % (price, qty))
+        _mark_resting(state, item, slot, today)
+        print("%s placed buy %s qty %s" % (item["ticker"], item["price"], item["qty"]))
     if deferred:
-        print("DEFERRED TQQQ %s" % (len(deferred),))
+        tqqq_n = sum(1 for item in deferred if item["ticker"] == _TICKER)
+        if tqqq_n:
+            print("DEFERRED TQQQ %s" % (tqqq_n,))
         print("FOLLOWUP reset")
         print("OK live")
         return 0, True, state
@@ -473,11 +574,15 @@ def _is_max_orders():
 
 
 def _broker_place(account, price, qty):
-    """One TQQQ limit buy. None on reject, "max_orders" on a count limit."""
+    """One limit buy. None on reject, "max_orders" on a count limit."""
     send = bot._share_count(qty)
-    if send < 1 or send > _QTY:
-        return None
-    if _level_for(price) != price:
+    if _level_for(price) == price and 1 <= send <= _QTY:
+        ticker = _TICKER
+        limit = price
+    elif _tltw_price(price) and 1 <= send <= _TLTW_QTY:
+        ticker = _TLTW_TICKER
+        limit = _TLTW_PRICE
+    else:
         return None
     kind = bot._order_type(bot._now_kst(), mode="reset")
     if not kind:
@@ -485,9 +590,9 @@ def _broker_place(account, price, qty):
     body = {
         "act_no": account,
         "fc_sec_trd_nat_cd": "200",
-        "iem_cd": _TICKER,
+        "iem_cd": ticker,
         "orr_qty": send,
-        "fc_orr_uit_pr": round(float(Decimal(price)), 2),
+        "fc_orr_uit_pr": round(float(Decimal(limit)), 2),
         "ahi_nmn_pr_tp_cd": kind,
         "wtm_cur_knd_cd": "1",
     }

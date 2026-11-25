@@ -109,6 +109,8 @@ _ISIN = {
     "US25461A3876": "KORU",
     "US25459W4583": "SOXL",
     "US74347X8314": "TQQQ",
+    # TLTW CUSIP 46436E338 on the iShares product page. ISIN check digit 3.
+    "US46436E3383": "TLTW",
 }
 
 

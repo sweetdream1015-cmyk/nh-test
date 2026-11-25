@@ -45,7 +45,7 @@ Actions → acct-check → Run workflow. The job requests an OAuth token and cal
 
 ## TQQQ standing buys
 
-The TQQQ program is separate from the SOXL/KORU/NAIL ladder. It trades only the type-01 account whose number contains `201-12`, and it stores progress in `.tqqq-state/state.json`. It does not cancel other orders in that account.
+The TQQQ program is separate from the SOXL/KORU/NAIL ladder. It trades only the type-01 account whose number contains `201-12`, and it stores progress in `.tqqq-state/state.json`. It does not cancel other orders in that account. The same run also keeps one TLTW buy of 100 shares at 18.00 (`tltw-buy-100-18`) until that buy has filled 100 shares once. TQQQ levels are sent first, highest price first. Other TLTW and SCHD orders are left alone.
 
 It runs weekdays at 10:11 KST (day session, order type 63) and 18:11 KST (US premarket, order type 61). On issue **#18**, from the repository owner account, a new comment whose body starts with `tqqq-reset` runs the same reset.
 
