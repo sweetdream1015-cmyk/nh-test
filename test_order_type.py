@@ -1405,7 +1405,7 @@ def test_regular_reject_does_not_block_other_tickers():
 
 
 def test_reset_reject_still_places_exception():
-    """A reset reject stops that ticker and still places the exception."""
+    """A reset reject stops that ticker. The retired 400 buy is not placed."""
     _restore_guards()
     os.environ["LIVE_TRADING"] = "on"
     os.environ["LIVE_TICKERS"] = "SOXL"
@@ -1473,12 +1473,13 @@ def test_reset_reject_still_places_exception():
         assert "order type 00" in out
         assert "REJECT SOXL" in out
         assert "rsp_cd 23530" in out
-        assert "exception placed 1" in out
+        assert "exception placed" not in out
+        assert "18.7" not in out
         assert "ERROR reject" in out
         assert "ERROR unexpected" not in out
         assert "OK live" not in out
         assert len(world["placed"]) == 1
-        assert world["exceptions"] == [(400, 18.7)]
+        assert world["exceptions"] == []
         saved = world["saved"]
         assert saved["reset_tickers"]["17"].get("SOXL", "") == ""
         assert saved["reset_done"]["17"] == ""

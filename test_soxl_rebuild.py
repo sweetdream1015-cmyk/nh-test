@@ -1,4 +1,4 @@
-"""SOXL is 20 shares, plus the 400 at 18.7, and the one-shot rebuild."""
+"""SOXL is 20 shares. The buy of 400 at 18.7 is not placed."""
 
 import os
 from datetime import datetime
@@ -130,23 +130,15 @@ def test_flat_twenty_and_no_double():
     ]
 
 
-def test_exception_is_400_at_18_7_and_sell_is_retired():
+def test_buy_400_at_18_7_is_not_an_exception():
     ids = [item["id"] for item in bot._EXCEPTIONS]
+    assert ids == ["koru-buy-100-4.2"]
+    assert "soxl-buy-400-18-7" not in ids
     assert "soxl-sell-150-75" not in ids
-    assert ids == ["koru-buy-100-4.2", "soxl-buy-400-18-7"]
-    exc = bot._EXCEPTION_BY_ID["soxl-buy-400-18-7"]
-    assert exc["side"] == "buy" and exc["qty"] == 400
-    assert abs(exc["price"] - 18.7) < 1e-9
     assert ladders._level_of("SOXL", 18.7) is None
     state = bot._clean_state({})
-    assert bot._exception_remaining(state, exc) == 400
     assert bot._exception_remaining(state) == 0
     assert bot._exception_due(state, [], "09", "20261125") is False
-    state["exception_id"] = bot._EXCEPTION_ID
-    state["exception_filled"] = True
-    assert bot._exception_done(state) is True
-    assert bot._exception_due(state, [], "09", "20261125") is False
-    assert bot._exception_done_for(state, exc) is False
 
 
 def test_last_sell_from_36_is_103_for_15():
@@ -177,7 +169,7 @@ def test_dry_rebuild_keeps_36_30_despite_the_30_fill():
     assert "SOXL plan place buy 26 qty 20" not in out
     assert "exception plan place sell 75" not in out
     assert "SOXL plan cancel sell 75" not in out
-    assert "exception plan place buy 18.7 qty 400" in out
+    assert "18.7" not in out
     assert "NAIL unchanged" in out
     assert "KORU unchanged" in out
     assert "OK dry" in out
@@ -220,7 +212,7 @@ def test_live_rebuild_cancels_only_soxl_ladder_orders():
         ("SOXL", "sell", 36, 20),
         ("SOXL", "sell", 39, 20),
     ]
-    assert (400, 18.7) in world["exceptions"]
+    assert world["exceptions"] == []
     assert (150, 75) not in world["exceptions"]
     saved = world["saved"]
     assert saved["tickers"]["SOXL"]["sell"] == _level(36)
@@ -228,9 +220,7 @@ def test_live_rebuild_cancels_only_soxl_ladder_orders():
     assert saved["tickers"]["NAIL"]["sell"] == sim._pair("NAIL", 39, 33)["sell"]
     assert saved["tickers"]["KORU"]["buy"] == sim._pair("KORU", 7.2, 6.0)["buy"]
     assert _KEY in saved["handled"]
-    bucket = saved["exception_orders"]["soxl-buy-400-18-7"]
-    assert bucket["filled"] is False
-    assert bucket["resting"]["id"] == "soxl-buy-400-18-7"
+    assert "soxl-buy-400-18-7" not in saved.get("exception_orders", {})
 
 
 def test_later_reset_and_intraday_keep_36_30():
@@ -480,14 +470,14 @@ def test_extra_sell_39_is_cancelled_and_anchor_stays():
     assert code == 0, out
     assert "SOXL plan cancel sell 39 qty 4" in out
     assert "SOXL plan cancel sell 75 qty 150" in out
-    assert "SOXL plan ignore buy 18.7 qty 400" in out
-    assert "SOXL plan cancel buy 18.7" not in out
+    assert "SOXL plan cancel buy 18.7 qty 400" in out
+    assert "exception plan place buy 18.7" not in out
     assert ("SOXL", 39, 39) in world["cancelled"]
     assert ("SOXL", 75, 75) in world["cancelled"]
-    assert all(number != 187 for _ticker, _price, number in world["cancelled"])
+    assert ("SOXL", 18.7, 187) in world["cancelled"]
     assert all(ticker == "SOXL" for ticker, _price, _number in world["cancelled"])
     assert world["placed"].count(("SOXL", "sell", 39, 20)) == 1
-    assert (400, 18.7) not in world["exceptions"]
+    assert world["exceptions"] == []
     saved = world["saved"]
     assert saved["tickers"]["SOXL"]["sell"] == _level(36)
     assert saved["tickers"]["SOXL"]["buy"] == _level(30)
@@ -541,7 +531,7 @@ def test_reinquire_does_not_double_place():
     assert world["placed"].count(("SOXL", "sell", 36, 20)) == 1
     assert world["placed"].count(("SOXL", "buy", 30, 20)) == 1
     assert world["placed"].count(("SOXL", "buy", 28, 20)) == 1
-    assert all(number != 187 for _ticker, _price, number in world["cancelled"])
+    assert ("SOXL", 18.7, 187) in world["cancelled"]
     assert world["saved"]["tickers"]["SOXL"]["sell"] == _level(36)
     assert world["saved"]["tickers"]["SOXL"]["buy"] == _level(30)
 
@@ -648,7 +638,8 @@ def test_live_rebuild_cancels_without_live_trading():
         cancelled = [item["cancel"] for item in sent if item["cancel"] is not None]
         assert 39 in cancelled
         assert 75 in cancelled
-        assert 187 not in cancelled
+        assert 187 in cancelled
+        assert sum(1 for item in sent if item["price"] == 18.7) == 0
         assert sum(1 for item in sent if item["price"] == 39.0 and item["qty"] == 20) == 1
         assert saved["data"]["tickers"]["SOXL"]["sell"] == _level(36)
         assert saved["data"]["tickers"]["SOXL"]["buy"] == _level(30)
@@ -665,6 +656,44 @@ def test_live_rebuild_cancels_without_live_trading():
         os.environ.pop("GITHUB_EVENT_NAME", None)
         os.environ.pop("NHPLUG_APP_KEY", None)
         os.environ.pop("NHPLUG_APP_SECRET", None)
+
+
+def test_evening_reset_keeps_the_rebuilt_soxl_book():
+    """18:11 keeps sell 20@36, sell 20@39, buy 20@30, buy 20@28."""
+    when = datetime(2026, 11, 25, 18, 11, tzinfo=bot.KST)
+    assert when.strftime("%A") == "Wednesday"
+    assert bot._reset_slot(when) == "17"
+    assert not bot._orders_blocked(when)
+    state = _state()
+    state["handled"] = [_KEY]
+    opens = [
+        {"ticker": "SOXL", "side": "sell", "price": 36, "qty": 20, "orr_no": 1},
+        {"ticker": "SOXL", "side": "sell", "price": 39, "qty": 20, "orr_no": 2},
+        {"ticker": "SOXL", "side": "buy", "price": 30, "qty": 20, "orr_no": 3},
+        {"ticker": "SOXL", "side": "buy", "price": 28, "qty": 20, "orr_no": 4},
+    ]
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "SOXL"
+    os.environ.pop("SOXL_REBUILD_LIVE", None)
+    os.environ.pop("ORDER_TYPE", None)
+    code, out, world = sim._run(
+        state, opens, {}, fills=[_fill_30()], mode="reset", when=when
+    )
+    assert code == 0, out
+    assert world["placed"] == []
+    assert world["cancelled"] == []
+    assert world["exceptions"] == []
+    assert "18.7" not in out
+    kept = world["saved"]["tickers"]["SOXL"]
+    assert kept["sell"] == _level(36)
+    assert kept["buy"] == _level(30)
+    code, out, intra = sim._run(
+        state, opens, {}, fills=[_fill_30()], mode="intraday", when=datetime(2026, 11, 25, 12, 40, tzinfo=bot.KST)
+    )
+    assert code == 0, out
+    assert intra["placed"] == []
+    assert intra["cancelled"] == []
+    assert "18.7" not in out
 
 
 def test_live_trading_alone_stays_dry():
@@ -684,7 +713,7 @@ def main():
     original = bot._now_kst
     try:
         test_flat_twenty_and_no_double()
-        test_exception_is_400_at_18_7_and_sell_is_retired()
+        test_buy_400_at_18_7_is_not_an_exception()
         test_last_sell_from_36_is_103_for_15()
         test_dry_rebuild_keeps_36_30_despite_the_30_fill()
         test_live_rebuild_cancels_only_soxl_ladder_orders()
@@ -694,6 +723,7 @@ def main():
         test_extra_sell_39_is_cancelled_and_anchor_stays()
         test_reinquire_does_not_double_place()
         test_live_rebuild_cancels_without_live_trading()
+        test_evening_reset_keeps_the_rebuilt_soxl_book()
         test_live_trading_alone_stays_dry()
         print("OK soxl rebuild")
     finally:
