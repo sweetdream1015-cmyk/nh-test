@@ -384,13 +384,14 @@ def test_reset_does_not_requote_unhandled_anchor_fill():
     assert again["saved"]["tickers"]["SOXL"]["buy"] == _level("SOXL", 42)
 
 
-def test_adjust_places_missing_exception_once():
+def test_adjust_does_not_replace_retired_sell():
+    """The sell of 150 at 75 is not placed, even when it is missing."""
     when = _PREMARKET
     opens = _opens_without_exception()
     before = _state()
     code, out, world = _run(before, opens, when, preview=True)
     assert code == 0, out
-    assert "exception plan place sell 75 qty 150" in out
+    assert "exception plan place sell 75" not in out
     assert "OK preview" in out
     assert "saved" not in world
     assert world["placed"] == []
@@ -398,40 +399,19 @@ def test_adjust_places_missing_exception_once():
 
     code, out, world = _run_sending(before, opens, when)
     assert code == 0, out
-    assert "exception plan place sell 75 qty 150" in out
-    assert "exception placed 1" in out
-    assert world["exceptions"] == [(150, 75)]
+    assert "exception plan place sell 75" not in out
+    assert "exception placed" not in out
+    assert world["exceptions"] == []
     assert ("SOXL", "buy", 36, 20) in world["placed"]
     assert ("SOXL", "sell", 46, 20) in world["placed"]
-    assert all(price != 75 for _ticker, price, _number in world["cancelled"])
     saved = world["saved"]
     assert saved["exception_filled"] is False
     assert saved["exception_id"] == ""
-    assert saved["exception_resting"]["id"] == bot._EXCEPTION_ID
-    assert saved["exception_resting"]["slot"] == "17"
-    assert saved["exception_resting"]["day"] == "20261109"
+    assert saved["exception_resting"] == {}
     assert saved["tickers"]["NAIL"] == before["tickers"]["NAIL"]
     assert saved["tickers"]["KORU"] == before["tickers"]["KORU"]
     assert saved["tickers"]["SOXL"]["sell"] == _level("SOXL", 46)
     assert saved["tickers"]["SOXL"]["buy"] == _level("SOXL", 39)
-
-    code, out, again = _run_sending(saved, opens, when)
-    assert code == 0, out
-    assert again["exceptions"] == []
-    assert "exception placed" not in out
-    assert again["saved"]["exception_filled"] is False
-
-    morning_mark = _state()
-    morning_mark["exception_resting"] = {
-        "id": bot._EXCEPTION_ID,
-        "slot": "09",
-        "day": "20261109",
-        "at": int(when.timestamp()),
-    }
-    code, out, world = _run_sending(morning_mark, opens, when)
-    assert code == 0, out
-    assert world["exceptions"] == [(150, 75)]
-    assert world["saved"]["exception_resting"]["slot"] == "17"
 
     partial_key = "ab" * 32
     partial = _state()
@@ -441,19 +421,17 @@ def test_adjust_places_missing_exception_once():
     partial["exception_parts"] = {partial_key: 40}
     code, out, world = _run(bot._clean_state(partial), opens, when, preview=True)
     assert code == 0, out
-    assert "exception plan place sell 75 qty 110" in out
+    assert "exception plan place sell 75" not in out
     assert "OK preview" in out
     code, out, world = _run_sending(bot._clean_state(partial), opens, when)
     assert code == 0, out
-    assert "exception plan place sell 75 qty 110" in out
-    assert world["exceptions"] == [(110, 75)]
-    assert world["saved"]["exception_filled"] is False
+    assert "exception plan place sell 75" not in out
+    assert world["exceptions"] == []
     assert world["saved"]["exception_filled_qty"] == 40
-    assert all(price != 75 for _ticker, price, _number in world["cancelled"])
 
 
-def test_koru_adjust_places_missing_exception():
-    """Moving KORU still sends the missing SOXL sell, not KORU's ladder only."""
+def test_koru_adjust_does_not_place_retired_sell():
+    """Moving KORU does not send the retired SOXL sell of 150 at 75."""
     when = _PREMARKET
     os.environ["LIVE_TRADING"] = "on"
     os.environ["LIVE_TICKERS"] = "NAIL,KORU,SOXL"
@@ -489,9 +467,9 @@ def test_koru_adjust_places_missing_exception():
     )
     assert code == 0, out
     assert "OK preview" in out
-    assert "exception plan place sell 75 qty 150" in out
+    assert "exception plan place sell 75" not in out
     assert "NAIL unchanged" in out
-    assert "SOXL unchanged" not in out
+    assert "SOXL unchanged" in out
     assert "saved" not in world
 
     os.environ["ADJUST_PREVIEW"] = "false"
@@ -510,8 +488,8 @@ def test_koru_adjust_places_missing_exception():
         )
     )
     assert code == 0, out
-    assert world["exceptions"] == [(150, 75)]
-    assert "exception placed 1" in out
+    assert world["exceptions"] == []
+    assert "exception placed" not in out
     assert ("KORU", "sell", 7.9, 1) in world["placed"]
     assert ("KORU", "buy", 5.5, 2) in world["placed"]
     assert world["cancelled"] == []
@@ -520,8 +498,7 @@ def test_koru_adjust_places_missing_exception():
     assert saved["tickers"]["SOXL"] == before["tickers"]["SOXL"]
     assert saved["tickers"]["NAIL"] == before["tickers"]["NAIL"]
     assert saved["exception_filled"] is False
-    assert saved["exception_resting"]["slot"] == "17"
-    assert saved["exception_resting"]["day"] == "20261109"
+    assert saved["exception_resting"] == {}
 
 
 def test_adjust_skips_ineligible_exception():
@@ -727,8 +704,8 @@ def main():
         test_step_buy_one_matches_explicit_anchors()
         test_other_hours_and_bad_anchor()
         test_reset_does_not_requote_unhandled_anchor_fill()
-        test_adjust_places_missing_exception_once()
-        test_koru_adjust_places_missing_exception()
+        test_adjust_does_not_replace_retired_sell()
+        test_koru_adjust_does_not_place_retired_sell()
         test_adjust_skips_ineligible_exception()
         test_adjust_leaves_koru_exception()
         test_adjust_does_not_replace_recent_order()

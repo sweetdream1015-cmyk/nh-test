@@ -1,7 +1,9 @@
 """SOXL is 20 shares, plus the 400 at 18.7, and the one-shot rebuild."""
 
 import os
+from datetime import datetime
 
+import gb_readonly_check as gb
 import ladder_bot as bot
 import ladder_dryrun as ladders
 import test_reset_batch as sim
@@ -128,21 +130,38 @@ def test_flat_twenty_and_no_double():
     ]
 
 
-def test_exception_is_400_at_18_7_and_sell_stays():
+def test_exception_is_400_at_18_7_and_sell_is_retired():
     ids = [item["id"] for item in bot._EXCEPTIONS]
-    assert ids[0] == "soxl-sell-150-75"
-    assert "soxl-buy-400-18-7" in ids
+    assert "soxl-sell-150-75" not in ids
+    assert ids == ["koru-buy-100-4.2", "soxl-buy-400-18-7"]
     exc = bot._EXCEPTION_BY_ID["soxl-buy-400-18-7"]
     assert exc["side"] == "buy" and exc["qty"] == 400
     assert abs(exc["price"] - 18.7) < 1e-9
     assert ladders._level_of("SOXL", 18.7) is None
     state = bot._clean_state({})
     assert bot._exception_remaining(state, exc) == 400
-    assert bot._exception_remaining(state) == 150
+    assert bot._exception_remaining(state) == 0
+    assert bot._exception_due(state, [], "09", "20261125") is False
     state["exception_id"] = bot._EXCEPTION_ID
     state["exception_filled"] = True
     assert bot._exception_done(state) is True
+    assert bot._exception_due(state, [], "09", "20261125") is False
     assert bot._exception_done_for(state, exc) is False
+
+
+def test_last_sell_from_36_is_103_for_15():
+    """475 - 100 base - 120 exception = 255 ladder shares from 36."""
+    index = _level(36)
+    left = 475 - 100 - 120
+    assert left == 255
+    last = None
+    while left > 0:
+        price = ladders._price_at("SOXL", index)
+        qty = 20 if left >= 20 else left
+        last = (price, qty)
+        left -= qty
+        index += 1
+    assert last == (103, 15)
 
 
 def test_dry_rebuild_keeps_36_30_despite_the_30_fill():
@@ -156,7 +175,8 @@ def test_dry_rebuild_keeps_36_30_despite_the_30_fill():
     assert "SOXL plan place buy 28 qty 20" in out
     assert "SOXL plan place sell 33 qty 20" not in out
     assert "SOXL plan place buy 26 qty 20" not in out
-    assert "exception plan place sell 75 qty 150" in out
+    assert "exception plan place sell 75" not in out
+    assert "SOXL plan cancel sell 75" not in out
     assert "exception plan place buy 18.7 qty 400" in out
     assert "NAIL unchanged" in out
     assert "KORU unchanged" in out
@@ -170,8 +190,8 @@ def test_dry_rebuild_keeps_36_30_despite_the_30_fill():
     assert code == 0, out
     assert "SOXL anchor sell 36 buy 30" in out
     assert "exception plan place sell 75" not in out
-    assert "SOXL plan ignore sell 75 qty 150" in out
-    assert "SOXL plan cancel sell 75" not in out
+    assert "SOXL plan ignore sell 75 qty 150" not in out
+    assert "SOXL plan cancel sell 75 qty 150" in out
     assert world["placed"] == []
     assert world["cancelled"] == []
     assert world["exceptions"] == []
@@ -193,10 +213,7 @@ def test_live_rebuild_cancels_only_soxl_ladder_orders():
     assert code == 0, out
     assert "OK live" in out
     assert {ticker for ticker, _price, _number in world["cancelled"]} == {"SOXL"}
-    assert all(price != 75 for _ticker, price, _number in world["cancelled"])
-    assert all(
-        not (ticker == "SOXL" and price == 75) for ticker, price, _number in world["cancelled"]
-    )
+    assert ("SOXL", 75, 90) in world["cancelled"]
     assert sorted(world["placed"]) == [
         ("SOXL", "buy", 28, 20),
         ("SOXL", "buy", 30, 20),
@@ -249,6 +266,170 @@ def test_later_reset_and_intraday_keep_36_30():
     assert ("SOXL", "buy", 26, 20) not in intra["placed"]
 
 
+def _old_book():
+    """The open SOXL book from before the 20-share rebuild."""
+    return [
+        {"ticker": "SOXL", "side": "buy", "price": 26, "qty": 8, "orr_no": 26},
+        {"ticker": "SOXL", "side": "buy", "price": 28, "qty": 8, "orr_no": 28},
+        {"ticker": "SOXL", "side": "sell", "price": 33, "qty": 4, "orr_no": 33},
+        {"ticker": "SOXL", "side": "sell", "price": 36, "qty": 4, "orr_no": 36},
+        {"ticker": "SOXL", "side": "sell", "price": 75, "qty": 150, "orr_no": 75},
+    ]
+
+
+def test_scheduled_runs_leave_the_old_book():
+    """Reset and intraday must not quote 20s or 400 beside the old book.
+
+    The sell of 150 at 75 stays until soxl-rebuild cancels it. The
+    unhandled buy of 4 at 30 does not step the anchor, even if a sell
+    at 39 is also open.
+    """
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["LIVE_TICKERS"] = "NAIL,KORU,SOXL"
+    os.environ.pop("SOXL_REBUILD_LIVE", None)
+    os.environ.pop("ORDER_TYPE", None)
+    when = datetime(2026, 11, 25, 12, 40, tzinfo=bot.KST)
+    bot._now_kst = lambda: when
+    opens = _old_book()
+    code, out, world = sim._run(
+        _state(), opens, {}, fills=[_fill_30()], mode="reset", when=when
+    )
+    assert code == 0, out
+    assert "SOXL skip old book" in out
+    assert world["cancelled"] == []
+    assert [item for item in world["placed"] if item[0] == "SOXL"] == []
+    assert (400, 18.7) not in world["exceptions"]
+    assert (150, 75) not in world["exceptions"]
+    kept = world["saved"]["tickers"]["SOXL"]
+    assert kept["sell"] == _level(36)
+    assert kept["buy"] == _level(30)
+    assert _KEY not in world["saved"]["handled"]
+    nail = [item for item in world["placed"] if item[0] == "NAIL"]
+    assert nail, out
+
+    wider = opens + [
+        {"ticker": "SOXL", "side": "sell", "price": 39, "qty": 4, "orr_no": 39}
+    ]
+    code, out, intra = sim._run(
+        _state(), wider, {}, fills=[_fill_30()], mode="intraday", when=when
+    )
+    assert code == 0, out
+    assert "SOXL skip old book" in out
+    assert intra["placed"] == []
+    assert intra["cancelled"] == []
+    assert (400, 18.7) not in intra["exceptions"]
+    kept = intra["saved"]["tickers"]["SOXL"]
+    assert kept["sell"] == _level(36)
+    assert kept["buy"] == _level(30)
+    assert "NEEDS_REVIEW SOXL" not in out
+
+
+def test_live_clocked_rebuild_at_1240_reaches_runner():
+    """A live issue-comment rebuild at 12:40 KST must not log OK skip.
+
+    The guards at 08:30 and 16:30 KST still stop it before any order.
+    """
+    noon = datetime(2026, 11, 25, 12, 40, tzinfo=bot.KST)
+    morning = datetime(2026, 11, 25, 8, 30, tzinfo=bot.KST)
+    afternoon = datetime(2026, 11, 25, 16, 30, tzinfo=bot.KST)
+    assert noon.weekday() == 2
+    assert bot._window_open("soxl-rebuild", noon, noon.astimezone(bot.ET))
+    assert not bot._orders_blocked(noon)
+    assert bot._orders_blocked(morning)
+    assert bot._orders_blocked(afternoon)
+    ten = datetime(2026, 11, 25, 10, 0, tzinfo=bot.KST)
+    assert not bot._orders_blocked(ten)
+    assert bot._window_open("soxl-rebuild", ten, ten.astimezone(bot.ET))
+
+    calls = {"n": 0}
+    moment = {"when": noon}
+
+    class _Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = moment["when"]
+            if tz is None:
+                return current.replace(tzinfo=None)
+            return current.astimezone(tz)
+
+    original_run = bot._run_soxl_rebuild
+    original_datetime = bot.datetime
+    original_token = bot._load_token
+    original_inquiry = bot._inquiry
+    original_state = bot._load_state
+    original_place = bot._place
+    original_cancel = bot._cancel
+    original_place_exc = bot._place_exception
+    original_save = bot._save_json
+    original_post = gb._post_bearer
+
+    def wrapped(*args, **kwargs):
+        calls["n"] += 1
+        return original_run(*args, **kwargs)
+
+    saved = {}
+
+    def save_json(_path, data):
+        saved["data"] = data
+
+    def post(url, _body, _extra):
+        if "acctinfo" not in url:
+            return 500, {}, {}
+        return 200, {}, {"Output_0": [{"acct_type": "01", "acct_no": "20102999991"}]}
+
+    os.environ["LADDER_MODE"] = "soxl-rebuild"
+    os.environ["GITHUB_EVENT_NAME"] = "schedule"
+    os.environ["SOXL_REBUILD_LIVE"] = "on"
+    os.environ["LIVE_TRADING"] = "on"
+    os.environ["NHPLUG_APP_KEY"] = "test-key"
+    os.environ["NHPLUG_APP_SECRET"] = "test-secret"
+    os.environ.pop("NHPLUG_ACCOUNT_SUFFIX", None)
+    os.environ.pop("ORDER_TYPE", None)
+    bot._now_kst = lambda: moment["when"]
+    bot.datetime = _Clock
+    bot._run_soxl_rebuild = wrapped
+    bot._load_token = lambda: "token"
+    bot._load_state = _state
+    bot._inquiry = lambda *_args, **_kwargs: []
+    bot._place = lambda *_args, **_kwargs: True
+    bot._cancel = lambda *_args, **_kwargs: True
+    bot._place_exception = lambda *_args, **_kwargs: True
+    bot._save_json = save_json
+    gb._post_bearer = post
+    try:
+        code, out = sim._capture(bot._main_once)
+        assert calls["n"] == 1, out
+        assert "OK skip" not in out
+        assert "SOXL anchor sell 36 buy 30" in out
+        assert "OK live" in out
+        assert "20102999991" not in out
+        assert code == (0, False), out
+
+        calls["n"] = 0
+        for blocked in (morning, afternoon):
+            moment["when"] = blocked
+            code, out = sim._capture(bot._main_once)
+            assert code == (0, False), out
+            assert "skip: time guard" in out
+            assert calls["n"] == 0, out
+            assert "SOXL anchor" not in out
+    finally:
+        bot.datetime = original_datetime
+        bot._run_soxl_rebuild = original_run
+        bot._load_token = original_token
+        bot._inquiry = original_inquiry
+        bot._load_state = original_state
+        bot._place = original_place
+        bot._cancel = original_cancel
+        bot._place_exception = original_place_exc
+        bot._save_json = original_save
+        gb._post_bearer = original_post
+        os.environ.pop("LADDER_MODE", None)
+        os.environ.pop("GITHUB_EVENT_NAME", None)
+        os.environ.pop("NHPLUG_APP_KEY", None)
+        os.environ.pop("NHPLUG_APP_SECRET", None)
+
+
 def test_live_trading_alone_stays_dry():
     os.environ["LIVE_TRADING"] = "on"
     os.environ.pop("SOXL_REBUILD_LIVE", None)
@@ -266,10 +447,13 @@ def main():
     original = bot._now_kst
     try:
         test_flat_twenty_and_no_double()
-        test_exception_is_400_at_18_7_and_sell_stays()
+        test_exception_is_400_at_18_7_and_sell_is_retired()
+        test_last_sell_from_36_is_103_for_15()
         test_dry_rebuild_keeps_36_30_despite_the_30_fill()
         test_live_rebuild_cancels_only_soxl_ladder_orders()
         test_later_reset_and_intraday_keep_36_30()
+        test_scheduled_runs_leave_the_old_book()
+        test_live_clocked_rebuild_at_1240_reaches_runner()
         test_live_trading_alone_stays_dry()
         print("OK soxl rebuild")
     finally:

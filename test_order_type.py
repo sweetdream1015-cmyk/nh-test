@@ -1473,12 +1473,12 @@ def test_reset_reject_still_places_exception():
         assert "order type 00" in out
         assert "REJECT SOXL" in out
         assert "rsp_cd 23530" in out
-        assert "exception placed 2" in out
+        assert "exception placed 1" in out
         assert "ERROR reject" in out
         assert "ERROR unexpected" not in out
         assert "OK live" not in out
         assert len(world["placed"]) == 1
-        assert world["exceptions"] == [(150, 75), (400, 18.7)]
+        assert world["exceptions"] == [(400, 18.7)]
         saved = world["saved"]
         assert saved["reset_tickers"]["17"].get("SOXL", "") == ""
         assert saved["reset_done"]["17"] == ""
