@@ -20,13 +20,13 @@ Clauses are separated by ';':
   TICKER.double_used=price,price   (replaces that ticker's list; empty clears)
 Example: exception_filled=true;SOXL.double_used=72
 
-exception_filled applies to the standing order, SOXL sell 150 at 75.
-true stores that order's id and marks the 150 shares sold. false clears
-it. A saved true left by a retired buy does not finish this sell: 100 at
-75 on 2026-10-31, 200 at 38 (soxl-buy-200-38), and 200 at 37.5 filled
-2026-11-21 (soxl-buy-200-37-5). Do not seed true after the switch to the
-sell: that marks 150 at 75 finished. Do not reseed false either. The old
-true is already ignored.
+exception_filled still stores the retired id soxl-sell-150-75. That sell
+is not placed. true marks the old 150 shares sold. false clears the
+mark. Neither value sends an order. A saved true left by a retired buy
+is not a new order: 100 at 75 on 2026-10-31, 200 at 38
+(soxl-buy-200-38), and 200 at 37.5 filled 2026-11-21
+(soxl-buy-200-37-5). Do not reseed either way to change trading. The
+old mark does not place the 150 sell.
 """
 
 import os
