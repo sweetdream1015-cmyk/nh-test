@@ -3223,10 +3223,49 @@ def _soxl_exception_lines(state, opens, slot, today):
     return due, lines
 
 
-def _run_soxl_rebuild(event, now_kst, now_et, opens, fills, state, actions):
-    """Cancel SOXL ladder orders and quote the 20-share book.
+# Chosen core after the 11:55 KST buy of 4 at 30. That fill is already
+# handled: rebuild keeps this pair and later resets must not step it.
+_SOXL_REBUILD_SELL = 36
+_SOXL_REBUILD_BUY = 30
 
-    An unhandled core fill steps the pair first, the same way reset does.
+
+def _soxl_rebuild_pair(stored):
+    """Sell 36 / buy 30, keeping any saved double_used list."""
+    sell = ladders._level_of("SOXL", _SOXL_REBUILD_SELL)
+    buy = ladders._level_of("SOXL", _SOXL_REBUILD_BUY)
+    if not _valid_pair("SOXL", sell, buy):
+        return None
+    used = []
+    if isinstance(stored, dict):
+        used = list(stored.get("double_used") or [])
+    return {"sell": sell, "buy": buy, "double_used": used}
+
+
+def _core_buy_fill_keys(fills, buy_idx):
+    """Keys for the already-handled SOXL buy at the core anchor."""
+    keys = []
+    for row in fills or []:
+        if not isinstance(row, dict):
+            continue
+        if row.get("ticker") != "SOXL" or row.get("side") != "buy":
+            continue
+        idx = row.get("idx")
+        if isinstance(idx, bool) or not isinstance(idx, int):
+            idx = _level_of("SOXL", row.get("price"))
+        if idx != buy_idx:
+            continue
+        key = row.get("key")
+        if isinstance(key, str) and key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _run_soxl_rebuild(event, now_kst, now_et, opens, fills, state, actions):
+    """Cancel SOXL ladder orders and quote sell 36 / buy 30 at 20 shares.
+
+    The 11:55 buy of 4 at 30 is already handled. This does not step that
+    fill to sell 33 / buy 28. A live save stores sell 36 / buy 30 and the
+    fill key, so the next reset or intraday keeps the same anchor.
     The sell of 150 at 75 and the buy of 400 at 18.7 are not cancelled.
     An open one stays. A missing one is placed with the ladder orders.
     KORU, NAIL, and the other account are not touched. Dry unless
@@ -3243,9 +3282,11 @@ def _run_soxl_rebuild(event, now_kst, now_et, opens, fills, state, actions):
         print("OK dry")
         return 0
     _note_exception_fills(working, fills)
-    pair = _anchor_fill_step(
-        "SOXL", stored, fills, set(working["handled"]), mult, working
-    )
+    pair = _soxl_rebuild_pair(stored)
+    if pair is None:
+        print("ERROR config")
+        return 1
+    handled_fill = _core_buy_fill_keys(fills, pair["buy"])
     desired = _desired("SOXL", pair["sell"], pair["buy"], mult, pair["double_used"])
     if not desired:
         print("ERROR config")
@@ -3322,14 +3363,8 @@ def _run_soxl_rebuild(event, now_kst, now_et, opens, fills, state, actions):
             _add_exception_order_no(working, exc, number)
     if placed_n:
         print("exception placed %s" % (placed_n,))
-    _remember(
-        working,
-        [
-            row["key"]
-            for row in fills or []
-            if row.get("ticker") == "SOXL" and isinstance(row.get("key"), str)
-        ],
-    )
+    # The 11:55 buy at 30 stays handled so the next reset does not step.
+    _remember(working, handled_fill)
     working["tickers"]["SOXL"] = pair
     actions["save_state"](_clean_state(working))
     print("OK live")
