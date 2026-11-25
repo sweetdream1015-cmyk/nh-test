@@ -42,19 +42,19 @@ That covers a cron GitHub never started. It does not cancel a book
 that already has ladder orders; those stay on the intraday path.
 Deferred work is retried in this process about 2 minutes later, at most
 3 extra passes, and not into a blocked window or out of the slot.
-Reset keeps two standing orders until each is fully filled, and places
+Reset keeps the standing orders until each is fully filled, and places
 them again after each broker cancel-all. A partial fill reduces the next
-order to the shares still left. The SOXL sell is 150 at 75. The KORU buy
+order to the shares still left. The SOXL sell is 150 at 75. The SOXL
+buy is 400 at 18.7, which is not a ladder rung. The KORU buy
 is 100 at 4.2, sent to the buy endpoint, and it is not the ladder's own
 2-share buy at that rung. The retired buys stay retired: 100 at 75 on
 2026-10-31, 200 at 38, and 200 at 37.5 filled 2026-11-21. exception_filled
 counts only when exception_id is soxl-sell-150-75, so a saved true from
 any of those buys does not block 150 at 75 and must not be reseeded true.
 The KORU buy keeps its own filled count under exception_orders.
-SOXL buys and sells 4. A first SOXL buy at 39 or below is 8, then 4
-once that level is in double_used. KORU buys and sells 1. A first KORU
-buy at 6 or below is 2, then 1. NAIL is unchanged. Saved double_used
-is kept as written.
+SOXL ladder buys and sells are 20. There is no doubled first buy.
+KORU buys and sells 1. A first KORU buy at 6 or below is 2, then 1.
+NAIL is unchanged. Saved double_used is kept as written.
 A manual adjust sets one ticker's sell and buy anchors, or steps that
 ticker once, then cancels only that ticker's ladder orders that do not
 match and places the missing ones. Preview prints those prices and
@@ -134,7 +134,7 @@ SELL_URL = gb.LIVE + "/gbstock/order/v1/sell"
 CANCEL_URL = gb.LIVE + "/gbstock/order/v1/cancel"
 _ORDER_URLS = {BUY_URL, SELL_URL, CANCEL_URL}
 # Ladder orders only. Standing exceptions do not use this cap.
-_HARD_MAX = {"NAIL": 40, "KORU": 4, "SOXL": 8}
+_HARD_MAX = {"NAIL": 40, "KORU": 4, "SOXL": 20}
 _MAX_NEW = 6
 # Extra reset passes after a deferral. Three tickers need only a couple;
 # the bound stops a stuck deferral from chaining.
@@ -164,6 +164,13 @@ _EXCEPTIONS = (
         "side": "buy",
         "price": 4.2,
         "qty": 100,
+    },
+    {
+        "id": "soxl-buy-400-18-7",
+        "ticker": "SOXL",
+        "side": "buy",
+        "price": 18.7,
+        "qty": 400,
     },
 )
 _EXCEPTION_BY_ID = {item["id"]: item for item in _EXCEPTIONS}
@@ -487,24 +494,22 @@ def _anchors(ticker, orders):
 def _in_double_zone(ticker, price):
     """True where the first buy is above base, so double_used can revert it.
 
-    NAIL is 22 and at or below 20. KORU is at or below 6. SOXL is at
-    or below 39.
+    NAIL is 22 and at or below 20. KORU is at or below 6. SOXL has no
+    doubled size, so a saved double_used list does not change its qty.
     """
     if ticker == "NAIL":
         return price <= 22
     if ticker == "KORU":
         return price <= 6
-    if ticker == "SOXL":
-        return price <= 39
     return False
 
 
 def _buy_computed(ticker, index, double_used):
     """First-buy size, or base once that level is already in double_used.
 
-    SOXL is 4, or 8 on the first buy at 39 or below. A used SOXL level
-    there is 4. KORU is 1, or 2 on the first buy at 6 or below, then 1.
-    NAIL is 20 at 22 and 40 at 20 or below, then 10 once that level is used.
+    SOXL is 20 on every rung. KORU is 1, or 2 on the first buy at 6 or
+    below, then 1. NAIL is 20 at 22 and 40 at 20 or below, then 10 once
+    that level is used.
     """
     price = ladders._price_at(ticker, index)
     if price is None:
@@ -3194,12 +3199,186 @@ def _run_cancel_dup(event, now_kst, now_et, opens, state, actions):
     return 0
 
 
+def _rebuild_live():
+    """Live SOXL rebuild is its own switch. LIVE_TRADING does not turn it on."""
+    return os.environ.get("SOXL_REBUILD_LIVE") == "on"
+
+
+def _soxl_exception_lines(state, opens, slot, today):
+    """Due SOXL standing orders. The KORU buy is not part of this rebuild."""
+    lines = []
+    due = []
+    for exc in _EXCEPTIONS:
+        if exc["ticker"] != "SOXL":
+            continue
+        if not _exception_due(state, opens, slot, today, exc):
+            continue
+        left = _exception_remaining(state, exc)
+        if left < 1:
+            continue
+        due.append((exc, left))
+        lines.append(
+            "exception plan place %s %s qty %s" % (exc["side"], _px(exc["price"]), left)
+        )
+    return due, lines
+
+
+# Chosen core after the 11:55 KST buy of 4 at 30. That fill is already
+# handled: rebuild keeps this pair and later resets must not step it.
+_SOXL_REBUILD_SELL = 36
+_SOXL_REBUILD_BUY = 30
+
+
+def _soxl_rebuild_pair(stored):
+    """Sell 36 / buy 30, keeping any saved double_used list."""
+    sell = ladders._level_of("SOXL", _SOXL_REBUILD_SELL)
+    buy = ladders._level_of("SOXL", _SOXL_REBUILD_BUY)
+    if not _valid_pair("SOXL", sell, buy):
+        return None
+    used = []
+    if isinstance(stored, dict):
+        used = list(stored.get("double_used") or [])
+    return {"sell": sell, "buy": buy, "double_used": used}
+
+
+def _core_buy_fill_keys(fills, buy_idx):
+    """Keys for the already-handled SOXL buy at the core anchor."""
+    keys = []
+    for row in fills or []:
+        if not isinstance(row, dict):
+            continue
+        if row.get("ticker") != "SOXL" or row.get("side") != "buy":
+            continue
+        idx = row.get("idx")
+        if isinstance(idx, bool) or not isinstance(idx, int):
+            idx = _level_of("SOXL", row.get("price"))
+        if idx != buy_idx:
+            continue
+        key = row.get("key")
+        if isinstance(key, str) and key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _run_soxl_rebuild(event, now_kst, now_et, opens, fills, state, actions):
+    """Cancel SOXL ladder orders and quote sell 36 / buy 30 at 20 shares.
+
+    The 11:55 buy of 4 at 30 is already handled. This does not step that
+    fill to sell 33 / buy 28. A live save stores sell 36 / buy 30 and the
+    fill key, so the next reset or intraday keeps the same anchor.
+    The sell of 150 at 75 and the buy of 400 at 18.7 are not cancelled.
+    An open one stays. A missing one is placed with the ladder orders.
+    KORU, NAIL, and the other account are not touched. Dry unless
+    SOXL_REBUILD_LIVE is on. A dry run does not save state.
+    """
+    mult = _mult()
+    if mult is None or _order_type_override() is None or state is None:
+        print("ERROR config")
+        return 1
+    working = _clean_state(state)
+    stored = _stored_pair(working, "SOXL")
+    if stored is None:
+        print("NEEDS_REVIEW SOXL")
+        print("OK dry")
+        return 0
+    _note_exception_fills(working, fills)
+    pair = _soxl_rebuild_pair(stored)
+    if pair is None:
+        print("ERROR config")
+        return 1
+    handled_fill = _core_buy_fill_keys(fills, pair["buy"])
+    desired = _desired("SOXL", pair["sell"], pair["buy"], mult, pair["double_used"])
+    if not desired:
+        print("ERROR config")
+        return 1
+    cancel, place, keep, ignored = _book_delta("SOXL", desired, opens, working)
+    today = now_kst.strftime("%Y%m%d")
+    slot = _reset_slot(now_kst) or ""
+    due, extra_lines = _soxl_exception_lines(working, opens, slot, today)
+    sell = ladders._price_at("SOXL", pair["sell"])
+    buy = ladders._price_at("SOXL", pair["buy"])
+    print("SOXL anchor sell %s buy %s" % (_px(sell), _px(buy)))
+    print("order type %s" % (_order_type(now_kst, now_et, "adjust") or "none",))
+
+    def _line(kind, side, price, qty):
+        print("SOXL plan %s %s %s qty %s" % (kind, side, _px(price), _px(qty)))
+
+    for order in cancel:
+        _line("cancel", order.get("side", ""), order.get("price"), order.get("qty"))
+    for item in place:
+        _line("place", item["side"], item["price"], item["qty"])
+    for order in keep:
+        _line("keep", order.get("side", ""), order.get("price"), order.get("qty"))
+    for order in ignored:
+        if _exception_order(order, working):
+            _line("ignore", order.get("side", ""), order.get("price"), order.get("qty"))
+    for line in extra_lines:
+        print(line)
+    print("NAIL unchanged")
+    print("KORU unchanged")
+    live = (
+        _rebuild_live()
+        and event in ("schedule", "workflow_dispatch")
+        and not _orders_blocked(now_kst)
+        and not _orders_blocked(_now_kst())
+        and _window_open("adjust", now_kst, now_et)
+    )
+    if not live:
+        print("OK dry")
+        return 0
+    kind = _order_type(now_kst, now_et, "adjust")
+    wall = _now_kst()
+    wall_kind = _order_type(wall, wall.astimezone(ET), "adjust")
+    if not kind or kind != wall_kind:
+        print("skip: session closed")
+        return 0
+    if len(place) + len(due) > _MAX_NEW:
+        print("ERROR max_orders")
+        return 1
+    counter = [0]
+    for order in cancel:
+        result = actions["cancel"]("SOXL", order)
+        if not result:
+            print("ERROR reject" if _log_reject() else _unexpected_line("cancel", "SOXL"))
+            return 1
+    for item in place:
+        result = actions["place"]("SOXL", item, counter)
+        if not result:
+            print("ERROR reject" if _log_reject() else _unexpected_line("place", "SOXL"))
+            return 1
+        _remember_placed(working, "SOXL", item, result, now_kst)
+    placed_n = 0
+    for exc, left in due:
+        if counter[0] >= _MAX_NEW:
+            print("DEFERRED exception")
+            break
+        result = _call_place_exception(actions, counter, left, exc)
+        if not result:
+            print("ERROR reject" if _log_reject() else _unexpected_line("place", "SOXL"))
+            return 1
+        placed_n += 1
+        _mark_exception_resting(working, slot if slot in ("09", "17") else "", today, now_kst, exc)
+        number = _order_number(result)
+        if number is not None:
+            _add_exception_order_no(working, exc, number)
+    if placed_n:
+        print("exception placed %s" % (placed_n,))
+    # The 11:55 buy at 30 stays handled so the next reset does not step.
+    _remember(working, handled_fill)
+    working["tickers"]["SOXL"] = pair
+    actions["save_state"](_clean_state(working))
+    print("OK live")
+    return 0
+
+
 def run(mode, event, now_kst, now_et, opens, fills, state, actions):
     """Pure orchestration. `actions` performs live calls or records dry intent."""
     global _wants_reset_followup
     _wants_reset_followup = False
     if mode == "cancel-dup":
         return _run_cancel_dup(event, now_kst, now_et, opens, state, actions)
+    if mode == "soxl-rebuild":
+        return _run_soxl_rebuild(event, now_kst, now_et, opens, fills, state, actions)
     mult = _mult()
     if mult is None or mode not in ("reset", "intraday", "adjust") or _order_type_override() is None:
         print("ERROR config")
@@ -3693,6 +3872,10 @@ def _main_once():
         if event not in ("schedule", "workflow_dispatch", "issue_comment"):
             print("OK dry")
             return 0, False
+    elif mode == "soxl-rebuild":
+        if _order_type_override() is None:
+            print("ERROR config")
+            return 1, False
     elif mode not in ("reset", "intraday", "adjust") or _order_type_override() is None:
         print("ERROR config")
         return 1, False
@@ -3700,7 +3883,8 @@ def _main_once():
     if mode == "adjust" and adjust is None:
         print("ERROR config")
         return 1, False
-    if _orders_blocked(now_kst) and not (adjust and adjust["preview"]):
+    rebuild_dry = mode == "soxl-rebuild" and not _rebuild_live()
+    if _orders_blocked(now_kst) and not (adjust and adjust["preview"]) and not rebuild_dry:
         print("skip: time guard")
         return 0, False
     if mode == "reset":
@@ -3721,6 +3905,8 @@ def _main_once():
             print("OK skip")
             return 0, False
     elif _clocked(event) and adjust and adjust["preview"]:
+        pass
+    elif _clocked(event) and mode == "soxl-rebuild" and not _rebuild_live():
         pass
     elif _clocked(event) and not _window_open(mode, now_kst, now_et):
         print("OK skip")

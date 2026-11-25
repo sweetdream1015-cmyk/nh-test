@@ -141,15 +141,15 @@ def _assert_plan(out):
     assert "SOXL anchor sell 46 buy 39" in out
     assert "SOXL plan cancel buy 42 qty 2" in out
     assert "SOXL plan cancel sell 55 qty 2" in out
-    assert "SOXL plan place sell 46 qty 4" in out
-    assert "SOXL plan place buy 36 qty 8" in out
-    assert "SOXL plan keep buy 39 qty 4" in out
-    assert "SOXL plan keep sell 50 qty 4" in out
+    assert "SOXL plan cancel buy 39 qty 4" in out
+    assert "SOXL plan cancel sell 50 qty 4" in out
+    assert "SOXL plan place sell 46 qty 20" in out
+    assert "SOXL plan place sell 50 qty 20" in out
+    assert "SOXL plan place buy 39 qty 20" in out
+    assert "SOXL plan place buy 36 qty 20" in out
     assert "SOXL plan ignore sell 75 qty 150" in out
     assert "NAIL unchanged" in out
     assert "KORU unchanged" in out
-    assert "SOXL plan cancel buy 39" not in out
-    assert "SOXL plan cancel sell 50" not in out
     assert "SOXL plan place buy 42" not in out
     assert "SOXL plan place sell 55" not in out
 
@@ -174,10 +174,10 @@ def test_target_book_quantities():
     pair = sim._pair("SOXL", 46, 39, _used())
     desired = bot._desired("SOXL", pair["sell"], pair["buy"], 1.0, pair["double_used"])
     assert [(item["side"], item["price"], item["qty"]) for item in desired] == [
-        ("sell", 46, 4),
-        ("sell", 50, 4),
-        ("buy", 39, 4),
-        ("buy", 36, 8),
+        ("sell", 46, 20),
+        ("sell", 50, 20),
+        ("buy", 39, 20),
+        ("buy", 36, 20),
     ]
 
 
@@ -210,11 +210,15 @@ def test_live_adjust_syncs_soxl_only():
     assert "OK live" in out
     assert "exception placed" not in out
     assert sorted(world["placed"]) == [
-        ("SOXL", "buy", 36, 8),
-        ("SOXL", "sell", 46, 4),
+        ("SOXL", "buy", 36, 20),
+        ("SOXL", "buy", 39, 20),
+        ("SOXL", "sell", 46, 20),
+        ("SOXL", "sell", 50, 20),
     ]
     assert sorted((ticker, price) for ticker, price, _number in world["cancelled"]) == [
+        ("SOXL", 39),
         ("SOXL", 42),
+        ("SOXL", 50),
         ("SOXL", 55),
     ]
     assert all(number != 5 for _ticker, _price, number in world["cancelled"])
@@ -228,8 +232,10 @@ def test_step_buy_one_matches_explicit_anchors():
     assert code == 0, out
     _assert_plan(out)
     assert sorted(world["placed"]) == [
-        ("SOXL", "buy", 36, 8),
-        ("SOXL", "sell", 46, 4),
+        ("SOXL", "buy", 36, 20),
+        ("SOXL", "buy", 39, 20),
+        ("SOXL", "sell", 46, 20),
+        ("SOXL", "sell", 50, 20),
     ]
     assert _level("SOXL", 36) not in world["saved"]["tickers"]["SOXL"]["double_used"]
     step_text = _run(
@@ -277,8 +283,10 @@ def test_other_hours_and_bad_anchor():
     assert "order type 62" in out
     assert "OK live" in out
     assert sorted(world["placed"]) == [
-        ("SOXL", "buy", 36, 8),
-        ("SOXL", "sell", 46, 4),
+        ("SOXL", "buy", 36, 20),
+        ("SOXL", "buy", 39, 20),
+        ("SOXL", "sell", 46, 20),
+        ("SOXL", "sell", 50, 20),
     ]
     assert {ticker for ticker, _price, _number in world["cancelled"]} == {"SOXL"}
 
@@ -339,10 +347,10 @@ def test_reset_does_not_requote_unhandled_anchor_fill():
     assert code == 0, out
     assert ("SOXL", "buy", 42, 2) not in world["placed"]
     assert sorted(world["placed"]) == [
-        ("SOXL", "buy", 36, 8),
-        ("SOXL", "buy", 39, 4),
-        ("SOXL", "sell", 46, 4),
-        ("SOXL", "sell", 50, 4),
+        ("SOXL", "buy", 36, 20),
+        ("SOXL", "buy", 39, 20),
+        ("SOXL", "sell", 46, 20),
+        ("SOXL", "sell", 50, 20),
     ]
     assert all(price != 75 for _ticker, price, _number in world["cancelled"])
     assert {ticker for ticker, _price, _number in world["cancelled"]} == {"SOXL"}
@@ -353,8 +361,8 @@ def test_reset_does_not_requote_unhandled_anchor_fill():
     assert key in saved["handled"]
     assert saved["tickers"]["NAIL"] == state["tickers"]["NAIL"]
     assert saved["tickers"]["KORU"] == state["tickers"]["KORU"]
-    assert world["exceptions"] == [(100, 4.2)]
-    assert "exception placed 1" in out
+    assert world["exceptions"] == [(100, 4.2), (400, 18.7)]
+    assert "exception placed 2" in out
     assert all(price != 75 for _qty, price in world["exceptions"])
 
     wiped = [order for order in opens if order["orr_no"] in (5, 6, 7, 8, 9)]
@@ -362,8 +370,8 @@ def test_reset_does_not_requote_unhandled_anchor_fill():
     assert code == 0, out
     assert wiped_world["cancelled"] == []
     assert ("SOXL", "buy", 42, 2) not in wiped_world["placed"]
-    assert ("SOXL", "buy", 36, 8) in wiped_world["placed"]
-    assert ("SOXL", "sell", 46, 4) in wiped_world["placed"]
+    assert ("SOXL", "buy", 36, 20) in wiped_world["placed"]
+    assert ("SOXL", "sell", 46, 20) in wiped_world["placed"]
     assert wiped_world["saved"]["tickers"]["SOXL"]["buy"] == _level("SOXL", 39)
     assert all(item[0] == "SOXL" for item in wiped_world["placed"])
 
@@ -371,7 +379,7 @@ def test_reset_does_not_requote_unhandled_anchor_fill():
     handled["handled"] = [key]
     code, out, again = sim._run(handled, opens, {}, fills=[fill])
     assert code == 0, out
-    assert ("SOXL", "buy", 42, 4) in again["placed"]
+    assert ("SOXL", "buy", 42, 20) in again["placed"]
     assert again["saved"]["tickers"]["SOXL"]["sell"] == _level("SOXL", 50)
     assert again["saved"]["tickers"]["SOXL"]["buy"] == _level("SOXL", 42)
 
@@ -393,8 +401,8 @@ def test_adjust_places_missing_exception_once():
     assert "exception plan place sell 75 qty 150" in out
     assert "exception placed 1" in out
     assert world["exceptions"] == [(150, 75)]
-    assert ("SOXL", "buy", 36, 8) in world["placed"]
-    assert ("SOXL", "sell", 46, 4) in world["placed"]
+    assert ("SOXL", "buy", 36, 20) in world["placed"]
+    assert ("SOXL", "sell", 46, 20) in world["placed"]
     assert all(price != 75 for _ticker, price, _number in world["cancelled"])
     saved = world["saved"]
     assert saved["exception_filled"] is False
@@ -546,7 +554,7 @@ def test_adjust_skips_ineligible_exception():
     assert code == 0, out
     assert "exception placed" not in out
     assert "exception plan place" not in out
-    assert ("SOXL", "buy", 36, 8) in world["placed"]
+    assert ("SOXL", "buy", 36, 20) in world["placed"]
 
     _env(False)
     bot._now_kst = lambda: when
@@ -669,11 +677,13 @@ def test_adjust_does_not_replace_recent_order():
         bot._clean_state(before), _opens(), _PREMARKET, preview=False
     )
     assert code == 0, out
-    assert ("SOXL", "sell", 46, 4) not in world["placed"], world["placed"]
-    assert ("SOXL", "buy", 36, 8) in world["placed"]
-    assert "SOXL resting sell 46 qty 4" in out
+    assert ("SOXL", "sell", 46, 20) not in world["placed"], world["placed"]
+    assert ("SOXL", "buy", 36, 20) in world["placed"]
+    assert "SOXL resting sell 46 qty 20" in out
     assert sorted((ticker, price) for ticker, price, _number in world["cancelled"]) == [
+        ("SOXL", 39),
         ("SOXL", 42),
+        ("SOXL", 50),
         ("SOXL", 55),
     ]
     assert world["saved"]["tickers"]["SOXL"]["double_used"] == used

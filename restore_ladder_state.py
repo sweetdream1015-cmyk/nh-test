@@ -33,6 +33,7 @@ _WORKFLOWS = (
     "ladder-reset.yml",
     "ladder-cancel-dup.yml",
     "ladder-adjust.yml",
+    "soxl-rebuild.yml",
     "seed-state.yml",
 )
 # No event= filter. issue_comment runs are included with schedule and dispatch.
