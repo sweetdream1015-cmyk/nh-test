@@ -154,7 +154,7 @@ def _run(mode, moment, state, opens, fills, place):
     def exception_open():
         return False
 
-    def place_exception(_counter, _qty=None):
+    def place_exception(_counter, _qty=None, _exc=None):
         return False
 
     actions = {
@@ -442,10 +442,11 @@ def _run_tracking(moment, state, opens, fills, place_fn=None):
     def exception_open():
         return False
 
-    def place_exception(_counter, qty=None):
+    def place_exception(_counter, qty=None, exc=None):
         if qty is None:
             qty = bot._EXCEPTION_QTY
-        world["exceptions"].append((qty, bot._EXCEPTION_PRICE))
+        price = bot._EXCEPTION_PRICE if exc is None else exc["price"]
+        world["exceptions"].append((qty, price))
         return True
 
     def place(ticker, item, counter):
@@ -615,8 +616,8 @@ def test_day_session_fill_followup():
         ("NAIL", "buy", 30, 10),
         ("KORU", "sell", 11.3, 1),
         ("KORU", "buy", 9.4, 1),
-        ("SOXL", "sell", 86, 4),
-        ("SOXL", "buy", 72, 4),
+        ("SOXL", "sell", 86, 20),
+        ("SOXL", "buy", 72, 20),
     ]
     moments = (
         (_kst(2026, 10, 29, 12, 0), "63"),
@@ -832,7 +833,7 @@ def test_day_session_quantities():
         86,
         1,
     )
-    assert soxl_at["placed"] == [("SOXL", "sell", 86, 4), ("SOXL", "buy", 72, 4)]
+    assert soxl_at["placed"] == [("SOXL", "sell", 86, 20), ("SOXL", "buy", 72, 20)]
 
     soxl_below = _one(
         "SOXL",
@@ -848,9 +849,9 @@ def test_day_session_quantities():
         79,
         1,
     )
-    assert soxl_below["placed"] == [("SOXL", "sell", 79, 4), ("SOXL", "buy", 66, 4)]
+    assert soxl_below["placed"] == [("SOXL", "sell", 79, 20), ("SOXL", "buy", 66, 20)]
 
-    # Above 39 the new buy is the base 4. The new sell is 4.
+    # Every new SOXL rung is 20, above 39 and below it.
     soxl_above = _one(
         "SOXL",
         103,
@@ -865,9 +866,9 @@ def test_day_session_quantities():
         94,
         1,
     )
-    assert soxl_above["placed"] == [("SOXL", "sell", 94, 4), ("SOXL", "buy", 79, 4)]
+    assert soxl_above["placed"] == [("SOXL", "sell", 94, 20), ("SOXL", "buy", 79, 20)]
 
-    # A used mark above 39 does not change the base 4.
+    # A used mark does not change the 20.
     soxl_used = _one(
         "SOXL",
         94,
@@ -882,7 +883,7 @@ def test_day_session_quantities():
         86,
         1,
     )
-    assert soxl_used["placed"] == [("SOXL", "sell", 86, 4), ("SOXL", "buy", 72, 4)]
+    assert soxl_used["placed"] == [("SOXL", "sell", 86, 20), ("SOXL", "buy", 72, 20)]
 
     soxl_used_low = _one(
         "SOXL",
@@ -898,7 +899,7 @@ def test_day_session_quantities():
         79,
         1,
     )
-    assert soxl_used_low["placed"] == [("SOXL", "sell", 79, 4), ("SOXL", "buy", 66, 4)]
+    assert soxl_used_low["placed"] == [("SOXL", "sell", 79, 20), ("SOXL", "buy", 66, 20)]
 
 
 def test_koru_buy_fill_steps_below_7_2():
@@ -1353,8 +1354,8 @@ def test_regular_reject_does_not_block_other_tickers():
     others = [
         ("KORU", "sell", 11.3, 1),
         ("KORU", "buy", 9.4, 1),
-        ("SOXL", "sell", 86, 4),
-        ("SOXL", "buy", 72, 4),
+        ("SOXL", "sell", 86, 20),
+        ("SOXL", "buy", 72, 20),
     ]
     for moment in (
         _kst(2026, 10, 30, 1, 34),  # 12:34 EDT
@@ -1439,10 +1440,11 @@ def test_reset_reject_still_places_exception():
             }
             return None
 
-        def place_exception(_counter, qty=None, world=world):
+        def place_exception(_counter, qty=None, exc=None, world=world):
             if qty is None:
                 qty = bot._EXCEPTION_QTY
-            world["exceptions"].append((qty, bot._EXCEPTION_PRICE))
+            price = bot._EXCEPTION_PRICE if exc is None else exc["price"]
+            world["exceptions"].append((qty, price))
             return True
 
         actions = {
@@ -1471,12 +1473,12 @@ def test_reset_reject_still_places_exception():
         assert "order type 00" in out
         assert "REJECT SOXL" in out
         assert "rsp_cd 23530" in out
-        assert "exception placed 1" in out
+        assert "exception placed 2" in out
         assert "ERROR reject" in out
         assert "ERROR unexpected" not in out
         assert "OK live" not in out
         assert len(world["placed"]) == 1
-        assert world["exceptions"] == [(150, 75)]
+        assert world["exceptions"] == [(150, 75), (400, 18.7)]
         saved = world["saved"]
         assert saved["reset_tickers"]["17"].get("SOXL", "") == ""
         assert saved["reset_done"]["17"] == ""
@@ -1732,11 +1734,11 @@ def test_prior_fill_does_not_hide_a_new_order_at_that_rung():
     )
     assert code == 0, out
     assert "NEEDS_REVIEW SOXL" not in out
-    assert ("SOXL", "buy", 30, 4) not in stepped
-    assert ("SOXL", "buy", 28, 8) not in stepped
-    assert ("SOXL", "sell", 33, 4) in stepped
-    assert ("SOXL", "buy", 26, 8) not in stepped
-    assert "SOXL resting buy 26 qty 8" in out
+    assert ("SOXL", "buy", 30, 20) not in stepped
+    assert ("SOXL", "buy", 28, 20) not in stepped
+    assert ("SOXL", "sell", 33, 20) in stepped
+    assert ("SOXL", "buy", 26, 20) not in stepped
+    assert "SOXL resting buy 26 qty 20" in out
     assert world["saved"]["tickers"]["SOXL"]["sell"] == _idx("SOXL", 33)
     assert world["saved"]["tickers"]["SOXL"]["buy"] == _idx("SOXL", 28)
     assert not any(item.get("orr_no") == 10019694 for item in world["saved"]["recent_orders"])

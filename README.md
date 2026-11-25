@@ -39,6 +39,12 @@ reset premarket
 
 If the scheduled reset never starts, the next `ladder-intraday` run after the slot opens places that same reset when the ladder book is empty. It does not cancel orders that are already open.
 
+## Rebuild SOXL at 20 shares
+
+SOXL ladder buys and sells are 20 shares. The standing sell of 150 at 75 stays. A standing buy of 400 at 18.7 (`soxl-buy-400-18-7`) is replaced after each reset until it has filled once. 18.7 is not a ladder rung.
+
+Actions → soxl-rebuild → Run workflow prints the cancel and place lines and sends nothing. The live input is off by default. An owner comment on issue **#18** whose body starts with `soxl-rebuild` does the same. That comment sends orders only when the repository variable `SOXL_REBUILD_LIVE` is exactly `on`. `LIVE_TRADING` does not turn it on. The job uses the same account as the ladder. It cancels SOXL ladder orders only. It does not cancel the 150 at 75 or an open 400 at 18.7, and it does not cancel KORU or NAIL.
+
 ## Check account 201-12
 
 Actions → acct-check → Run workflow. The job requests an OAuth token and calls `/n2/acctinfo` only. It prints each account masked (for example `201-12-68***5`) with its `acct_type`, then `201-12 present yes` or `201-12 present no`. It does not place orders and does not write state.

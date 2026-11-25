@@ -1,0 +1,99 @@
+name: soxl-rebuild
+
+on:
+  workflow_dispatch:
+    inputs:
+      live:
+        description: "true cancels open SOXL ladder orders and places the 20-share book. false prints the plan only."
+        required: true
+        default: false
+        type: boolean
+  issue_comment:
+    types: [created]
+
+concurrency:
+  # A comment that is not soxl-rebuild must not take the ladder lock.
+  group: >-
+    ${{
+      (github.event_name == 'workflow_dispatch'
+        || startsWith(github.event.comment.body, 'soxl-rebuild'))
+      && 'ladder-bot'
+      || format('ladder-skip-{0}', github.run_id)
+    }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  soxl-rebuild:
+    name: soxl-rebuild
+    # Dispatch is always dry unless its live input is true. A comment runs
+    # only for the owner, on issue #18, when the body starts with
+    # soxl-rebuild. That comment stays dry unless SOXL_REBUILD_LIVE is on.
+    # LIVE_TRADING does not send these orders. The ladder account is the
+    # same account as today: this job does not set NHPLUG_ACCOUNT_SUFFIX.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' &&
+      !github.event.issue.pull_request &&
+      github.event.issue.number == 18 &&
+      contains(github.event.issue.labels.*.name, 'ladder-kick') &&
+      github.event.comment.user.login == github.repository_owner &&
+      startsWith(github.event.comment.body, 'soxl-rebuild'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Restore access token
+        uses: actions/cache@v4
+        with:
+          path: .nhplug-token
+          key: nhplug-token-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            nhplug-token-
+
+      - name: Restore ladder state
+        uses: actions/cache@v4
+        with:
+          path: .ladder-state
+          key: ladder-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ladder-state-
+
+      - name: Restore ladder state artifact
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 restore_ladder_state.py
+
+      - name: Rebuild SOXL
+        env:
+          LADDER_MODE: soxl-rebuild
+          SOXL_REBUILD_LIVE: ${{ github.event_name == 'workflow_dispatch' && (inputs.live && 'on' || '') || vars.SOXL_REBUILD_LIVE }}
+          MAX_QTY_MULT: ${{ vars.MAX_QTY_MULT }}
+          ORDER_TYPE: ${{ vars.ORDER_TYPE }}
+          NHPLUG_APP_KEY: ${{ secrets.NHPLUG_APP_KEY }}
+          NHPLUG_APP_SECRET: ${{ secrets.NHPLUG_APP_SECRET }}
+          NHPLUG_TOKEN_PATH: .nhplug-token/token.json
+          LADDER_STATE_PATH: .ladder-state/state.json
+        # A comment uses the scheduled clock, including the time guards
+        # when the run is live. The plan is printed either way.
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "issue_comment" ]; then
+            GITHUB_EVENT_NAME=schedule python3 ladder_bot.py
+          else
+            python3 ladder_bot.py
+          fi
+
+      - name: Upload ladder state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ladder-state
+          path: .ladder-state/state.json
+          retention-days: 30
+          include-hidden-files: true
+          if-no-files-found: ignore

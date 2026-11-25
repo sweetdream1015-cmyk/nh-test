@@ -702,10 +702,11 @@ def test_buy_body_and_max_order_detector():
 
 
 def test_inquiry_matches_isin_and_ladder_is_untouched():
-    assert [item["id"] for item in bot._EXCEPTIONS] == [
+    assert [item["id"] for item in bot._EXCEPTIONS][:2] == [
         "soxl-sell-150-75",
         "koru-buy-100-4.2",
     ]
+    assert "soxl-buy-400-18-7" in [item["id"] for item in bot._EXCEPTIONS]
     assert bot._STATE_PATH == ".ladder-state/state.json"
     assert bot._MAX_NEW == 6
     row = {
@@ -745,10 +746,10 @@ def test_inquiry_matches_isin_and_ladder_is_untouched():
         used,
     )
     assert [(item["side"], item["price"], item["qty"]) for item in desired] == [
-        ("sell", 46, 4),
-        ("sell", 50, 4),
-        ("buy", 39, 4),
-        ("buy", 36, 8),
+        ("sell", 46, 20),
+        ("sell", 50, 20),
+        ("buy", 39, 20),
+        ("buy", 36, 20),
     ]
 
 
